@@ -113,6 +113,7 @@ Frontend, backend, and the merge-port proxy all start together. Logs are interle
 ```
 proc-compose init [--template T]     Generate a starter config (templates: minimal, node, go, python)
 proc-compose validate                Parse and validate config without starting (alias: check)
+proc-compose doctor [--write]        Scan project and diagnose proc-compose setup
 proc-compose up [processes...]       Start all or named processes
 proc-compose up --survive --name <n> Print or install a systemd user unit
 proc-compose status [--json]         Show running daemon's process states (alias: st, ps)
@@ -278,6 +279,18 @@ proc-compose validate            # parse-only, no processes started
 
 Returns non-zero if the config has any errors (unknown fields, bad
 `restart` policies, circular `depends_on`, invalid regex, etc.).
+
+### Diagnose or generate config
+
+```sh
+proc-compose doctor          # scan project and report suggestions
+proc-compose doctor --write  # create proc-compose.yml when none exists
+proc-compose doctor --json   # emit machine-readable report
+```
+
+`doctor` helps first-time setup and existing config debugging. Without a config file, it scans common Node, Go, and Python project layouts, then prints suggested processes, ports, readiness probes, and YAML. With an existing config, it checks paths, env files, port conflicts, readiness gaps, merge-port setup, and likely missing binaries.
+
+`--write` is safe by default: it only creates `proc-compose.yml` when neither `proc-compose.yml` nor `proc-compose.yaml` exists.
 
 ### Wait for readiness when daemonising
 
