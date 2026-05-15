@@ -421,10 +421,12 @@ func (m *monitor) render() {
 		// Show a single hint line instead so the user understands why the
 		// TUI looks empty rather than wondering if it has frozen.
 		var buf bytes.Buffer
-		buf.WriteString("\033[H\033[J")
+		buf.WriteString("\033[H\033[K")
 		fmt.Fprintf(&buf, "terminal too small (%dx%d, need at least 40x8)\n",
 			m.width, m.height)
+		buf.WriteString("\033[K")
 		fmt.Fprintf(&buf, "press q to quit, resize the window to continue.\n")
+		buf.WriteString("\033[J")
 		m.write(buf.Bytes())
 		return
 	}
@@ -434,8 +436,12 @@ func (m *monitor) render() {
 	}
 	var buf bytes.Buffer
 
-	// Cursor to top-left, clear screen.
-	buf.WriteString("\033[H\033[J")
+	// Cursor to top-left only — no leading clear. Each row erases its
+	// own tail with \033[K, and a single \033[J at the end wipes any
+	// leftover rows. This "overwrite, don't clear" pattern avoids the
+	// blank-screen flash that would otherwise flicker on terminals that
+	// don't honour DEC mode 2026 (synchronized output).
+	buf.WriteString("\033[H")
 
 	row := 1
 
@@ -446,7 +452,7 @@ func (m *monitor) render() {
 	if gap < 1 {
 		gap = 1
 	}
-	fmt.Fprintf(&buf, "\033[%d;1H%s%s%s%s%s%s%s",
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%s%s%s%s",
 		row,
 		ansiBold+ansiCyan, title, ansiReset,
 		strings.Repeat(" ", gap),
@@ -461,13 +467,13 @@ func (m *monitor) render() {
 		if maxURLLen > 10 && utf8.RuneCountInString(urlPart) > maxURLLen {
 			urlPart = string([]rune(urlPart)[:maxURLLen-1]) + "…"
 		}
-		fmt.Fprintf(&buf, "\033[%d;1H%s%s%s%s%s",
+		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%s%s",
 			row, ansiDim, label, ansiBold+ansiGreen, urlPart, ansiReset)
 		row++
 	}
 
 	// ── Process table header ──────────────────────────────────────────────────
-	fmt.Fprintf(&buf, "\033[%d;1H%s%-*s  %-11s  %-8s  %-6s  %-7s  %s%s",
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%-*s  %-11s  %-8s  %-6s  %-7s  %s%s",
 		row, ansiDim,
 		m.maxProcNameLen(), "PROCESS", "STATUS", "RESTARTS", "CPU%", "MEM", "UPTIME", ansiReset)
 	row++
@@ -495,7 +501,7 @@ func (m *monitor) render() {
 		cpuStr := formatCPU(st.CPUPercent)
 		memStr := formatMemory(st.MemoryMB)
 
-		fmt.Fprintf(&buf, "\033[%d;1H%s%s%s%-*s%s  %s%s%-11s%s  %-8s  %-6s  %-7s  %s%s",
+		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%-*s%s  %s%s%-11s%s  %-8s  %-6s  %-7s  %s%s",
 			row,
 			cursor, prefix,
 			ansiBold+c, m.maxProcNameLen(), padRight(name, m.maxProcNameLen()), ansiReset,
@@ -517,16 +523,16 @@ func (m *monitor) render() {
 		scrollHint = fmt.Sprintf("  %s[+%d lines]%s", ansiYellow, m.logOffset, ansiReset)
 	}
 	div := strings.Repeat("─", m.width)
-	fmt.Fprintf(&buf, "\033[%d;1H%s", row, div)
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s", row, div)
 	row++
-	fmt.Fprintf(&buf, "\033[%d;1H  %sLOGS%s  [%s]%s",
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K  %sLOGS%s  [%s]%s",
 		row, ansiBold, ansiReset, filterLabel, scrollHint)
 	row++
 
 	// ── Log lines ─────────────────────────────────────────────────────────────
 	logRows := m.height - row
 	if logRows < 1 {
-		os.Stdout.Write(buf.Bytes())
+		m.write(buf.Bytes())
 		return
 	}
 
@@ -554,7 +560,7 @@ func (m *monitor) render() {
 		}
 
 		line := truncate(entry.Line, m.width-m.maxProcNameLen()-4)
-		fmt.Fprintf(&buf, "\033[%d;1H%s%s%-*s%s %s│%s %s%s%s",
+		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%-*s%s %s│%s %s%s%s",
 			row,
 			ansiBold+c, "", m.maxProcNameLen(), entry.Process, ansiReset,
 			ansiDim, ansiReset,
@@ -562,10 +568,11 @@ func (m *monitor) render() {
 		row++
 	}
 
-	// Blank remaining rows in the log area.
-	for row <= m.height {
-		fmt.Fprintf(&buf, "\033[%d;1H\033[2K", row)
-		row++
+	// Single clear-to-end-of-screen wipes any leftover rows below the
+	// last log line. Cheaper than per-row \033[2K and produces no
+	// flash because content above is already painted.
+	if row <= m.height {
+		fmt.Fprintf(&buf, "\033[%d;1H\033[J", row)
 	}
 
 	m.write(buf.Bytes())
@@ -574,15 +581,27 @@ func (m *monitor) render() {
 // write emits the assembled frame, stripping SGR escape sequences when
 // colour is disabled so $NO_COLOR / --no-color produce a clean monochrome
 // TUI without obliterating cursor-positioning sequences.
+//
+// Wraps the frame in DEC mode 2026 (synchronized output): supporting
+// terminals buffer the entire repaint and flip atomically, eliminating
+// flicker from the clear-screen + redraw sequence. Terminals that don't
+// understand 2026 ignore the bracket sequences.
 func (m *monitor) write(b []byte) {
 	if ansi.Disabled() {
 		b = stripColor(b)
 	}
-	os.Stdout.Write(b)
+	var out bytes.Buffer
+	out.Grow(len(b) + 16)
+	out.WriteString("\033[?2026h")
+	out.Write(b)
+	out.WriteString("\033[?2026l")
+	os.Stdout.Write(out.Bytes())
 }
 
 func (m *monitor) renderMessage(msg string) {
-	fmt.Printf("\033[H\033[J\033[1;1H%s\n", msg)
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "\033[H\033[J\033[1;1H%s\n", msg)
+	m.write(buf.Bytes())
 }
 
 // renderHelp displays a centered help overlay with all keyboard shortcuts.
