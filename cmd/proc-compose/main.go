@@ -14,6 +14,7 @@ import (
 
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/daemon"
+	"github.com/anivaryam/proc-compose/internal/doctor"
 	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/logrotate"
 	"github.com/anivaryam/proc-compose/internal/monitor"
@@ -55,7 +56,7 @@ Example:
 		surviveName   string
 		install       bool
 		force         bool
-		uninstallName  string
+		uninstallName string
 		dryRun        bool
 		verbose       bool
 		logFormat     string
@@ -65,17 +66,23 @@ Example:
 		waitTimeout   int
 	)
 
+	// ── doctor ────────────────────────────────────────────────────────────────
+	var (
+		doctorWrite bool
+		doctorJSON  bool
+	)
+
 	upCmd := &cobra.Command{
-		Use:               "up [processes...]",
-		Aliases:           []string{"u"},
-		Short:             "Start all (or named) processes",
+		Use:     "up [processes...]",
+		Aliases: []string{"u"},
+		Short:   "Start all (or named) processes",
 		Example: `  proc-compose up                    # start all processes
   proc-compose up frontend backend   # start specific processes
   proc-compose up -s --log-file app.log   # daemonize with log file
   proc-compose up --log-format json       # JSON log output
   proc-compose up --verbose              # verbose debug output`,
-		SilenceUsage:      true,
-		SilenceErrors:     false,
+		SilenceUsage:  true,
+		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if survive {
 				if err := validateUnitName(surviveName); err != nil {
@@ -455,11 +462,11 @@ Example:
 
 	// ── restart ──────────────────────────────────────────────────────────────
 	restartCmd := &cobra.Command{
-		Use:     "restart <process>",
-		Aliases: []string{"r"},
-		Short:   "Restart a single process in a running daemon",
-		Example: "  proc-compose restart backend    # restart single process\n  proc-compose restart -f myapp.yml backend",
-		Args:    cobra.ExactArgs(1),
+		Use:           "restart <process>",
+		Aliases:       []string{"r"},
+		Short:         "Restart a single process in a running daemon",
+		Example:       "  proc-compose restart backend    # restart single process\n  proc-compose restart -f myapp.yml backend",
+		Args:          cobra.ExactArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -652,9 +659,9 @@ Example:
 	// ── man ───────────────────────────────────────────────────────────────────
 	var manDir string
 	manCmd := &cobra.Command{
-		Use:    "man",
-		Short:  "Generate man page to stdout (or to a directory with --dir)",
-		Args:   cobra.NoArgs,
+		Use:   "man",
+		Short: "Generate man page to stdout (or to a directory with --dir)",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if manDir != "" {
 				if err := os.MkdirAll(manDir, 0755); err != nil {
@@ -667,12 +674,51 @@ Example:
 	}
 	manCmd.Flags().StringVar(&manDir, "dir", "", "write man pages to directory")
 
+	// ── doctor ────────────────────────────────────────────────────────────────
+	doctorCmd := &cobra.Command{
+		Use:     "doctor",
+		Aliases: []string{"doc"},
+		Short:   "Scan project and diagnose proc-compose setup",
+		Example: `  proc-compose doctor          # report detected services and config issues
+  proc-compose doctor --write  # create proc-compose.yml when missing
+  proc-compose doctor --json   # machine-readable report`,
+		SilenceUsage:  true,
+		SilenceErrors: false,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			doctorRoot := "."
+			doctorConfig := ""
+			if cmd.Root().PersistentFlags().Changed("file") {
+				absConfig, absErr := filepath.Abs(configFile)
+				if absErr != nil {
+					return absErr
+				}
+				doctorRoot = filepath.Dir(absConfig)
+				doctorConfig = absConfig
+			}
+			report, err := doctor.Run(doctor.Options{Root: doctorRoot, ConfigFile: doctorConfig, Write: doctorWrite})
+			if doctorJSON {
+				if jsonErr := doctor.WriteJSON(os.Stdout, report); jsonErr != nil {
+					return jsonErr
+				}
+				return err
+			}
+			if report != nil {
+				if textErr := doctor.WriteText(os.Stdout, report); textErr != nil {
+					return textErr
+				}
+			}
+			return err
+		},
+	}
+	doctorCmd.Flags().BoolVar(&doctorWrite, "write", false, "create proc-compose.yml when no config exists")
+	doctorCmd.Flags().BoolVar(&doctorJSON, "json", false, "emit machine-readable JSON")
+
 	rootCmd.PersistentFlags().StringVarP(&configFile, "file", "f", "proc-compose.yml", "config file path")
 	uninstallCmd.Flags().StringVar(&uninstallName, "name", "", "service name to uninstall")
 	if err := uninstallCmd.MarkFlagRequired("name"); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to mark --name as required: %v\n", err)
 	}
-	rootCmd.AddCommand(upCmd, monitorCmd, stopCmd, listCmd, initCmd, restartCmd, reloadCmd, uninstallCmd, logsCmd, manCmd, statusCmd, validateCmd)
+	rootCmd.AddCommand(upCmd, monitorCmd, stopCmd, listCmd, initCmd, restartCmd, reloadCmd, uninstallCmd, logsCmd, manCmd, statusCmd, validateCmd, doctorCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
