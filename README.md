@@ -114,6 +114,7 @@ Frontend, backend, and the merge-port proxy all start together. Logs are interle
 proc-compose init [--template T]     Generate a starter config (templates: minimal, node, go, python)
 proc-compose validate                Parse and validate config without starting (alias: check)
 proc-compose doctor [--write]        Scan project and diagnose proc-compose setup
+proc-compose bootstrap [--write] [--verify]  Generate and optionally verify setup
 proc-compose up [processes...]       Start all or named processes
 proc-compose up --survive --name <n> Print or install a systemd user unit
 proc-compose status [--json]         Show running daemon's process states (alias: st, ps)
@@ -291,6 +292,19 @@ proc-compose doctor --json   # emit machine-readable report
 `doctor` helps first-time setup and existing config debugging. Without a config file, it scans common Node, Go, and Python project layouts, then prints suggested processes, ports, readiness probes, and YAML. With an existing config, it checks paths, env files, port conflicts, readiness gaps, merge-port setup, and likely missing binaries.
 
 `--write` is safe by default: it only creates `proc-compose.yml` when neither `proc-compose.yml` nor `proc-compose.yaml` exists.
+
+### Bootstrap a working setup
+
+```sh
+proc-compose bootstrap                  # dry run: show generated config
+proc-compose bootstrap --write          # create proc-compose.yml when none exists
+proc-compose bootstrap --verify         # test generated config without writing it
+proc-compose bootstrap --write --verify # write, then verify
+```
+
+`bootstrap` builds on `doctor`: it scans the repo, proposes a config, and can verify the config through proc-compose. The default mode is safe and read-only. Use `--write` to create `proc-compose.yml`; it refuses to overwrite existing configs.
+
+Use `doctor` when you want diagnostics only. Use `bootstrap` when you want a first-run setup path.
 
 ### Wait for readiness when daemonising
 
