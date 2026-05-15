@@ -15,7 +15,7 @@ import (
 
 func helperCmd(args ...string) string {
 	if runtime.GOOS == "windows" {
-		cmd := fmt.Sprintf("set GO_WANT_HELPER_PROCESS=1 & %q -test.run=TestRunnerHelperProcess --", os.Args[0])
+		cmd := fmt.Sprintf("set GO_WANT_HELPER_PROCESS=1 & %s -test.run=TestRunnerHelperProcess --", cmdQuote(os.Args[0]))
 		for _, arg := range args {
 			cmd += " " + cmdQuote(arg)
 		}
