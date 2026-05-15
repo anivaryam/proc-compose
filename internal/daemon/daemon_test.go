@@ -171,8 +171,12 @@ func TestIsAliveFromPIDFile_StartTimeMismatch(t *testing.T) {
 	// Synthesize a pidfile that points at *our* PID but with a wrong
 	// start-time. On Linux procStartTime returns a real value; on other
 	// Unixes it returns 0 and we fall back to liveness-only — skip there.
-	if _, err := procStartTime(os.Getpid()); err != nil {
+	startedAt, err := procStartTime(os.Getpid())
+	if err != nil {
 		t.Skipf("procStartTime unavailable: %v", err)
+	}
+	if startedAt == 0 {
+		t.Skip("procStartTime unavailable on this platform")
 	}
 	stale := pidFile{PID: os.Getpid(), Addr: "/tmp/x.sock", StartedAt: 1}
 	data, _ := json.Marshal(stale)

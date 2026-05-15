@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -39,7 +40,12 @@ func testSocketPath(t *testing.T, name string) string {
 	if runtime.GOOS == "windows" {
 		return `\\.\pipe\` + name
 	}
-	return filepath.Join(t.TempDir(), name)
+	dir, err := os.MkdirTemp("/tmp", "pc-test-*")
+	if err != nil {
+		t.Fatalf("temp socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, name)
 }
 
 func TestServer_AckSignalsBusyWhenChannelFull(t *testing.T) {

@@ -11,6 +11,16 @@ import (
 	"time"
 )
 
+func testUnixSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "pc-test-*")
+	if err != nil {
+		t.Fatalf("temp socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, name)
+}
+
 func sleepCommand(t *testing.T, seconds int) *exec.Cmd {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -41,7 +51,7 @@ func TestWaitForDaemonReady_DetectsDeadChild(t *testing.T) {
 	// Wait for the child to actually exit so IsAlive returns false.
 	_ = cmd.Wait()
 
-	socketPath := filepath.Join(t.TempDir(), "ipc.sock")
+	socketPath := testUnixSocketPath(t, "ipc.sock")
 	err := waitForDaemonReady(pid, socketPath, logPath, 2*time.Second)
 	if err == nil {
 		t.Fatal("expected error when child has died, got nil")
@@ -72,7 +82,7 @@ func TestWaitForDaemonReady_TimesOutWithoutSocket(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "child.log")
 	os.WriteFile(logPath, []byte("starting...\n"), 0644)
 
-	socketPath := filepath.Join(t.TempDir(), "ipc.sock")
+	socketPath := testUnixSocketPath(t, "ipc.sock")
 	start := time.Now()
 	err := waitForDaemonReady(cmd.Process.Pid, socketPath, logPath, 500*time.Millisecond)
 	elapsed := time.Since(start)
@@ -102,7 +112,7 @@ func TestWaitForDaemonReady_SucceedsWhenSocketReady(t *testing.T) {
 		_, _ = cmd.Process.Wait()
 	}()
 
-	socketPath := filepath.Join(t.TempDir(), "ipc.sock")
+	socketPath := testUnixSocketPath(t, "ipc.sock")
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
