@@ -14,9 +14,9 @@ import (
 
 func helperCmd(args ...string) string {
 	if runtime.GOOS == "windows" {
-		parts := []string{"set GO_WANT_HELPER_PROCESS=1", "&", strconv.Quote(os.Args[0]), strconv.Quote("-test.run=TestRunnerHelperProcess"), strconv.Quote("--")}
+		parts := []string{"set", cmdQuote("GO_WANT_HELPER_PROCESS=1"), "&", cmdQuote(os.Args[0]), cmdQuote("-test.run=TestRunnerHelperProcess"), cmdQuote("--")}
 		for _, arg := range args {
-			parts = append(parts, strconv.Quote(arg))
+			parts = append(parts, cmdQuote(arg))
 		}
 		return strings.Join(parts, " ")
 	}
@@ -25,6 +25,10 @@ func helperCmd(args ...string) string {
 		parts = append(parts, strconv.Quote(arg))
 	}
 	return strings.Join(parts, " ")
+}
+
+func cmdQuote(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 func TestRunnerHelperProcess(t *testing.T) {
