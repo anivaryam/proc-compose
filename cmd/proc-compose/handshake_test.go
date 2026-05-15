@@ -13,6 +13,9 @@ import (
 
 func testUnixSocketPath(t *testing.T, name string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		return `\\.\pipe\` + strings.ReplaceAll(t.Name()+"-"+name, "/", "-")
+	}
 	dir, err := os.MkdirTemp("/tmp", "pc-test-*")
 	if err != nil {
 		t.Fatalf("temp socket dir: %v", err)

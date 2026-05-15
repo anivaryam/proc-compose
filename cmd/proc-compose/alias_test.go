@@ -3,9 +3,23 @@ package main
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"testing"
 )
+
+func buildTestBinary(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "proc-compose_test")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	buildCmd := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to build proc-compose: %v\n%s", err, out)
+	}
+	return bin
+}
 
 func TestAliasEquivalence(t *testing.T) {
 	tests := []struct {
@@ -23,24 +37,18 @@ func TestAliasEquivalence(t *testing.T) {
 		{"reload_alias", "rl", "reload", []string{"--help"}},
 	}
 
-	// Build the binary first
-	t.Log("Building proc-compose...")
-	buildCmd := exec.Command("go", "build", "-o", "proc-compose_test", ".")
-	if err := buildCmd.Run(); err != nil {
-		t.Fatalf("Failed to build proc-compose: %v", err)
-	}
-	defer os.Remove("proc-compose_test")
+	bin := buildTestBinary(t)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Build canonical command with args
-			canonicalArgs := append([]string{"./proc-compose_test", tt.cmd}, tt.args...)
+			canonicalArgs := append([]string{bin, tt.cmd}, tt.args...)
 			canonical := exec.Command(canonicalArgs[0], canonicalArgs[1:]...)
 			canonicalOut, canonicalErr := canonical.CombinedOutput()
 			canonicalExit := canonical.ProcessState.ExitCode()
 
 			// Build alias command with same args
-			aliasArgs := append([]string{"./proc-compose_test", tt.alias}, tt.args...)
+			aliasArgs := append([]string{bin, tt.alias}, tt.args...)
 			aliasCmd := exec.Command(aliasArgs[0], aliasArgs[1:]...)
 			aliasOut, aliasErr := aliasCmd.CombinedOutput()
 			aliasExit := aliasCmd.ProcessState.ExitCode()
@@ -66,14 +74,10 @@ func TestAliasEquivalence(t *testing.T) {
 }
 
 func TestInvalidAlias(t *testing.T) {
-	buildCmd := exec.Command("go", "build", "-o", "proc-compose_test", ".")
-	if err := buildCmd.Run(); err != nil {
-		t.Fatalf("Failed to build proc-compose: %v", err)
-	}
-	defer os.Remove("proc-compose_test")
+	bin := buildTestBinary(t)
 
 	// Test invalid alias
-	cmd := exec.Command("./proc-compose_test", "xyz")
+	cmd := exec.Command(bin, "xyz")
 	_, err := cmd.CombinedOutput()
 
 	// Should fail with "unknown command" or similar

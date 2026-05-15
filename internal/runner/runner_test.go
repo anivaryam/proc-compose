@@ -2,7 +2,9 @@ package runner
 
 import (
 	"context"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -10,11 +12,84 @@ import (
 	"github.com/anivaryam/proc-compose/internal/config"
 )
 
-func crossPlatformCmd(cmd string) string {
+func helperCmd(args ...string) string {
 	if runtime.GOOS == "windows" {
-		return "cmd /c " + cmd
+		parts := []string{"set GO_WANT_HELPER_PROCESS=1", "&", strconv.Quote(os.Args[0]), strconv.Quote("-test.run=TestRunnerHelperProcess"), strconv.Quote("--")}
+		for _, arg := range args {
+			parts = append(parts, strconv.Quote(arg))
+		}
+		return strings.Join(parts, " ")
 	}
-	return "sh -c '" + cmd + "'"
+	parts := []string{"GO_WANT_HELPER_PROCESS=1", strconv.Quote(os.Args[0]), "-test.run=TestRunnerHelperProcess", "--"}
+	for _, arg := range args {
+		parts = append(parts, strconv.Quote(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func TestRunnerHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	args := os.Args
+	for len(args) > 0 && args[0] != "--" {
+		args = args[1:]
+	}
+	if len(args) == 0 {
+		os.Exit(2)
+	}
+	args = args[1:]
+	if len(args) == 0 {
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "exit":
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		code, err := strconv.Atoi(args[1])
+		if err != nil {
+			os.Exit(2)
+		}
+		os.Exit(code)
+	case "sleep":
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		d, err := time.ParseDuration(args[1])
+		if err != nil {
+			os.Exit(2)
+		}
+		time.Sleep(d)
+		os.Exit(0)
+	case "log":
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		_, _ = os.Stdout.WriteString(args[1] + "\n")
+		os.Exit(0)
+	case "log-block":
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		_, _ = os.Stdout.WriteString(args[1] + "\n")
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	case "ready-after":
+		if len(args) != 3 {
+			os.Exit(2)
+		}
+		d, err := time.ParseDuration(args[1])
+		if err != nil {
+			os.Exit(2)
+		}
+		time.Sleep(d)
+		_, _ = os.Stdout.WriteString(args[2] + "\n")
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	default:
+		os.Exit(2)
+	}
 }
 
 func makeRunner(processes map[string]config.Process) *Runner {
@@ -27,7 +102,7 @@ func makeRunner(processes map[string]config.Process) *Runner {
 
 func TestRun_FailedProcessReturnsError(t *testing.T) {
 	r := makeRunner(map[string]config.Process{
-		"failing": {Cmd: crossPlatformCmd("exit 1"), Restart: "never"},
+		"failing": {Cmd: helperCmd("exit", "1"), Restart: "never"},
 	})
 	ctx := context.Background()
 	err := r.Run(ctx)
@@ -38,7 +113,7 @@ func TestRun_FailedProcessReturnsError(t *testing.T) {
 
 func TestRun_CleanExitReturnsNil(t *testing.T) {
 	r := makeRunner(map[string]config.Process{
-		"ok": {Cmd: crossPlatformCmd("exit 0"), Restart: "never"},
+		"ok": {Cmd: helperCmd("exit", "0"), Restart: "never"},
 	})
 	ctx := context.Background()
 	err := r.Run(ctx)
@@ -49,7 +124,7 @@ func TestRun_CleanExitReturnsNil(t *testing.T) {
 
 func TestRun_SIGTERMReturnsNil(t *testing.T) {
 	r := makeRunner(map[string]config.Process{
-		"long": {Cmd: crossPlatformCmd("sleep 30"), Restart: "never"},
+		"long": {Cmd: helperCmd("sleep", "30s"), Restart: "never"},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	// Cancel after a short delay to simulate SIGTERM.
@@ -65,7 +140,7 @@ func TestRun_SIGTERMReturnsNil(t *testing.T) {
 
 func TestRun_OnFailureRestartCancelledReturnsNil(t *testing.T) {
 	r := makeRunner(map[string]config.Process{
-		"flaky": {Cmd: crossPlatformCmd("exit 1"), Restart: "on-failure"},
+		"flaky": {Cmd: helperCmd("exit", "1"), Restart: "on-failure"},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	// Cancel after a short delay so the process gets into backoff and is then cancelled.
@@ -81,7 +156,7 @@ func TestRun_OnFailureRestartCancelledReturnsNil(t *testing.T) {
 
 func TestRun_MaxRestarts_OnFailure(t *testing.T) {
 	r := makeRunner(map[string]config.Process{
-		"flaky": {Cmd: crossPlatformCmd("exit 1"), Restart: "on-failure", MaxRestarts: 2},
+		"flaky": {Cmd: helperCmd("exit", "1"), Restart: "on-failure", MaxRestarts: 2},
 	})
 	ctx := context.Background()
 	err := r.Run(ctx)
@@ -95,7 +170,7 @@ func TestRun_MaxRestarts_OnFailure(t *testing.T) {
 
 func TestRun_MaxRestarts_Always(t *testing.T) {
 	r := makeRunner(map[string]config.Process{
-		"looper": {Cmd: crossPlatformCmd("exit 0"), Restart: "always", MaxRestarts: 2},
+		"looper": {Cmd: helperCmd("exit", "0"), Restart: "always", MaxRestarts: 2},
 	})
 	ctx := context.Background()
 	err := r.Run(ctx)
@@ -106,7 +181,7 @@ func TestRun_MaxRestarts_Always(t *testing.T) {
 
 func TestRun_MaxRestarts_CancelledBeforeLimit(t *testing.T) {
 	r := makeRunner(map[string]config.Process{
-		"flaky": {Cmd: crossPlatformCmd("exit 1"), Restart: "on-failure", MaxRestarts: 100},
+		"flaky": {Cmd: helperCmd("exit", "1"), Restart: "on-failure", MaxRestarts: 100},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -123,14 +198,14 @@ func TestRun_DependsOn_WaitsForDependency(t *testing.T) {
 	// "app" depends on "db" which takes ~200ms to become ready (log probe).
 	r := makeRunner(map[string]config.Process{
 		"db": {
-			Cmd:     crossPlatformCmd("sleep 0.2 && echo READY && sleep 30"),
+			Cmd:     helperCmd("ready-after", "200ms", "READY"),
 			Restart: "never",
 			ReadyWhen: &config.ReadyWhen{
 				Log: "READY",
 			},
 		},
 		"app": {
-			Cmd:       crossPlatformCmd("echo app-started && sleep 30"),
+			Cmd:       helperCmd("log-block", "app-started"),
 			Restart:   "never",
 			DependsOn: []string{"db"},
 		},
@@ -150,14 +225,14 @@ func TestRun_DependsOn_FailedDependency(t *testing.T) {
 	// "app" depends on "db" which exits immediately (fails before becoming ready).
 	r := makeRunner(map[string]config.Process{
 		"db": {
-			Cmd:     crossPlatformCmd("exit 1"),
+			Cmd:     helperCmd("exit", "1"),
 			Restart: "never",
 			ReadyWhen: &config.ReadyWhen{
 				Log: "READY",
 			},
 		},
 		"app": {
-			Cmd:       crossPlatformCmd("echo should-not-run"),
+			Cmd:       helperCmd("log", "should-not-run"),
 			Restart:   "never",
 			DependsOn: []string{"db"},
 		},
@@ -180,7 +255,7 @@ func TestRun_ReadyWhen_Log(t *testing.T) {
 	// Process prints "listening on port 3000" and should be marked ready.
 	r := makeRunner(map[string]config.Process{
 		"server": {
-			Cmd:     crossPlatformCmd("echo listening on port 3000 && sleep 30"),
+			Cmd:     helperCmd("log-block", "listening on port 3000"),
 			Restart: "never",
 			ReadyWhen: &config.ReadyWhen{
 				Log: "listening on port",
@@ -203,14 +278,14 @@ func TestRun_FilterPullsInDependencies(t *testing.T) {
 		Config: &config.Config{
 			Processes: map[string]config.Process{
 				"db": {
-					Cmd:     crossPlatformCmd("echo READY && sleep 30"),
+					Cmd:     helperCmd("log-block", "READY"),
 					Restart: "never",
 					ReadyWhen: &config.ReadyWhen{
 						Log: "READY",
 					},
 				},
 				"app": {
-					Cmd:       crossPlatformCmd("echo app-started && sleep 30"),
+					Cmd:       helperCmd("log-block", "app-started"),
 					Restart:   "never",
 					DependsOn: []string{"db"},
 				},
@@ -234,7 +309,7 @@ func TestRun_ReadyWhen_HTTPTimeoutFailsProcess(t *testing.T) {
 	// time out within ReadyTimeout and the runner must mark the process failed.
 	r := makeRunner(map[string]config.Process{
 		"server": {
-			Cmd:          crossPlatformCmd("sleep 30"),
+			Cmd:          helperCmd("sleep", "30s"),
 			Restart:      "never",
 			ReadyTimeout: 1, // 1 second
 			ReadyWhen: &config.ReadyWhen{
@@ -258,7 +333,7 @@ func TestRun_ReadyWhen_LogTimeoutFailsProcess(t *testing.T) {
 	// Process runs forever and never emits the expected log line.
 	r := makeRunner(map[string]config.Process{
 		"server": {
-			Cmd:          crossPlatformCmd("sleep 30"),
+			Cmd:          helperCmd("sleep", "30s"),
 			Restart:      "never",
 			ReadyTimeout: 1,
 			ReadyWhen: &config.ReadyWhen{
@@ -276,8 +351,8 @@ func TestRun_ReadyWhen_LogTimeoutFailsProcess(t *testing.T) {
 
 func TestRun_MultipleFailedProcessesErrorContainsNames(t *testing.T) {
 	r := makeRunner(map[string]config.Process{
-		"proc-a": {Cmd: crossPlatformCmd("exit 1"), Restart: "never"},
-		"proc-b": {Cmd: crossPlatformCmd("exit 1"), Restart: "never"},
+		"proc-a": {Cmd: helperCmd("exit", "1"), Restart: "never"},
+		"proc-b": {Cmd: helperCmd("exit", "1"), Restart: "never"},
 	})
 	ctx := context.Background()
 	err := r.Run(ctx)

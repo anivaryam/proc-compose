@@ -40,7 +40,7 @@ func testSocketPath(t *testing.T, name string) string {
 	if runtime.GOOS == "windows" {
 		return `\\.\pipe\` + name
 	}
-	dir, err := os.MkdirTemp("/tmp", "pc-test-*")
+	dir, err := os.MkdirTemp("", "pc-test-*")
 	if err != nil {
 		t.Fatalf("temp socket dir: %v", err)
 	}

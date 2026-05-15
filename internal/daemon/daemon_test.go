@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 )
 
@@ -116,6 +117,9 @@ func TestCleanup_MissingFilesNoError(t *testing.T) {
 }
 
 func TestPIDFile_Mode0600(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose POSIX file permission bits")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.pid")
 

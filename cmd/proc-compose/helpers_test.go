@@ -188,7 +188,7 @@ func TestGetHomeDir(t *testing.T) {
 	if home == "" {
 		t.Error("getHomeDir() returned empty string")
 	}
-	if home[0] != '/' {
-		t.Errorf("getHomeDir() = %q, want absolute path starting with /", home)
+	if !filepath.IsAbs(home) {
+		t.Errorf("getHomeDir() = %q, want absolute path", home)
 	}
 }

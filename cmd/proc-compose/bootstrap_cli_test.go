@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -24,6 +25,9 @@ func TestBootstrapJSON(t *testing.T) {
 	writeCLIFile(t, filepath.Join(tmp, "package.json"), `{"scripts":{"dev":"vite"},"dependencies":{"vite":"latest"}}`)
 
 	bin := filepath.Join(tmp, "proc-compose-test")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	build := exec.Command("go", "build", "-o", bin, ".")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build failed: %v\n%s", err, out)
