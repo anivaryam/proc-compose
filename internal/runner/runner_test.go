@@ -15,17 +15,24 @@ import (
 const helperSentinel = "__PROC_COMPOSE_TEST_HELPER__"
 
 func helperCmd(args ...string) string {
-	parts := []string{shellQuote(os.Args[0]), "-test.run=^TestRunnerHelperProcess$", "--", helperSentinel}
+	if runtime.GOOS == "windows" {
+		// Go's exec-on-Windows escaping mangles double-quoted paths when
+		// passed to cmd /c, so leave the binary path bare. CI temp paths
+		// have no spaces.
+		cmd := os.Args[0] + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel
+		for _, arg := range args {
+			cmd += " " + cmdQuote(arg)
+		}
+		return cmd
+	}
+	parts := []string{posixQuote(os.Args[0]), "-test.run=^TestRunnerHelperProcess$", "--", helperSentinel}
 	for _, arg := range args {
-		parts = append(parts, shellQuote(arg))
+		parts = append(parts, posixQuote(arg))
 	}
 	return strings.Join(parts, " ")
 }
 
-func shellQuote(s string) string {
-	if runtime.GOOS == "windows" {
-		return cmdQuote(s)
-	}
+func posixQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
