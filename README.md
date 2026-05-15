@@ -1,6 +1,16 @@
 # proc-compose
 
-A lightweight process runner that starts multiple local services from a single YAML config. Color-coded log output, restart policies, clean shutdown with one Ctrl+C — and optional merge-port integration built in.
+`proc-compose` is a local process orchestrator for development and small deployments. It starts every service in your stack from one YAML file, streams their logs with stable names and colors, waits for readiness, restarts failed processes when configured, and shuts the whole tree down cleanly with one Ctrl+C.
+
+Use it when a project needs more than one command to run:
+
+- a frontend plus API server
+- several microservices plus workers
+- a local stack that needs ordered startup
+- a single-container deployment that still runs multiple child processes
+- a public demo stack using `merge-port` or `tunnel`
+
+It is intentionally smaller than Docker Compose: no containers, no image builds, no networks, no volumes. Commands run on your machine exactly as you would run them in a terminal, but `proc-compose` gives them one lifecycle, one log stream, one config, and one control surface.
 
 ```
 proc-compose up
@@ -72,7 +82,16 @@ These are optional. proc-compose works without them; the features that depend on
 
 ## Quick Start
 
-Generate a starter config:
+The fastest path is `bootstrap`: it scans your project, proposes a config, and can verify that the generated config parses through `proc-compose` before writing anything.
+
+```sh
+proc-compose bootstrap          # inspect generated config
+proc-compose bootstrap --verify # verify generated config without writing
+proc-compose bootstrap --write  # create proc-compose.yml when none exists
+proc-compose up                 # start the stack
+```
+
+If you prefer a template, generate a starter config:
 
 ```sh
 proc-compose init
@@ -80,7 +99,7 @@ proc-compose init
 proc-compose up
 ```
 
-Or write it by hand:
+Or write `proc-compose.yml` by hand:
 
 ```yaml
 merge:
@@ -108,28 +127,46 @@ proc-compose up
 
 Frontend, backend, and the merge-port proxy all start together. Logs are interleaved with color-coded prefixes. Ctrl+C stops everything cleanly.
 
+## Mental Model
+
+`proc-compose.yml` declares named processes. Each process is a shell command plus optional working directory, environment, readiness probe, dependencies, and restart policy.
+
+When you run `proc-compose up`, the runner:
+
+1. parses and validates the config
+2. starts processes whose dependencies are ready
+3. prefixes and streams stdout/stderr into one log
+4. tracks readiness through `http`, `tcp`, or `log` probes
+5. applies restart policies
+6. forwards shutdown to the full process tree
+
+Daemon commands (`status`, `logs`, `monitor`, `restart`, `reload`, `stop`) talk to the background runner for the current config file.
+
 ## CLI Usage
 
 ```
-proc-compose init [--template T]     Generate a starter config (templates: minimal, node, go, python)
-proc-compose validate                Parse and validate config without starting (alias: check)
-proc-compose doctor [--write]        Scan project and diagnose proc-compose setup
-proc-compose bootstrap [--write] [--verify]  Generate and optionally verify setup
-proc-compose up [processes...]       Start all or named processes
-proc-compose up --survive --name <n> Print or install a systemd user unit
-proc-compose status [--json]         Show running daemon's process states (alias: st, ps)
-proc-compose stop [--timeout N]      Stop a running daemon (graceful, escalates to SIGKILL)
-proc-compose monitor                 Connect to a running daemon and display a live TUI
-proc-compose list                    List processes defined in config
-proc-compose restart <process>       Restart a single process in a running daemon
-proc-compose reload                  Reload config and restart changed processes
-proc-compose logs [-n N]             Print log file for the current config
-proc-compose uninstall --name <n>    Remove a systemd unit installed via --survive
-proc-compose man [--dir DIR]         Generate man pages
-proc-compose --version               Print version
+proc-compose bootstrap [--write] [--verify] [--json]  Generate and optionally verify setup
+proc-compose doctor [--write] [--json]                Scan project and diagnose setup
+proc-compose init [--template T]                       Generate starter config
+proc-compose validate                                  Parse config without starting
+proc-compose up [processes...]                         Start all or named processes
+proc-compose up --silent                               Run daemon in background
+proc-compose monitor                                   Open live TUI for daemon
+proc-compose status [--json]                           Show daemon process states
+proc-compose logs [-n N]                               Show daemon log file
+proc-compose restart <process>                         Restart one running process
+proc-compose reload                                    Reload config and restart changed processes
+proc-compose stop [--timeout N]                        Stop daemon gracefully
+proc-compose list                                      List config processes
+proc-compose man [--dir DIR]                           Generate man pages
+proc-compose uninstall --name <n>                      Remove systemd unit
+proc-compose --version                                 Print version
 
-Flags (up):
+Global flags:
   -f, --file string        Config file path (default "proc-compose.yml"; falls back to proc-compose.yaml)
+  -v, --version            Print version
+
+Important flags (up):
   -s, --silent             Daemonize — run in the background and exit
       --wait-ready         With --silent, block until every started process passes its readiness probe
       --wait-timeout int   Seconds to wait when --wait-ready is set (default 60)
@@ -142,8 +179,12 @@ Flags (up):
       --dry-run            Validate config and list processes without starting
       --no-color           Disable ANSI color output (also: NO_COLOR env var)
       --log-format string  Log output format: text or json (default "text")
-  -v, --verbose            Enable verbose debug output
       --health-port int    HTTP port for /health endpoint (0 = disabled)
+
+Important flags (bootstrap):
+      --write              Create proc-compose.yml when no config exists
+      --verify             Verify generated config through proc-compose
+      --json               Emit machine-readable JSON
 
 Flags (stop):
       --timeout int        Seconds to wait for graceful shutdown before SIGKILL (default 10)
