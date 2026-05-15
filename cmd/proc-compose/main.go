@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anivaryam/proc-compose/internal/bootstrap"
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/doctor"
@@ -70,6 +71,13 @@ Example:
 	var (
 		doctorWrite bool
 		doctorJSON  bool
+	)
+
+	// ── bootstrap ─────────────────────────────────────────────────────────────
+	var (
+		bootstrapWrite  bool
+		bootstrapVerify bool
+		bootstrapJSON   bool
 	)
 
 	upCmd := &cobra.Command{
@@ -674,6 +682,52 @@ Example:
 	}
 	manCmd.Flags().StringVar(&manDir, "dir", "", "write man pages to directory")
 
+	// ── bootstrap ─────────────────────────────────────────────────────────────
+	bootstrapCmd := &cobra.Command{
+		Use:   "bootstrap",
+		Short: "Generate and optionally verify proc-compose setup",
+		Example: `  proc-compose bootstrap                  # show generated config without changing files
+  proc-compose bootstrap --write          # create proc-compose.yml when missing
+  proc-compose bootstrap --verify         # verify generated config through proc-compose
+  proc-compose bootstrap --write --verify # write and verify setup
+  proc-compose bootstrap --json           # machine-readable report`,
+		SilenceUsage:  true,
+		SilenceErrors: false,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			bootstrapRoot := "."
+			bootstrapConfig := ""
+			if cmd.Root().PersistentFlags().Changed("file") {
+				absConfig, absErr := filepath.Abs(configFile)
+				if absErr != nil {
+					return absErr
+				}
+				bootstrapRoot = filepath.Dir(absConfig)
+				bootstrapConfig = absConfig
+			}
+			report, err := bootstrap.Run(bootstrap.Options{
+				Root:       bootstrapRoot,
+				ConfigFile: bootstrapConfig,
+				Write:      bootstrapWrite,
+				Verify:     bootstrapVerify,
+			})
+			if bootstrapJSON {
+				if jsonErr := bootstrap.WriteJSON(os.Stdout, report); jsonErr != nil {
+					return jsonErr
+				}
+				return err
+			}
+			if report != nil {
+				if textErr := bootstrap.WriteText(os.Stdout, report); textErr != nil {
+					return textErr
+				}
+			}
+			return err
+		},
+	}
+	bootstrapCmd.Flags().BoolVar(&bootstrapWrite, "write", false, "create proc-compose.yml when no config exists")
+	bootstrapCmd.Flags().BoolVar(&bootstrapVerify, "verify", false, "verify generated config through proc-compose")
+	bootstrapCmd.Flags().BoolVar(&bootstrapJSON, "json", false, "emit machine-readable JSON")
+
 	// ── doctor ────────────────────────────────────────────────────────────────
 	doctorCmd := &cobra.Command{
 		Use:     "doctor",
@@ -718,7 +772,7 @@ Example:
 	if err := uninstallCmd.MarkFlagRequired("name"); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to mark --name as required: %v\n", err)
 	}
-	rootCmd.AddCommand(upCmd, monitorCmd, stopCmd, listCmd, initCmd, restartCmd, reloadCmd, uninstallCmd, logsCmd, manCmd, statusCmd, validateCmd, doctorCmd)
+	rootCmd.AddCommand(upCmd, monitorCmd, stopCmd, listCmd, initCmd, restartCmd, reloadCmd, uninstallCmd, logsCmd, manCmd, statusCmd, validateCmd, bootstrapCmd, doctorCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
