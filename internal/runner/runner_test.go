@@ -12,19 +12,21 @@ import (
 	"github.com/anivaryam/proc-compose/internal/config"
 )
 
+const helperSentinel = "__PROC_COMPOSE_TEST_HELPER__"
+
 func helperCmd(args ...string) string {
-	if runtime.GOOS == "windows" {
-		cmd := "set GO_WANT_HELPER_PROCESS=1 & " + os.Args[0] + " -test.run=TestRunnerHelperProcess --"
-		for _, arg := range args {
-			cmd += " " + cmdQuote(arg)
-		}
-		return cmd
-	}
-	parts := []string{"GO_WANT_HELPER_PROCESS=1", strconv.Quote(os.Args[0]), "-test.run=TestRunnerHelperProcess", "--"}
+	parts := []string{shellQuote(os.Args[0]), "-test.run=^TestRunnerHelperProcess$", "--", helperSentinel}
 	for _, arg := range args {
-		parts = append(parts, strconv.Quote(arg))
+		parts = append(parts, shellQuote(arg))
 	}
 	return strings.Join(parts, " ")
+}
+
+func shellQuote(s string) string {
+	if runtime.GOOS == "windows" {
+		return cmdQuote(s)
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func cmdQuote(s string) string {
@@ -32,17 +34,16 @@ func cmdQuote(s string) string {
 }
 
 func TestRunnerHelperProcess(t *testing.T) {
-	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+	var args []string
+	for i, a := range os.Args {
+		if a == helperSentinel {
+			args = os.Args[i+1:]
+			break
+		}
+	}
+	if args == nil {
 		return
 	}
-	args := os.Args
-	for len(args) > 0 && args[0] != "--" {
-		args = args[1:]
-	}
-	if len(args) == 0 {
-		os.Exit(2)
-	}
-	args = args[1:]
 	if len(args) == 0 {
 		os.Exit(2)
 	}
