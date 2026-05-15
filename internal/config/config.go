@@ -109,6 +109,10 @@ func Load(path string) (*Config, error) {
 		mergeProc := Process{
 			Cmd:     cmd,
 			Restart: "on-failure",
+			// Probe merge-port's own listen port so any downstream process
+			// (e.g. a tunnel that depends on merge-port) doesn't race the
+			// proxy's bind. cfg.Merge.Port is finalised inside buildMergeCmd.
+			ReadyWhen: &ReadyWhen{TCP: fmt.Sprintf("localhost:%d", cfg.Merge.Port)},
 		}
 		// depends_on must be deterministic so the runner's startup order
 		// (and any error messages) are stable across runs.
