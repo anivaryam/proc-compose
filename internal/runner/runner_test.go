@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"runtime"
 	"strconv"
@@ -14,43 +15,45 @@ import (
 
 const helperSentinel = "__PROC_COMPOSE_TEST_HELPER__"
 
+// helperCmd builds a shell command that re-invokes this test binary in
+// helper mode. Args are base64-encoded into a single shell-safe token so
+// quoting hell across sh, cmd, PowerShell, and Go's exec-arg escaping
+// never matters.
 func helperCmd(args ...string) string {
+	payload := base64.RawURLEncoding.EncodeToString([]byte(strings.Join(args, "\x00")))
 	if runtime.GOOS == "windows" {
-		// Go's exec-on-Windows escaping mangles double-quoted paths when
-		// passed to cmd /c, so leave the binary path bare. CI temp paths
-		// have no spaces.
-		cmd := os.Args[0] + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel
-		for _, arg := range args {
-			cmd += " " + cmdQuote(arg)
-		}
-		return cmd
+		// Leave path bare on Windows: Go's CreateProcess arg escaping
+		// turns any quotes we add into literal \" inside cmd /c.
+		// CI temp paths have no spaces.
+		return os.Args[0] + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel + " " + payload
 	}
-	parts := []string{posixQuote(os.Args[0]), "-test.run=^TestRunnerHelperProcess$", "--", helperSentinel}
-	for _, arg := range args {
-		parts = append(parts, posixQuote(arg))
-	}
-	return strings.Join(parts, " ")
+	return posixQuote(os.Args[0]) + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel + " " + payload
 }
 
 func posixQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-func cmdQuote(s string) string {
-	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
-}
-
 func TestRunnerHelperProcess(t *testing.T) {
-	var args []string
+	var payload string
+	found := false
 	for i, a := range os.Args {
 		if a == helperSentinel {
-			args = os.Args[i+1:]
+			if i+1 < len(os.Args) {
+				payload = os.Args[i+1]
+				found = true
+			}
 			break
 		}
 	}
-	if args == nil {
+	if !found {
 		return
 	}
+	decoded, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		os.Exit(2)
+	}
+	args := strings.Split(string(decoded), "\x00")
 	if len(args) == 0 {
 		os.Exit(2)
 	}
