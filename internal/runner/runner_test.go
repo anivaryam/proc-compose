@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -14,11 +15,11 @@ import (
 
 func helperCmd(args ...string) string {
 	if runtime.GOOS == "windows" {
-		parts := []string{"set", cmdQuote("GO_WANT_HELPER_PROCESS=1"), "&", cmdQuote(os.Args[0]), cmdQuote("-test.run=TestRunnerHelperProcess"), cmdQuote("--")}
+		cmd := fmt.Sprintf("set GO_WANT_HELPER_PROCESS=1 & %q -test.run=TestRunnerHelperProcess --", os.Args[0])
 		for _, arg := range args {
-			parts = append(parts, cmdQuote(arg))
+			cmd += " " + cmdQuote(arg)
 		}
-		return strings.Join(parts, " ")
+		return cmd
 	}
 	parts := []string{"GO_WANT_HELPER_PROCESS=1", strconv.Quote(os.Args[0]), "-test.run=TestRunnerHelperProcess", "--"}
 	for _, arg := range args {
