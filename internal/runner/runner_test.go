@@ -77,6 +77,41 @@ func TestRunnerHelperProcess(t *testing.T) {
 		}
 		time.Sleep(d)
 		os.Exit(0)
+	case "touch":
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(args[1], []byte("started"), 0o644); err != nil {
+			os.Exit(2)
+		}
+		os.Exit(0)
+	case "touch-block":
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(args[1], []byte("started"), 0o644); err != nil {
+			os.Exit(2)
+		}
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	case "fail-after-file":
+		if len(args) != 3 {
+			os.Exit(2)
+		}
+		timeout, err := time.ParseDuration(args[2])
+		if err != nil {
+			os.Exit(2)
+		}
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(args[1]); err == nil {
+				os.Exit(1)
+			} else if !os.IsNotExist(err) {
+				os.Exit(2)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		os.Exit(2)
 	case "log":
 		if len(args) != 2 {
 			os.Exit(2)
@@ -377,5 +412,125 @@ func TestRun_MultipleFailedProcessesErrorContainsNames(t *testing.T) {
 	msg := err.Error()
 	if len(msg) == 0 {
 		t.Fatal("expected non-empty error message")
+	}
+}
+
+func TestRun_TaskModeSuccessUnblocksDependent(t *testing.T) {
+	appStarted := t.TempDir() + string(os.PathSeparator) + "app-started"
+	r := makeRunner(map[string]config.Process{
+		"migrate": {Cmd: helperCmd("sleep", "200ms"), Restart: "never", Mode: config.ProcessModeTask},
+		"app": {
+			Cmd:       helperCmd("touch", appStarted),
+			Restart:   "never",
+			DependsOn: []string{"migrate"},
+		},
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background()) }()
+
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(appStarted); err == nil {
+		t.Fatal("dependent service started before task completed")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat app marker: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected task success to unblock dependent and return nil, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not finish after task completed")
+	}
+	if _, err := os.Stat(appStarted); err != nil {
+		t.Fatalf("expected dependent service to start after task completed: %v", err)
+	}
+}
+
+func TestRun_TaskModeFailurePreventsDependent(t *testing.T) {
+	appStarted := t.TempDir() + string(os.PathSeparator) + "app-started"
+	r := makeRunner(map[string]config.Process{
+		"migrate": {Cmd: helperCmd("exit", "1"), Restart: "never", Mode: config.ProcessModeTask},
+		"app": {
+			Cmd:       helperCmd("touch", appStarted),
+			Restart:   "never",
+			DependsOn: []string{"migrate"},
+		},
+	})
+
+	err := r.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected non-nil error when task fails")
+	}
+	if !strings.Contains(err.Error(), "migrate") {
+		t.Fatalf("expected error to mention failed task, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "app") {
+		t.Fatalf("expected error to mention failed dependent, got: %v", err)
+	}
+	if _, statErr := os.Stat(appStarted); statErr == nil {
+		t.Fatal("dependent service started after task failure")
+	} else if !os.IsNotExist(statErr) {
+		t.Fatalf("stat app marker: %v", statErr)
+	}
+}
+
+func TestRun_TaskModeFailureCancelsStack(t *testing.T) {
+	siblingStarted := t.TempDir() + string(os.PathSeparator) + "sibling-started"
+	r := makeRunner(map[string]config.Process{
+		"api":     {Cmd: helperCmd("touch-block", siblingStarted), Restart: "never"},
+		"migrate": {Cmd: helperCmd("fail-after-file", siblingStarted, "1s"), Restart: "never", Mode: config.ProcessModeTask},
+	})
+
+	start := time.Now()
+	err := r.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected non-nil error when task fails")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("expected task failure to cancel sibling quickly, took %s", elapsed)
+	}
+	if _, statErr := os.Stat(siblingStarted); statErr != nil {
+		t.Fatalf("expected sibling service to have started before cancellation: %v", statErr)
+	}
+}
+
+func TestRun_TaskModeSuccessStateCompletedReady(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"migrate": {Cmd: helperCmd("exit", "0"), Restart: "never", Mode: config.ProcessModeTask},
+	})
+
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatalf("expected task success to return nil, got: %v", err)
+	}
+	states := r.store.snapshot()
+	if len(states) != 1 {
+		t.Fatalf("expected one state, got %d", len(states))
+	}
+	st := states[0]
+	if st.State != "completed" {
+		t.Fatalf("task state = %q, want completed", st.State)
+	}
+	if !st.Ready {
+		t.Fatal("task Ready = false, want true after successful completion")
+	}
+	if st.PID != 0 {
+		t.Fatalf("task PID = %d, want 0 after completion", st.PID)
+	}
+}
+
+func TestRun_TaskModeRunnerDefenseIgnoresRestartAlways(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"migrate": {Cmd: helperCmd("exit", "0"), Restart: "always", Mode: config.ProcessModeTask, MaxRestarts: 2},
+	})
+
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatalf("expected successful task to finish without restarting, got: %v", err)
+	}
+	states := r.store.snapshot()
+	if states[0].Restarts != 0 {
+		t.Fatalf("task restarts = %d, want 0", states[0].Restarts)
 	}
 }

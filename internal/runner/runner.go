@@ -101,6 +101,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		go r.collectMetrics(ctx, store, procs)
 	}
 
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
 	var (
 		wg          sync.WaitGroup
 		failedMu    sync.Mutex
@@ -110,10 +113,14 @@ func (r *Runner) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func(p procInfo) {
 			defer wg.Done()
-			if r.runProcess(ctx, p, maxName, store) {
+			result := r.runProcess(runCtx, p, maxName, store)
+			if result.failed {
 				failedMu.Lock()
 				failedNames = append(failedNames, p.name)
 				failedMu.Unlock()
+				if result.failFast {
+					cancelRun()
+				}
 			}
 		}(p)
 	}

@@ -9,12 +9,18 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
+type processRunResult struct {
+	failed   bool
+	failFast bool
+}
+
 // runProcess runs the lifecycle loop for a single process.
-// Returns true if the process ended in the "failed" state (restart:never + non-zero exit).
-func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store *stateStore) bool {
+// Returns failure metadata when the process ended in the "failed" state.
+func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store *stateStore) processRunResult {
 	st := store.get(p.name)
 	backoff := time.Second
 
@@ -28,7 +34,21 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		r.logEvent(p, fmt.Sprintf("waiting for %s...", dep))
 		select {
 		case <-ctx.Done():
-			return false
+			depSt.mu.Lock()
+			depFailed := depSt.readyClosed && !depSt.readyOK
+			depSt.mu.Unlock()
+			if depFailed {
+				msg := fmt.Sprintf("dependency %q failed", dep)
+				PrintProcessError(p.name, maxName, p.colorIndex, msg)
+				r.logEvent(p, msg)
+				st.mu.Lock()
+				st.state = "failed"
+				st.mu.Unlock()
+				r.broadcastState(p, st)
+				st.markReady(false)
+				return processRunResult{failed: true}
+			}
+			return processRunResult{}
 		case <-depSt.readyChannel():
 			depSt.mu.Lock()
 			depOK := depSt.readyOK
@@ -42,9 +62,13 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 				st.mu.Unlock()
 				r.broadcastState(p, st)
 				st.markReady(false)
-				return true
+				return processRunResult{failed: true}
 			}
 		}
+	}
+
+	if p.proc.EffectiveMode() == config.ProcessModeTask {
+		return r.runTaskProcess(ctx, p, maxName, st)
 	}
 
 	// Pre-compile log probe regex once (validated at config load).
@@ -99,7 +123,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			st.mu.Unlock()
 			r.broadcastState(p, st)
 			PrintProcessEvent(p.name, maxName, p.colorIndex, "stopped")
-			return false
+			return processRunResult{}
 		default:
 		}
 
@@ -139,7 +163,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 				next := st.restarts + 1
 				st.mu.Unlock()
 				if p.proc.MaxRestarts > 0 && next > p.proc.MaxRestarts {
-					return r.giveUp(p, maxName, st)
+					return processRunResult{failed: r.giveUp(p, maxName, st)}
 				}
 				PrintProcessEvent(p.name, maxName, p.colorIndex, "exited, restarting...")
 				r.logEvent(p, "exited, restarting...")
@@ -153,7 +177,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			}
 			PrintProcessEvent(p.name, maxName, p.colorIndex, "exited")
 			r.logEvent(p, "exited")
-			return false
+			return processRunResult{}
 		}
 
 		PrintProcessError(p.name, maxName, p.colorIndex, fmt.Sprintf("exited: %v", err))
@@ -164,14 +188,14 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			st.state = "failed"
 			st.mu.Unlock()
 			r.broadcastState(p, st)
-			return true
+			return processRunResult{failed: true}
 		}
 
 		st.mu.Lock()
 		next := st.restarts + 1
 		st.mu.Unlock()
 		if p.proc.MaxRestarts > 0 && next > p.proc.MaxRestarts {
-			return r.giveUp(p, maxName, st)
+			return processRunResult{failed: r.giveUp(p, maxName, st)}
 		}
 
 		st.mu.Lock()
@@ -184,7 +208,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 
 		select {
 		case <-ctx.Done():
-			return false
+			return processRunResult{}
 		case <-st.restartCh:
 			// Restart requested during backoff — skip the wait.
 			backoff = time.Second
@@ -197,6 +221,50 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			backoff *= 2
 		}
 	}
+}
+
+func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st *procState) processRunResult {
+	st.mu.Lock()
+	st.startedAt = time.Now()
+	st.state = "running"
+	st.mu.Unlock()
+	r.broadcastState(p, st)
+
+	err := r.exec(ctx, p, maxName, st, nil, nil)
+
+	st.mu.Lock()
+	st.pid = 0
+	st.mu.Unlock()
+
+	if ctx.Err() != nil {
+		st.mu.Lock()
+		st.state = "exited"
+		st.mu.Unlock()
+		r.broadcastState(p, st)
+		PrintProcessEvent(p.name, maxName, p.colorIndex, "stopped")
+		return processRunResult{}
+	}
+
+	if err == nil {
+		st.mu.Lock()
+		st.state = "completed"
+		st.mu.Unlock()
+		st.markReady(true)
+		r.broadcastState(p, st)
+		PrintProcessEvent(p.name, maxName, p.colorIndex, "completed")
+		r.logEvent(p, "completed")
+		return processRunResult{}
+	}
+
+	msg := fmt.Sprintf("task failed: %v", err)
+	PrintProcessError(p.name, maxName, p.colorIndex, msg)
+	r.logEvent(p, msg)
+	st.mu.Lock()
+	st.state = "failed"
+	st.mu.Unlock()
+	st.markReady(false)
+	r.broadcastState(p, st)
+	return processRunResult{failed: true, failFast: true}
 }
 
 // buildReadinessCallbacks builds onStart and onLine hooks bound to the
