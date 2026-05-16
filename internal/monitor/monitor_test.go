@@ -75,6 +75,20 @@ func TestApplyEvent_StateUpdate(t *testing.T) {
 	}
 }
 
+func TestApplyEvent_StateUpdateRebuildsHealthOrder(t *testing.T) {
+	m := newTestMonitor()
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "api", State: "running", Ready: true},
+		{Name: "worker", State: "running", Ready: true},
+	}})
+
+	m.applyEvent(ipc.Event{Type: ipc.TypeState, Proc: &ipc.ProcState{Name: "worker", State: "failed"}})
+
+	if got := strings.Join(m.procOrder, ","); got != "worker,api" {
+		t.Errorf("procOrder = %q, want worker,api", got)
+	}
+}
+
 func TestApplyEvent_TunnelURL(t *testing.T) {
 	m := newTestMonitor()
 	m.applyEvent(ipc.Event{Type: ipc.TypeTunnel, TunnelURL: "https://new.tunnel/"})
@@ -85,15 +99,31 @@ func TestApplyEvent_TunnelURL(t *testing.T) {
 
 func TestRebuildOrder_Sorted(t *testing.T) {
 	m := newTestMonitor()
-	m.procs["zzz"] = &ipc.ProcState{Name: "zzz"}
-	m.procs["aaa"] = &ipc.ProcState{Name: "aaa"}
-	m.procs["mmm"] = &ipc.ProcState{Name: "mmm"}
+	m.procs["zzz"] = &ipc.ProcState{Name: "zzz", State: "running", Ready: true}
+	m.procs["aaa"] = &ipc.ProcState{Name: "aaa", State: "running", Ready: true}
+	m.procs["mmm"] = &ipc.ProcState{Name: "mmm", State: "running", Ready: true}
 	m.rebuildOrder()
 	want := []string{"aaa", "mmm", "zzz"}
 	for i, n := range want {
 		if m.procOrder[i] != n {
 			t.Errorf("procOrder[%d] = %q, want %q", i, m.procOrder[i], n)
 		}
+	}
+}
+
+func TestRebuildOrder_SortsByHealthThenName(t *testing.T) {
+	m := newTestMonitor()
+	m.procs["ready-api"] = &ipc.ProcState{Name: "ready-api", State: "running", Ready: true}
+	m.procs["starting-web"] = &ipc.ProcState{Name: "starting-web", State: "running"}
+	m.procs["failed-worker"] = &ipc.ProcState{Name: "failed-worker", State: "failed"}
+	m.procs["restarting-db"] = &ipc.ProcState{Name: "restarting-db", State: "restarting"}
+	m.procs["ready-web"] = &ipc.ProcState{Name: "ready-web", State: "running", Ready: true}
+
+	m.rebuildOrder()
+
+	want := []string{"failed-worker", "restarting-db", "starting-web", "ready-api", "ready-web"}
+	if got := strings.Join(m.procOrder, ","); got != strings.Join(want, ",") {
+		t.Errorf("procOrder = %q, want %q", got, strings.Join(want, ","))
 	}
 }
 
@@ -215,14 +245,127 @@ func TestApplyEvent_SnapshotMultipleProcsAreSorted(t *testing.T) {
 	m.applyEvent(ipc.Event{
 		Type: ipc.TypeSnapshot,
 		Processes: []ipc.ProcState{
-			{Name: "zeta"},
-			{Name: "alpha"},
-			{Name: "mu"},
+			{Name: "zeta", State: "running", Ready: true},
+			{Name: "alpha", State: "running", Ready: true},
+			{Name: "mu", State: "running", Ready: true},
 		},
 	})
 	got := strings.Join(m.procOrder, ",")
 	if got != "alpha,mu,zeta" {
 		t.Errorf("procOrder = %q, want alpha,mu,zeta", got)
+	}
+}
+
+func TestHandleKeyEnterTogglesSelectedProcessFilter(t *testing.T) {
+	m := newTestMonitor()
+	m.procOrder = []string{"api", "web"}
+	m.selected = 1
+	m.filter = "web"
+	m.logOffset = 3
+
+	m.handleKey("enter")
+
+	if m.filter != "" {
+		t.Errorf("filter = %q, want cleared", m.filter)
+	}
+	if m.logOffset != 0 {
+		t.Errorf("logOffset = %d, want 0", m.logOffset)
+	}
+
+	m.handleKey("enter")
+	if m.filter != "web" {
+		t.Errorf("filter = %q, want web", m.filter)
+	}
+}
+
+func TestRenderFrameShowsReadinessSummaryAndFilterState(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 120
+	m.height = 20
+	m.filter = "api"
+	m.applyEvent(ipc.Event{
+		Type: ipc.TypeSnapshot,
+		Processes: []ipc.ProcState{
+			{Name: "api", State: "running", Ready: true},
+			{Name: "web", State: "running"},
+			{Name: "worker", State: "failed"},
+		},
+		RecentLogs: []ipc.LogEntry{{Process: "api", Line: "listening"}},
+	})
+
+	out := string(stripColor(m.renderFrame()))
+	for _, want := range []string{"READY", "ready 1/3", "failed 1", "Logs: filtered to api", "ready", "waiting"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("render output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestSummaryLineCountsOnlyRunningReadyProcesses(t *testing.T) {
+	m := newTestMonitor()
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "api", State: "running", Ready: true},
+		{Name: "worker", State: "failed", Ready: true},
+	}})
+
+	if got := m.summaryLine(); !strings.Contains(got, "ready 1/2") {
+		t.Errorf("summaryLine = %q, want ready 1/2", got)
+	}
+}
+
+func TestRenderFrameShowsEmptyLogStates(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 100
+	m.height = 16
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{{Name: "api", State: "running", Ready: true}}})
+
+	out := string(stripColor(m.renderFrame()))
+	if !strings.Contains(out, "No logs yet") {
+		t.Errorf("render output missing empty log message:\n%s", out)
+	}
+
+	m.filter = "api"
+	m.pushLog(ipc.LogEntry{Process: "web", Line: "hello"})
+	out = string(stripColor(m.renderFrame()))
+	if !strings.Contains(out, "No logs for api yet") {
+		t.Errorf("render output missing filtered empty message:\n%s", out)
+	}
+}
+
+func TestRenderHelpMentionsDismissKeysAndQuit(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 80
+	m.height = 24
+
+	out := string(stripColor(m.renderHelpFrame()))
+	for _, want := range []string{"Esc", "Space", "press q to quit"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestSmallTerminalFallbackIncludesSummary(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 30
+	m.height = 6
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{{Name: "api", State: "running", Ready: true}}})
+
+	out := string(stripColor(m.renderFrame()))
+	if !strings.Contains(out, "ready 1/1") {
+		t.Errorf("small terminal output missing summary:\n%s", out)
+	}
+}
+
+func TestActiveFrameUsesSmallTerminalFallbackBeforeHelpOverlay(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 30
+	m.height = 6
+	m.showHelp = true
+
+	out := string(stripColor(m.renderActiveFrame()))
+	if !strings.Contains(out, "terminal too small") {
+		t.Errorf("active frame should show small terminal fallback, got:\n%s", out)
 	}
 }
 

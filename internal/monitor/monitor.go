@@ -70,8 +70,8 @@ type monitor struct {
 	// implementation used `logs = logs[1:]` which memmoved the whole slice
 	// every line of every process.
 	logs      []ipc.LogEntry
-	logHead   int // index of next write
-	logCount  int // number of valid entries (≤ maxLogs)
+	logHead   int    // index of next write
+	logCount  int    // number of valid entries (≤ maxLogs)
 	filter    string // "" = all; process name = filtered
 	logOffset int    // scroll offset; 0 = tail (newest at bottom)
 
@@ -196,10 +196,10 @@ func (m *monitor) run() error {
 
 		case <-resize:
 			if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
-		m.width, m.height = w, h
-	} else {
-		fmt.Fprintf(os.Stderr, "WARN: failed to get terminal size: %v\n", err)
-	}
+				m.width, m.height = w, h
+			} else {
+				fmt.Fprintf(os.Stderr, "WARN: failed to get terminal size: %v\n", err)
+			}
 			m.render()
 
 		case <-ticker.C:
@@ -259,6 +259,7 @@ func (m *monitor) applyEvent(ev ipc.Event) {
 		if ev.Proc != nil {
 			cp := *ev.Proc
 			m.procs[cp.Name] = &cp
+			m.rebuildOrder()
 		}
 
 	case ipc.TypeTunnel:
@@ -271,10 +272,34 @@ func (m *monitor) rebuildOrder() {
 	for n := range m.procs {
 		names = append(names, n)
 	}
-	sort.Strings(names)
+	sort.Slice(names, func(i, j int) bool {
+		left := m.procs[names[i]]
+		right := m.procs[names[j]]
+		if leftRank, rightRank := healthRank(left), healthRank(right); leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		return names[i] < names[j]
+	})
 	m.procOrder = names
 	if m.selected >= len(m.procOrder) {
 		m.selected = max(0, len(m.procOrder)-1)
+	}
+}
+
+func healthRank(st *ipc.ProcState) int {
+	if st == nil {
+		return 4
+	}
+	switch st.State {
+	case "failed", "restarting":
+		return 0
+	case "running":
+		if st.Ready {
+			return 2
+		}
+		return 1
+	default:
+		return 3
 	}
 }
 
@@ -282,9 +307,8 @@ func (m *monitor) rebuildOrder() {
 
 func (m *monitor) handleKey(key string) (quit bool) {
 	// Help overlay swallows every key except quit. Any keypress dismisses it
-	// — we list a few canonical ones in renderHelp ("Press ? or q to close")
-	// but accepting Esc / Enter / Space / any letter is friendlier than
-	// silently ignoring them while the user wonders why the TUI is frozen.
+	// so Esc / Enter / Space / any letter all work instead of leaving the user
+	// wondering why the TUI is frozen.
 	if m.showHelp {
 		switch key {
 		case "q", "ctrl-c":
@@ -310,7 +334,12 @@ func (m *monitor) handleKey(key string) (quit bool) {
 		}
 	case "enter":
 		if len(m.procOrder) > 0 {
-			m.filter = m.procOrder[m.selected]
+			selected := m.procOrder[m.selected]
+			if m.filter == selected {
+				m.filter = ""
+			} else {
+				m.filter = selected
+			}
 			m.logOffset = 0
 		}
 	case "a":
@@ -416,23 +445,36 @@ var ansiSGRRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 func stripColor(b []byte) []byte { return ansiSGRRe.ReplaceAll(b, nil) }
 
 func (m *monitor) render() {
+	m.write(m.renderActiveFrame())
+}
+
+func (m *monitor) renderActiveFrame() []byte {
+	if m.showHelp && m.width >= 40 && m.height >= 8 {
+		return m.renderHelpFrame()
+	}
+	return m.renderFrame()
+}
+
+func (m *monitor) renderFrame() []byte {
 	if m.width < 40 || m.height < 8 {
 		// Don't try to draw the table — the layout collapses below this.
 		// Show a single hint line instead so the user understands why the
 		// TUI looks empty rather than wondering if it has frozen.
 		var buf bytes.Buffer
-		buf.WriteString("\033[H\033[K")
-		fmt.Fprintf(&buf, "terminal too small (%dx%d, need at least 40x8)\n",
-			m.width, m.height)
-		buf.WriteString("\033[K")
-		fmt.Fprintf(&buf, "press q to quit, resize the window to continue.\n")
+		lines := []string{
+			fmt.Sprintf("terminal too small %dx%d", m.width, m.height),
+			m.summaryLine(),
+			"press q to quit",
+			"resize to continue",
+		}
+		for i, line := range lines {
+			if i >= m.height {
+				break
+			}
+			fmt.Fprintf(&buf, "\033[%d;1H\033[K%s", i+1, truncate(line, m.width-1))
+		}
 		buf.WriteString("\033[J")
-		m.write(buf.Bytes())
-		return
-	}
-	if m.showHelp {
-		m.renderHelp()
-		return
+		return buf.Bytes()
 	}
 	var buf bytes.Buffer
 
@@ -459,6 +501,11 @@ func (m *monitor) render() {
 		ansiDim, hints, ansiReset)
 	row++
 
+	// ── Summary ───────────────────────────────────────────────────────────────
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K  %s%s%s",
+		row, ansiBold, m.summaryLine(), ansiReset)
+	row++
+
 	// ── Tunnel URL (only shown when --tunnel is active) ───────────────────────
 	if m.tunnelURL != "" {
 		label := "  public: "
@@ -473,9 +520,9 @@ func (m *monitor) render() {
 	}
 
 	// ── Process table header ──────────────────────────────────────────────────
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%-*s  %-11s  %-8s  %-6s  %-7s  %s%s",
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%-*s  %-11s  %-8s  %-6s  %-7s  %-8s  %s%s",
 		row, ansiDim,
-		m.maxProcNameLen(), "PROCESS", "STATUS", "RESTARTS", "CPU%", "MEM", "UPTIME", ansiReset)
+		m.maxProcNameLen(), "PROCESS", "STATUS", "RESTARTS", "CPU%", "MEM", "READY", "UPTIME", ansiReset)
 	row++
 
 	// ── Process rows ──────────────────────────────────────────────────────────
@@ -500,8 +547,9 @@ func (m *monitor) render() {
 		c := colorFor(st.ColorIndex)
 		cpuStr := formatCPU(st.CPUPercent)
 		memStr := formatMemory(st.MemoryMB)
+		readyStr := readinessDisplay(st)
 
-		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%-*s%s  %s%s%-11s%s  %-8s  %-6s  %-7s  %s%s",
+		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%-*s%s  %s%s%-11s%s  %-8s  %-6s  %-7s  %-8s  %s%s",
 			row,
 			cursor, prefix,
 			ansiBold+c, m.maxProcNameLen(), padRight(name, m.maxProcNameLen()), ansiReset,
@@ -509,14 +557,15 @@ func (m *monitor) render() {
 			restarts,
 			cpuStr,
 			memStr,
+			readyStr,
 			uptime, suffix)
 		row++
 	}
 
 	// ── Log area header ───────────────────────────────────────────────────────
-	filterLabel := "all"
+	filterLabel := "Logs: all"
 	if m.filter != "" {
-		filterLabel = m.filter
+		filterLabel = "Logs: filtered to " + m.filter
 	}
 	scrollHint := ""
 	if m.logOffset > 0 {
@@ -525,15 +574,14 @@ func (m *monitor) render() {
 	div := strings.Repeat("─", m.width)
 	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s", row, div)
 	row++
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K  %sLOGS%s  [%s]%s",
-		row, ansiBold, ansiReset, filterLabel, scrollHint)
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K  %s%s%s%s",
+		row, ansiBold, filterLabel, ansiReset, scrollHint)
 	row++
 
 	// ── Log lines ─────────────────────────────────────────────────────────────
 	logRows := m.height - row
 	if logRows < 1 {
-		m.write(buf.Bytes())
-		return
+		return buf.Bytes()
 	}
 
 	visible := m.filteredLogs()
@@ -549,6 +597,14 @@ func (m *monitor) render() {
 		start = 0
 	}
 	display := visible[start:end]
+	if len(display) == 0 {
+		message := "No logs yet"
+		if m.filter != "" {
+			message = fmt.Sprintf("No logs for %s yet", m.filter)
+		}
+		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s", row, ansiDim, message, ansiReset)
+		row++
+	}
 
 	for _, entry := range display {
 		c := colorFor(m.procColorIdx(entry.Process))
@@ -575,7 +631,7 @@ func (m *monitor) render() {
 		fmt.Fprintf(&buf, "\033[%d;1H\033[J", row)
 	}
 
-	m.write(buf.Bytes())
+	return buf.Bytes()
 }
 
 // write emits the assembled frame, stripping SGR escape sequences when
@@ -606,6 +662,10 @@ func (m *monitor) renderMessage(msg string) {
 
 // renderHelp displays a centered help overlay with all keyboard shortcuts.
 func (m *monitor) renderHelp() {
+	m.write(m.renderHelpFrame())
+}
+
+func (m *monitor) renderHelpFrame() []byte {
 	var buf bytes.Buffer
 	buf.WriteString("\033[H\033[J")
 
@@ -614,19 +674,28 @@ func (m *monitor) renderHelp() {
 		"",
 		"  q, Ctrl+C        Quit",
 		"  ?, h             Toggle this help",
+		"  Esc, Space       Close this help",
 		"  ↑/↓ or k/j       Navigate processes",
-		"  Enter            Filter logs to selected process",
+		"  Enter            Toggle filter for selected process",
 		"  a                Show all logs (unfilter)",
 		"  PgUp/PgDn        Scroll log area",
 		"  G                Jump to live tail",
 		"  g                Jump to top of buffer",
 		"",
-		"Press any key to close",
+		"Press Esc, Space, or any key to close; press q to quit",
 	}
 
 	// Calculate centered box dimensions.
-	boxWidth := 40
-	if m.width < boxWidth {
+	boxWidth := 0
+	for _, line := range lines {
+		if w := utf8.RuneCountInString(line) + 4; w > boxWidth {
+			boxWidth = w
+		}
+	}
+	if boxWidth < 40 {
+		boxWidth = 40
+	}
+	if m.width > 0 && boxWidth > m.width {
 		boxWidth = m.width
 	}
 	boxHeight := len(lines) + 2 // +2 for border
@@ -660,7 +729,7 @@ func (m *monitor) renderHelp() {
 	fmt.Fprintf(&buf, "\033[%d;%dH%s%s%s",
 		row, startCol, ansiBold+ansiCyan, strings.Repeat("─", boxWidth-2), ansiReset)
 
-	m.write(buf.Bytes())
+	return buf.Bytes()
 }
 
 func (m *monitor) filteredLogs() []ipc.LogEntry {
@@ -682,7 +751,7 @@ func (m *monitor) logAreaRows() int {
 	if m.tunnelURL != "" {
 		extra = 1
 	}
-	rows := m.height - 3 - len(m.procOrder) - 2 - extra
+	rows := m.height - 4 - len(m.procOrder) - 2 - extra
 	if rows < 1 {
 		return 1
 	}
@@ -714,7 +783,43 @@ func (m *monitor) procColorIdx(name string) int {
 	return h
 }
 
+func (m *monitor) summaryLine() string {
+	total := len(m.procOrder)
+	ready := 0
+	failed := 0
+	restarting := 0
+	for _, name := range m.procOrder {
+		st := m.procs[name]
+		if st == nil {
+			continue
+		}
+		if st.State == "running" && st.Ready {
+			ready++
+		}
+		switch st.State {
+		case "failed":
+			failed++
+		case "restarting":
+			restarting++
+		}
+	}
+	return fmt.Sprintf("ready %d/%d  failed %d  restarting %d", ready, total, failed, restarting)
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+func readinessDisplay(st *ipc.ProcState) string {
+	if st == nil {
+		return "-"
+	}
+	if st.State != "running" {
+		return "-"
+	}
+	if st.Ready {
+		return "ready"
+	}
+	return "waiting"
+}
 
 func stateDisplay(state string) (color, sym string) {
 	switch state {
@@ -775,4 +880,3 @@ func padRight(s string, width int) string {
 	}
 	return s + strings.Repeat(" ", remain)
 }
-
