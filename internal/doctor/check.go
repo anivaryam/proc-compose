@@ -113,7 +113,7 @@ func checkExistingConfig(report *Report, root string) {
 		}
 		for _, dep := range proc.DependsOn {
 			depProc, ok := cfg.Processes[dep]
-			if ok && depProc.ReadyWhen == nil {
+			if ok && depProc.ReadyWhen == nil && depProc.EffectiveMode() != config.ProcessModeTask {
 				report.Findings = append(report.Findings, Finding{
 					Severity:   SeverityInfo,
 					Code:       codeDependencyWithoutReadiness,

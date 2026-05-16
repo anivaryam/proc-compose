@@ -824,3 +824,67 @@ func hasFinding(report *Report, code string) bool {
 	}
 	return false
 }
+
+func TestServiceDependencyWithoutReadinessWarns(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `processes:
+  api:
+    cmd: go run .
+    env:
+      PORT: "3000"
+  worker:
+    cmd: go run ./worker
+    depends_on:
+      - api
+`)
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(report, codeDependencyWithoutReadiness) {
+		t.Fatalf("expected dependency_without_readiness warning for service-mode dep, got %+v", report.Findings)
+	}
+}
+
+func TestTaskDependencyWithoutReadinessNoWarning(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `processes:
+  migrate:
+    cmd: go run ./migrate
+    mode: task
+  app:
+    cmd: go run .
+    depends_on:
+      - migrate
+`)
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasFinding(report, codeDependencyWithoutReadiness) {
+		t.Fatalf("expected no dependency_without_readiness warning for task-mode dep, got %+v", report.Findings)
+	}
+}
+
+func TestServiceDependencyWithReadinessNoWarning(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `processes:
+  api:
+    cmd: go run .
+    ready_when:
+      tcp: localhost:3000
+  worker:
+    cmd: go run ./worker
+    depends_on:
+      - api
+`)
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasFinding(report, codeDependencyWithoutReadiness) {
+		t.Fatalf("expected no dependency_without_readiness warning when dep has ready_when, got %+v", report.Findings)
+	}
+}
