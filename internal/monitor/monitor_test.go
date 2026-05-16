@@ -1,12 +1,28 @@
 package monitor
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/ipc"
 )
+
+var testCSIRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+func plainFrameLines(frame []byte) []string {
+	plain := string(stripColor(frame))
+	plain = testCSIRe.ReplaceAllString(plain, "\n")
+	var lines []string
+	for _, line := range strings.Split(plain, "\n") {
+		line = strings.TrimRight(line, " ")
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
 
 func newTestMonitor() *monitor {
 	return &monitor{
@@ -299,6 +315,53 @@ func TestRenderFrameShowsReadinessSummaryAndFilterState(t *testing.T) {
 			t.Errorf("render output missing %q:\n%s", want, out)
 		}
 	}
+}
+
+func TestRenderFrameReservesCursorColumnForEveryProcessRow(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 120
+	m.height = 20
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "api", State: "running", Ready: true},
+		{Name: "web", State: "running", Ready: true},
+	}})
+	m.selected = 0
+
+	lines := plainFrameLines(m.renderFrame())
+	apiCol := -1
+	webCol := -1
+	for _, line := range lines {
+		if strings.Contains(line, "api") && strings.Contains(line, "running") {
+			apiCol = len([]rune(line[:strings.Index(line, "api")]))
+		}
+		if strings.Contains(line, "web") && strings.Contains(line, "running") {
+			webCol = len([]rune(line[:strings.Index(line, "web")]))
+		}
+	}
+	if apiCol < 0 || webCol < 0 {
+		t.Fatalf("missing process rows in frame lines: %#v", lines)
+	}
+	if apiCol != webCol {
+		t.Fatalf("selected process text starts at column %d, unselected starts at %d; lines=%#v", apiCol, webCol, lines)
+	}
+}
+
+func TestRenderFrameAlignsLogHeaderToLeftEdge(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 100
+	m.height = 16
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{{Name: "api", State: "running", Ready: true}}})
+
+	lines := plainFrameLines(m.renderFrame())
+	for _, line := range lines {
+		if strings.Contains(line, "Logs: all") {
+			if !strings.HasPrefix(line, "Logs: all") {
+				t.Fatalf("log header = %q, want left-aligned", line)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing Logs: all header in lines: %#v", lines)
 }
 
 func TestSummaryLineCountsOnlyRunningReadyProcesses(t *testing.T) {

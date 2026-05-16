@@ -520,7 +520,7 @@ func (m *monitor) renderFrame() []byte {
 	}
 
 	// ── Process table header ──────────────────────────────────────────────────
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%-*s  %-11s  %-8s  %-6s  %-7s  %-8s  %s%s",
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s  %-*s  %-11s  %-8s  %-6s  %-7s  %-8s  %s%s",
 		row, ansiDim,
 		m.maxProcNameLen(), "PROCESS", "STATUS", "RESTARTS", "CPU%", "MEM", "READY", "UPTIME", ansiReset)
 	row++
@@ -532,7 +532,7 @@ func (m *monitor) renderFrame() []byte {
 		prefix := ""
 		suffix := ""
 		if i == m.selected {
-			cursor = ansiReverse + " ▶" + ansiReset + " "
+			cursor = ansiReverse + "▶ " + ansiReset
 			prefix = ansiReverse
 			suffix = ansiReset
 		}
@@ -574,7 +574,7 @@ func (m *monitor) renderFrame() []byte {
 	div := strings.Repeat("─", m.width)
 	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s", row, div)
 	row++
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K  %s%s%s%s",
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%s",
 		row, ansiBold, filterLabel, ansiReset, scrollHint)
 	row++
 
