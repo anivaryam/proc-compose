@@ -76,6 +76,7 @@ Example:
 	// ── bootstrap ─────────────────────────────────────────────────────────────
 	var (
 		bootstrapWrite  bool
+		bootstrapForce  bool
 		bootstrapVerify bool
 		bootstrapJSON   bool
 	)
@@ -688,26 +689,22 @@ Example:
 		Short: "Generate and optionally verify proc-compose setup",
 		Example: `  proc-compose bootstrap                  # show generated config without changing files
   proc-compose bootstrap --write          # create proc-compose.yml when missing
+  proc-compose bootstrap --write --force  # overwrite existing config
   proc-compose bootstrap --verify         # verify generated config through proc-compose
   proc-compose bootstrap --write --verify # write and verify setup
   proc-compose bootstrap --json           # machine-readable report`,
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bootstrapRoot := "."
-			bootstrapConfig := ""
-			if cmd.Root().PersistentFlags().Changed("file") {
-				absConfig, absErr := filepath.Abs(configFile)
-				if absErr != nil {
-					return absErr
-				}
-				bootstrapRoot = filepath.Dir(absConfig)
-				bootstrapConfig = absConfig
+			bootstrapRoot, bootstrapConfig, err := resolveConfigContext(configFile, cmd.Root().PersistentFlags().Changed("file"))
+			if err != nil {
+				return err
 			}
 			report, err := bootstrap.Run(bootstrap.Options{
 				Root:       bootstrapRoot,
 				ConfigFile: bootstrapConfig,
 				Write:      bootstrapWrite,
+				Overwrite:  bootstrapForce,
 				Verify:     bootstrapVerify,
 			})
 			if bootstrapJSON {
@@ -725,6 +722,7 @@ Example:
 		},
 	}
 	bootstrapCmd.Flags().BoolVar(&bootstrapWrite, "write", false, "create proc-compose.yml when no config exists")
+	bootstrapCmd.Flags().BoolVar(&bootstrapForce, "force", false, "overwrite existing config when used with --write")
 	bootstrapCmd.Flags().BoolVar(&bootstrapVerify, "verify", false, "verify generated config through proc-compose")
 	bootstrapCmd.Flags().BoolVar(&bootstrapJSON, "json", false, "emit machine-readable JSON")
 
@@ -739,15 +737,9 @@ Example:
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			doctorRoot := "."
-			doctorConfig := ""
-			if cmd.Root().PersistentFlags().Changed("file") {
-				absConfig, absErr := filepath.Abs(configFile)
-				if absErr != nil {
-					return absErr
-				}
-				doctorRoot = filepath.Dir(absConfig)
-				doctorConfig = absConfig
+			doctorRoot, doctorConfig, err := resolveConfigContext(configFile, cmd.Root().PersistentFlags().Changed("file"))
+			if err != nil {
+				return err
 			}
 			report, err := doctor.Run(doctor.Options{Root: doctorRoot, ConfigFile: doctorConfig, Write: doctorWrite})
 			if doctorJSON {
@@ -767,7 +759,7 @@ Example:
 	doctorCmd.Flags().BoolVar(&doctorWrite, "write", false, "create proc-compose.yml when no config exists")
 	doctorCmd.Flags().BoolVar(&doctorJSON, "json", false, "emit machine-readable JSON")
 
-	rootCmd.PersistentFlags().StringVarP(&configFile, "file", "f", "proc-compose.yml", "config file path")
+	rootCmd.PersistentFlags().StringVarP(&configFile, "file", "f", "proc-compose.yml", "config file path (default searches current and parent dirs)")
 	uninstallCmd.Flags().StringVar(&uninstallName, "name", "", "service name to uninstall")
 	if err := uninstallCmd.MarkFlagRequired("name"); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to mark --name as required: %v\n", err)
@@ -793,6 +785,25 @@ func resolveConfigPaths(configFile string) (absConfig, hash, socketPath, pidPath
 	return absConfig, hash, paths.Socket(hash), paths.PID(hash), nil
 }
 
+func resolveConfigContext(configFile string, explicit bool) (root, configPath string, err error) {
+	if explicit {
+		absConfig, absErr := filepath.Abs(configFile)
+		if absErr != nil {
+			return "", "", absErr
+		}
+		return filepath.Dir(absConfig), absConfig, nil
+	}
+	resolved := resolveConfigExtension(configFile)
+	if resolved != configFile {
+		absConfig, absErr := filepath.Abs(resolved)
+		if absErr != nil {
+			return "", "", absErr
+		}
+		return filepath.Dir(absConfig), absConfig, nil
+	}
+	return ".", "", nil
+}
+
 // resolveConfigExtension makes proc-compose.yaml a transparent stand-in for
 // proc-compose.yml when the user accepted the default --file value but
 // keeps the .yaml form in the repo. Only triggers when:
@@ -805,12 +816,28 @@ func resolveConfigExtension(p string) string {
 	if p != "proc-compose.yml" {
 		return p
 	}
-	if _, err := os.Stat(p); err == nil {
+	wd, err := os.Getwd()
+	if err != nil {
 		return p
 	}
-	alt := "proc-compose.yaml"
-	if _, err := os.Stat(alt); err == nil {
-		return alt
+	for dir := wd; ; dir = filepath.Dir(dir) {
+		yml := filepath.Join(dir, "proc-compose.yml")
+		if _, err := os.Stat(yml); err == nil {
+			if dir == wd {
+				return p
+			}
+			return yml
+		}
+		yaml := filepath.Join(dir, "proc-compose.yaml")
+		if _, err := os.Stat(yaml); err == nil {
+			if dir == wd {
+				return "proc-compose.yaml"
+			}
+			return yaml
+		}
+		if parent := filepath.Dir(dir); parent == dir {
+			break
+		}
 	}
 	return p
 }

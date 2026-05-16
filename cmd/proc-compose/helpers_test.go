@@ -114,6 +114,62 @@ func TestResolveConfigExtension_DefaultPrefersYml(t *testing.T) {
 	}
 }
 
+func TestResolveConfigExtension_DefaultFindsParentConfig(t *testing.T) {
+	dir := t.TempDir()
+	child := filepath.Join(dir, "apps", "web")
+	if err := os.MkdirAll(child, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(cwd)
+	if err := os.WriteFile(filepath.Join(dir, "proc-compose.yml"), []byte("processes: {api: {cmd: x}}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(child); err != nil {
+		t.Fatal(err)
+	}
+
+	got := resolveConfigExtension("proc-compose.yml")
+	want := filepath.Join(dir, "proc-compose.yml")
+	if got != want {
+		t.Errorf("got %q, want parent config %q", got, want)
+	}
+}
+
+func TestResolveConfigContextUsesParentConfigAsProjectRoot(t *testing.T) {
+	dir := t.TempDir()
+	child := filepath.Join(dir, "packages", "api")
+	if err := os.MkdirAll(child, 0755); err != nil {
+		t.Fatal(err)
+	}
+	write := []byte("processes: {api: {cmd: x}}\n")
+	if err := os.WriteFile(filepath.Join(dir, "proc-compose.yml"), write, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(cwd)
+	if err := os.Chdir(child); err != nil {
+		t.Fatal(err)
+	}
+
+	root, configPath, err := resolveConfigContext("proc-compose.yml", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root != dir {
+		t.Errorf("root = %q, want %q", root, dir)
+	}
+	if configPath != filepath.Join(dir, "proc-compose.yml") {
+		t.Errorf("configPath = %q, want parent config", configPath)
+	}
+}
+
 func TestBuildChildArgs_NoDuplicateNoBanner(t *testing.T) {
 	got := buildChildArgs([]string{"up", "--silent", "--no-banner"}, "/abs/cfg.yml", "/v/x.log")
 	count := 0
