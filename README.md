@@ -220,16 +220,17 @@ The process starts daemonized. Logs are written to `app.log`. Use `monitor` to w
 proc-compose monitor
 ```
 
-Opens an interactive TUI showing process status, resource usage, and a scrollable log area:
+Opens an interactive TUI showing process status, readiness, resource usage, and a scrollable log area:
 
 ```
 proc-compose monitor               q=quit  ?=help  ↑↓/jk=nav  ⏎=filter  a=all  PgUp/Dn=scroll
-PROCESS      STATUS        RESTARTS  CPU%    MEM       UPTIME
-▶ backend    ● running     0         12.5%    45.2MB   1m32s
-  frontend   ● running     0          8.1%    32.1MB   1m32s
-  merge-port ● running     0          0.2%     8.4MB   1m32s
+  ready 3/3  failed 0  restarting 0
+PROCESS      STATUS        RESTARTS  CPU%    MEM       READY     UPTIME
+▶ backend    ● running     0         12.5%    45.2MB   ready     1m32s
+  frontend   ● running     0          8.1%    32.1MB   ready     1m32s
+  merge-port ● running     0          0.2%     8.4MB   ready     1m32s
 ──────────────────────────────────────────────────────────────────────────────────────────────
-  LOGS  [all]
+  Logs: all
 backend    │ listening on :3001
 frontend   │ VITE v5.4.2  ready in 237ms
 merge-port │ merge-port is running on port 8080
@@ -240,9 +241,9 @@ Keys:
 | Key             | Action                                |
 |-----------------|---------------------------------------|
 | `q` / `Ctrl+C`  | Quit                                  |
-| `?` / `h`       | Toggle help overlay (any key dismisses) |
+| `?` / `h`       | Toggle help overlay (Esc, Space, or any key dismisses; `q` quits) |
 | `↑` / `↓` or `k` / `j` | Navigate processes             |
-| `Enter`         | Filter logs to the selected process   |
+| `Enter`         | Toggle log filtering for the selected process |
 | `a`             | Show all logs (clear filter)          |
 | `PgUp` / `PgDn` | Scroll log area                       |
 | `G`             | Jump to live tail                     |
