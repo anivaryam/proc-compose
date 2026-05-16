@@ -163,7 +163,7 @@ proc-compose uninstall --name <n>                      Remove systemd unit
 proc-compose --version                                 Print version
 
 Global flags:
-  -f, --file string        Config file path (default "proc-compose.yml"; falls back to proc-compose.yaml)
+  -f, --file string        Config file path (default "proc-compose.yml"; falls back to proc-compose.yaml and parent dirs)
   -v, --version            Print version
 
 Important flags (up):
@@ -183,6 +183,7 @@ Important flags (up):
 
 Important flags (bootstrap):
       --write              Create proc-compose.yml when no config exists
+      --force              Overwrite an existing config when used with --write
       --verify             Verify generated config through proc-compose
       --json               Emit machine-readable JSON
 
@@ -342,13 +343,16 @@ When you pass `-f path/to/proc-compose.yml`, `doctor` scans and resolves relativ
 ```sh
 proc-compose bootstrap                  # dry run: show generated config
 proc-compose bootstrap --write          # create proc-compose.yml when none exists
+proc-compose bootstrap --write --force  # overwrite an existing generated or stale config
 proc-compose bootstrap --verify         # test generated config without writing it
 proc-compose bootstrap --write --verify # write, then verify
 ```
 
-`bootstrap` builds on `doctor`: it scans the repo, proposes a config, and can verify the config through proc-compose. The default mode is safe and read-only. Use `--write` to create `proc-compose.yml`; it refuses to overwrite existing configs. Use `--verify` without `--write` to validate a temporary generated config without creating the final file; use `--write --verify` to verify the file it wrote.
+`bootstrap` builds on `doctor`: it scans the repo, proposes a config, and can verify the config through proc-compose. The default mode is safe and read-only. Use `--write` to create `proc-compose.yml`; it refuses to overwrite existing configs unless you also pass `--force`. Use `--verify` without `--write` to validate a temporary generated config without creating the final file; use `--write --verify` to verify the file it wrote.
 
 Like `doctor`, `bootstrap -f path/to/proc-compose.yml` scans and writes relative to that config file's directory.
+
+When you do not pass `-f`, proc-compose searches upward from the current directory for `proc-compose.yml` or `proc-compose.yaml`. This lets `up`, `monitor`, `status`, `doctor`, and `bootstrap` work from nested package directories in a monorepo while still using the repository-level config.
 
 Use `doctor` when you want diagnostics only. Use `bootstrap` when you want a first-run setup path.
 
