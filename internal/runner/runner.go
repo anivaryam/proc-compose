@@ -202,7 +202,7 @@ func (r *Runner) handleCommands(store *stateStore) {
 				break
 			}
 			r.cfgMu.RLock()
-			_, known := r.Config.Processes[cmd.Process]
+			proc, known := r.Config.Processes[cmd.Process]
 			r.cfgMu.RUnlock()
 			if !known {
 				res = ipc.CommandResult{Status: "error", Message: fmt.Sprintf("unknown process %q", cmd.Process)}
@@ -211,6 +211,10 @@ func (r *Runner) handleCommands(store *stateStore) {
 			st := store.get(cmd.Process)
 			if st == nil {
 				res = ipc.CommandResult{Status: "error", Message: fmt.Sprintf("process %q is not currently managed", cmd.Process)}
+				break
+			}
+			if proc.EffectiveMode() == config.ProcessModeTask || st.state == "completed" {
+				res = ipc.CommandResult{Status: "error", Message: fmt.Sprintf("process %q is a task and cannot be restarted; restart the stack to rerun tasks", cmd.Process)}
 				break
 			}
 			st.requestRestart()
@@ -243,7 +247,13 @@ func (r *Runner) serveHealth(ln net.Listener, store *stateStore) {
 		allHealthy := true
 		for _, p := range procs {
 			status = append(status, procStatus{Name: p.Name, State: p.State, Restarts: p.Restarts})
-			if p.State != "running" && p.State != "restarting" {
+			healthy := false
+			if p.Mode == config.ProcessModeTask {
+				healthy = p.State == "completed"
+			} else {
+				healthy = p.State == "running" || p.State == "restarting"
+			}
+			if !healthy {
 				allHealthy = false
 			}
 		}

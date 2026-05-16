@@ -60,11 +60,18 @@ func (r *Runner) Reload() ipc.CommandResult {
 	for _, name := range removed {
 		r.systemEvent(fmt.Sprintf("reload: removed process %q ignored (hot-remove not supported)", name), false)
 	}
+	var skipped []string
 	for _, c := range changes {
-		if st := r.store.get(c.name); st != nil {
-			st.requestRestart()
+		st := r.store.get(c.name)
+		if st != nil && st.state == "completed" {
+			skipped = append(skipped, c.name)
+			r.systemEvent(fmt.Sprintf("reload: %q is completed and cannot be restarted; restart the daemon to apply changes", c.name), false)
+			continue
 		}
-		r.systemEvent(fmt.Sprintf("reload: restarting %q (config changed)", c.name), false)
+		if st != nil {
+			st.requestRestart()
+			r.systemEvent(fmt.Sprintf("reload: restarting %q (config changed)", c.name), false)
+		}
 	}
 	if len(changes) == 0 && len(added) == 0 && len(removed) == 0 {
 		r.systemEvent("reload: no changes detected", false)
@@ -83,6 +90,14 @@ func (r *Runner) Reload() ipc.CommandResult {
 		}
 		return ipc.CommandResult{Status: "partial", Message: strings.Join(parts, "; ") + " (restart the daemon to apply add/remove)"}
 	}
+	if len(skipped) > 0 {
+		var parts []string
+		if len(changes)-len(skipped) > 0 {
+			parts = append(parts, fmt.Sprintf("restarted %d", len(changes)-len(skipped)))
+		}
+		parts = append(parts, fmt.Sprintf("skipped %d completed", len(skipped)))
+		return ipc.CommandResult{Status: "partial", Message: strings.Join(parts, "; ") + " (restart the daemon to apply changes to completed tasks)"}
+	}
 	if len(changes) == 0 {
 		return ipc.CommandResult{Status: "ok", Message: "no changes detected"}
 	}
@@ -93,7 +108,10 @@ func (r *Runner) Reload() ipc.CommandResult {
 func procChanged(a, b config.Process) bool {
 	if a.Cmd != b.Cmd || a.Dir != b.Dir || a.Restart != b.Restart ||
 		a.MaxRestarts != b.MaxRestarts || a.ShutdownTimeout != b.ShutdownTimeout ||
-		a.EnvFile != b.EnvFile {
+		a.EnvFile != b.EnvFile || a.Mode != b.Mode || a.ReadyTimeout != b.ReadyTimeout {
+		return true
+	}
+	if !readyWhenEqual(a.ReadyWhen, b.ReadyWhen) {
 		return true
 	}
 	if len(a.Env) != len(b.Env) {
@@ -113,4 +131,14 @@ func procChanged(a, b config.Process) bool {
 		}
 	}
 	return false
+}
+
+func readyWhenEqual(a, b *config.ReadyWhen) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a.HTTP == b.HTTP && a.TCP == b.TCP && a.Log == b.Log
 }

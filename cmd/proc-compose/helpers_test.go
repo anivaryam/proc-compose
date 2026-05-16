@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
@@ -427,4 +428,98 @@ func ipcServerForTest(t *testing.T) (socketPath string, server *ipc.Server, stop
 	}
 	stop = func() { server.Shutdown() }
 	return
+}
+
+func TestComputeClosure_AllProcs(t *testing.T) {
+	procs := map[string]config.Process{
+		"a": {Cmd: "echo a"},
+		"b": {Cmd: "echo b"},
+		"c": {Cmd: "echo c"},
+	}
+	got := computeClosure(procs, nil)
+	if len(got) != 3 {
+		t.Errorf("expected 3 procs, got %d", len(got))
+	}
+}
+
+func TestComputeClosure_WithDeps(t *testing.T) {
+	procs := map[string]config.Process{
+		"app":  {Cmd: "echo app", DependsOn: []string{"db"}},
+		"db":   {Cmd: "echo db", DependsOn: []string{"migrate"}},
+		"migrate": {Cmd: "echo migrate"},
+	}
+	got := computeClosure(procs, []string{"app"})
+	if len(got) != 3 {
+		t.Errorf("expected closure {app,db,migrate}, got %v", got)
+	}
+	found := make(map[string]bool)
+	for _, n := range got {
+		found[n] = true
+	}
+	if !found["app"] || !found["db"] || !found["migrate"] {
+		t.Errorf("expected app,db,migrate in closure, got %v", got)
+	}
+}
+
+func TestComputeClosure_TaskOnlyRejected(t *testing.T) {
+	procs := map[string]config.Process{
+		"migrate": {Cmd: "echo migrate", Mode: config.ProcessModeTask},
+	}
+	closure := computeClosure(procs, []string{"migrate"})
+	hasService := false
+	for _, name := range closure {
+		if procs[name].EffectiveMode() != config.ProcessModeTask {
+			hasService = true
+			break
+		}
+	}
+	if hasService {
+		t.Error("expected task-only closure to have no services")
+	}
+}
+
+func TestComputeClosure_ServiceWithTaskAllowed(t *testing.T) {
+	procs := map[string]config.Process{
+		"app":     {Cmd: "echo app", DependsOn: []string{"migrate"}},
+		"migrate": {Cmd: "echo migrate", Mode: config.ProcessModeTask},
+	}
+	closure := computeClosure(procs, []string{"app"})
+	hasService := false
+	for _, name := range closure {
+		if procs[name].EffectiveMode() != config.ProcessModeTask {
+			hasService = true
+			break
+		}
+	}
+	if !hasService {
+		t.Error("expected closure with app to have at least one service")
+	}
+}
+
+func TestSilentGuardrail_TaskOnlyErrorMessage(t *testing.T) {
+	cfg := &config.Config{
+		Processes: map[string]config.Process{
+			"migrate": {Cmd: "echo migrate", Mode: config.ProcessModeTask},
+		},
+	}
+	err := validateSilentSelection(cfg, []string{"migrate"})
+	if err == nil {
+		t.Fatal("expected error for task-only selection, got nil")
+	}
+	if err.Error() != "up --silent requires at least one service; task-only stacks run in foreground" {
+		t.Errorf("error = %q, want exact message", err.Error())
+	}
+}
+
+func TestSilentGuardrail_ServiceWithTaskAllowed(t *testing.T) {
+	cfg := &config.Config{
+		Processes: map[string]config.Process{
+			"app":     {Cmd: "echo app", DependsOn: []string{"migrate"}},
+			"migrate": {Cmd: "echo migrate", Mode: config.ProcessModeTask},
+		},
+	}
+	err := validateSilentSelection(cfg, []string{"app"})
+	if err != nil {
+		t.Errorf("expected nil error for service with task dependency, got: %v", err)
+	}
 }

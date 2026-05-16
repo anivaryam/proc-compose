@@ -114,6 +114,12 @@ Example:
 				}
 			}
 
+			if silent {
+				if err := validateSilentSelection(cfg, args); err != nil {
+					return err
+				}
+			}
+
 			// Dry-run: validate config and print processes without starting
 			if dryRun {
 				r := &runner.Runner{Config: cfg}
@@ -802,6 +808,58 @@ func resolveConfigContext(configFile string, explicit bool) (root, configPath st
 		return filepath.Dir(absConfig), absConfig, nil
 	}
 	return ".", "", nil
+}
+
+// computeClosure returns the set of process names that would run given
+// the config and the selected args (which may be empty for "all").
+// It expands args to include transitive dependencies.
+func computeClosure(procs map[string]config.Process, args []string) []string {
+	if len(args) == 0 {
+		names := make([]string, 0, len(procs))
+		for name := range procs {
+			names = append(names, name)
+		}
+		return names
+	}
+
+	filterSet := make(map[string]bool)
+	for _, name := range args {
+		filterSet[name] = true
+	}
+
+	var expand func(name string)
+	expand = func(name string) {
+		proc, ok := procs[name]
+		if !ok {
+			return
+		}
+		for _, dep := range proc.DependsOn {
+			if !filterSet[dep] {
+				filterSet[dep] = true
+				expand(dep)
+			}
+		}
+	}
+
+	for _, name := range args {
+		expand(name)
+	}
+
+	result := make([]string, 0, len(filterSet))
+	for name := range filterSet {
+		result = append(result, name)
+	}
+	return result
+}
+
+func validateSilentSelection(cfg *config.Config, args []string) error {
+	closure := computeClosure(cfg.Processes, args)
+	for _, name := range closure {
+		if cfg.Processes[name].EffectiveMode() != config.ProcessModeTask {
+			return nil
+		}
+	}
+	return fmt.Errorf("up --silent requires at least one service; task-only stacks run in foreground")
 }
 
 // resolveConfigExtension makes proc-compose.yaml a transparent stand-in for

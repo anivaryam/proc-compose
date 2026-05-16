@@ -3,7 +3,11 @@ package runner
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -11,6 +15,7 @@ import (
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
 const helperSentinel = "__PROC_COMPOSE_TEST_HELPER__"
@@ -532,5 +537,287 @@ func TestRun_TaskModeRunnerDefenseIgnoresRestartAlways(t *testing.T) {
 	states := r.store.snapshot()
 	if states[0].Restarts != 0 {
 		t.Fatalf("task restarts = %d, want 0", states[0].Restarts)
+	}
+}
+
+// ─── Health endpoint tests ───────────────────────────────────────────────
+
+func TestServeHealth_TaskCompletedIsHealthy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	r := makeRunner(map[string]config.Process{
+		"migrate": {Cmd: helperCmd("exit", "0"), Restart: "never", Mode: config.ProcessModeTask},
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- r.Run(context.Background())
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	go r.serveHealth(ln, r.store)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + ln.Addr().String() + "/health")
+	if err != nil {
+		t.Fatalf("health request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("health returned %d, want 200 for completed task", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if result["healthy"] != true {
+		t.Errorf("healthy = %v, want true for completed task", result["healthy"])
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Log("runner did not finish in time")
+	}
+}
+
+func TestServeHealth_FailedTaskIsUnhealthy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	proc := config.Process{Cmd: helperCmd("exit", "1"), Restart: "never", Mode: config.ProcessModeTask}
+	r := makeRunner(map[string]config.Process{
+		"migrate": proc,
+	})
+
+	store := newStateStore([]procInfo{{name: "migrate", proc: proc, colorIndex: 0}})
+	r.store = store
+
+	st := store.get("migrate")
+	st.state = "failed"
+	st.readyClosed = true
+	st.readyOK = false
+
+	go r.serveHealth(ln, store)
+
+	time.Sleep(50 * time.Millisecond)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + ln.Addr().String() + "/health")
+	if err != nil {
+		t.Fatalf("health request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("health returned %d, want 503 for failed task", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if result["healthy"] != false {
+		t.Errorf("healthy = %v, want false for failed task", result["healthy"])
+	}
+}
+
+func TestServeHealth_ServiceRunningIsHealthy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	r := makeRunner(map[string]config.Process{
+		"svc": {Cmd: helperCmd("sleep", "10s"), Restart: "never"},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		r.Run(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	go r.serveHealth(ln, r.store)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + ln.Addr().String() + "/health")
+	if err != nil {
+		t.Fatalf("health request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("health returned %d, want 200 for running service", resp.StatusCode)
+	}
+}
+
+// ─── Restart guardrail tests ────────────────────────────────────────────
+
+func TestHandleRestart_RejectsTaskMode(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"migrate": {Cmd: helperCmd("exit", "0"), Restart: "never", Mode: config.ProcessModeTask},
+	})
+
+	socketPath, ipcServer, stopServer := ipcServerForTest(t)
+	defer stopServer()
+
+	r.IPC = ipcServer
+	r.ConfigPath = t.TempDir() + "/proc-compose.yml"
+
+	done := make(chan error, 1)
+	go func() {
+		done <- r.Run(context.Background())
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+
+	ipcClient, err := ipc.Dial(socketPath)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer ipcClient.Close()
+
+	if err := ipcClient.Send(ipc.Command{Action: "restart", Process: "migrate"}); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+
+	for {
+		ev, err := ipcClient.Recv()
+		if err != nil {
+			t.Fatalf("recv failed: %v", err)
+		}
+		if ev.Type == ipc.TypeAck {
+			if ev.Ack != "error" {
+				t.Errorf("expected ack error, got %s: %s", ev.Ack, ev.AckDetail)
+			}
+			want := `process "migrate" is a task and cannot be restarted; restart the stack to rerun tasks`
+			if ev.AckDetail != want {
+				t.Errorf("AckDetail = %q, want %q", ev.AckDetail, want)
+			}
+			break
+		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Log("runner did not finish in time")
+	}
+}
+
+func ipcServerForTest(t *testing.T) (string, *ipc.Server, func()) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "pc-test-*")
+	if err != nil {
+		t.Fatalf("temp socket dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socketPath := filepath.Join(dir, "pc.sock")
+
+	server := ipc.NewServer(socketPath)
+	if err := server.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	stop := func() { server.Shutdown() }
+	return socketPath, server, stop
+}
+
+// ─── Reload semantic diff tests ─────────────────────────────────────────
+
+func TestReload_DetectsModeChange(t *testing.T) {
+	// procChanged should detect Mode change
+	a := config.Process{Cmd: "echo", Restart: "never", Mode: config.ProcessModeService}
+	b := config.Process{Cmd: "echo", Restart: "never", Mode: config.ProcessModeTask}
+	if !procChanged(a, b) {
+		t.Error("procChanged should detect Mode change")
+	}
+}
+
+func TestReload_DetectsReadyWhenChange(t *testing.T) {
+	a := config.Process{
+		Cmd: "echo",
+		ReadyWhen: &config.ReadyWhen{HTTP: "http://localhost:3000/health"},
+	}
+	b := config.Process{
+		Cmd: "echo",
+		ReadyWhen: &config.ReadyWhen{HTTP: "http://localhost:4000/health"},
+	}
+	if !procChanged(a, b) {
+		t.Error("procChanged should detect ReadyWhen change")
+	}
+}
+
+func TestReload_DetectsReadyTimeoutChange(t *testing.T) {
+	a := config.Process{Cmd: "echo", ReadyTimeout: 30}
+	b := config.Process{Cmd: "echo", ReadyTimeout: 60}
+	if !procChanged(a, b) {
+		t.Error("procChanged should detect ReadyTimeout change")
+	}
+}
+
+func TestReload_SkipsCompletedTaskRestart(t *testing.T) {
+	dir := t.TempDir()
+	configPath := dir + "/proc-compose.yml"
+	if err := os.WriteFile(configPath, []byte(`processes:
+  migrate:
+    cmd: echo done
+    mode: task
+    restart: never
+`), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	r := &Runner{Config: cfg, ConfigPath: configPath}
+	store := newStateStore([]procInfo{{name: "migrate", proc: cfg.Processes["migrate"], colorIndex: 0}})
+	r.store = store
+
+	// Simulate task completing
+	st := store.get("migrate")
+	st.state = "completed"
+	st.readyClosed = true
+	st.readyOK = true
+
+	// Change config - modify the cmd
+	newCfg := *cfg
+	newCfg.Processes["migrate"] = config.Process{Cmd: "echo changed", Restart: "never", Mode: config.ProcessModeTask}
+
+	// Swap in new config
+	r.Config = &newCfg
+
+	result := r.Reload()
+
+	if result.Status != "partial" {
+		t.Errorf("reload status = %q, want partial", result.Status)
+	}
+	if !strings.Contains(result.Message, "completed") {
+		t.Errorf("message = %q, want 'completed' in message", result.Message)
+	}
+
+	// Verify the task was NOT restarted (restartCh should be empty)
+	select {
+	case <-st.restartCh:
+		t.Error("task was restarted but should have been skipped")
+	default:
+		// OK - no restart was requested
 	}
 }
