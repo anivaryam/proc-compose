@@ -79,6 +79,101 @@ func TestScanDetectsRootNodePackage(t *testing.T) {
 	}
 }
 
+func TestScanUsesPackageManagerRunnerAndScriptPort(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+	writeFile(t, filepath.Join(dir, "package.json"), `{
+  "scripts":{"dev":"vite --host 0.0.0.0 --port 4444"},
+  "devDependencies":{"vite":"latest"}
+}`)
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if len(report.Services) != 1 {
+		t.Fatalf("expected 1 service, got %+v", report.Services)
+	}
+	if report.Services[0].Command != "pnpm dev" {
+		t.Fatalf("command = %q, want pnpm dev", report.Services[0].Command)
+	}
+	if report.Services[0].Port != 4444 {
+		t.Fatalf("port = %d, want script --port", report.Services[0].Port)
+	}
+}
+
+func TestScanNestedNodePackageInheritsWorkspaceLockfile(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+	writeFile(t, filepath.Join(dir, "apps", "web", "package.json"), `{
+  "scripts":{"dev":"vite"},
+  "devDependencies":{"vite":"latest"}
+}`)
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if len(report.Services) != 1 {
+		t.Fatalf("expected nested service, got %+v", report.Services)
+	}
+	if report.Services[0].Command != "pnpm dev" {
+		t.Fatalf("command = %q, want pnpm dev inherited from root lockfile", report.Services[0].Command)
+	}
+}
+
+func TestScanDetectsRootWorkspacePackageWithRunnableScript(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "yarn.lock"), "# yarn lockfile\n")
+	writeFile(t, filepath.Join(dir, "package.json"), `{
+  "workspaces":["packages/*"],
+  "scripts":{"dev":"next dev"},
+  "dependencies":{"next":"14.0.0"}
+}`)
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if len(report.Services) != 1 {
+		t.Fatalf("expected root workspace service, got %+v", report.Services)
+	}
+	if report.Services[0].Command != "yarn dev" {
+		t.Fatalf("command = %q, want yarn dev", report.Services[0].Command)
+	}
+	if report.Services[0].Port != 3000 {
+		t.Fatalf("port = %d, want Next default", report.Services[0].Port)
+	}
+}
+
+func TestScanDetectsFrameworkDefaultPorts(t *testing.T) {
+	tests := []struct {
+		name string
+		pkg  string
+		port int
+	}{
+		{name: "svelte kit", pkg: `{"scripts":{"dev":"svelte-kit dev"},"devDependencies":{"@sveltejs/kit":"latest"}}`, port: 5173},
+		{name: "astro", pkg: `{"scripts":{"dev":"astro dev"},"devDependencies":{"astro":"latest"}}`, port: 4321},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, "package.json"), tt.pkg)
+			report, err := Run(Options{Root: dir})
+			if err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+			if len(report.Services) != 1 {
+				t.Fatalf("expected 1 service, got %+v", report.Services)
+			}
+			if report.Services[0].Port != tt.port {
+				t.Fatalf("port = %d, want %d", report.Services[0].Port, tt.port)
+			}
+		})
+	}
+}
+
 func TestScanDetectsGoCommandDirs(t *testing.T) {
 	dir := t.TempDir()
 
@@ -107,11 +202,11 @@ func TestScanDetectsGoCommandDirs(t *testing.T) {
 	if report.Services[0].Name != "api" {
 		t.Errorf("first service name = %q, want %q", report.Services[0].Name, "api")
 	}
-	if report.Services[0].Command != "go run ." {
-		t.Errorf("first service command = %q, want %q", report.Services[0].Command, "go run .")
+	if report.Services[0].Command != "go run ./cmd/api" {
+		t.Errorf("first service command = %q, want %q", report.Services[0].Command, "go run ./cmd/api")
 	}
-	if report.Services[0].Dir != "./cmd/api" {
-		t.Errorf("first service dir = %q, want %q", report.Services[0].Dir, "./cmd/api")
+	if report.Services[0].Dir != "." {
+		t.Errorf("first service dir = %q, want .", report.Services[0].Dir)
 	}
 	if report.Services[0].Kind != "go" {
 		t.Errorf("first service kind = %q, want %q", report.Services[0].Kind, "go")
@@ -123,11 +218,31 @@ func TestScanDetectsGoCommandDirs(t *testing.T) {
 	if report.Services[1].Name != "worker" {
 		t.Errorf("second service name = %q, want %q", report.Services[1].Name, "worker")
 	}
-	if report.Services[1].Command != "go run ." {
-		t.Errorf("second service command = %q, want %q", report.Services[1].Command, "go run .")
+	if report.Services[1].Command != "go run ./cmd/worker" {
+		t.Errorf("second service command = %q, want %q", report.Services[1].Command, "go run ./cmd/worker")
 	}
-	if report.Services[1].Dir != "./cmd/worker" {
-		t.Errorf("second service dir = %q, want %q", report.Services[1].Dir, "./cmd/worker")
+	if report.Services[1].Dir != "." {
+		t.Errorf("second service dir = %q, want .", report.Services[1].Dir)
+	}
+}
+
+func TestScanDetectsNestedGoCommandDirs(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "go.mod"), "module example.com/app\n\ngo 1.23\n")
+	writeFile(t, filepath.Join(dir, "cmd", "services", "api", "main.go"), "package main\n\nfunc main() {}\n")
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if len(report.Services) != 1 {
+		t.Fatalf("expected nested Go service, got %+v", report.Services)
+	}
+	if report.Services[0].Name != "api" {
+		t.Fatalf("name = %q, want api", report.Services[0].Name)
+	}
+	if report.Services[0].Command != "go run ./cmd/services/api" {
+		t.Fatalf("command = %q, want go run ./cmd/services/api", report.Services[0].Command)
 	}
 }
 
@@ -156,6 +271,20 @@ func TestScanSanitizesUnsafeGoCommandDirs(t *testing.T) {
 	}
 	if len(report.Services) != 0 {
 		t.Fatalf("expected unsafe command dir to be skipped, got %+v", report.Services)
+	}
+}
+
+func TestScanSkipsGoCommandWithUnsafeAncestorDir(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "go.mod"), "module example.com/app\n\ngo 1.23\n")
+	writeFile(t, filepath.Join(dir, "cmd", "api;touch bad", "server", "main.go"), "package main\n\nfunc main() {}\n")
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if len(report.Services) != 0 {
+		t.Fatalf("expected unsafe ancestor dir to be skipped, got %+v", report.Services)
 	}
 }
 
@@ -329,6 +458,43 @@ func TestScanDetectsPythonDjangoProject(t *testing.T) {
 	}
 	if svc.Manifest != "./api/manage.py" {
 		t.Errorf("service manifest = %q, want ./api/manage.py", svc.Manifest)
+	}
+}
+
+func TestScanDetectsPythonASGIAndFlaskCommands(t *testing.T) {
+	tests := []struct {
+		name string
+		file string
+		body string
+		want string
+		port int
+	}{
+		{name: "uvicorn pyproject", file: "pyproject.toml", body: "[project]\ndependencies = ['uvicorn']\n", want: "python -m uvicorn main:app --host 0.0.0.0 --port 9000 --reload", port: 9000},
+		{name: "flask requirements", file: "requirements.txt", body: "Flask==3.0.0\n", want: "python -m flask --app main run --host 0.0.0.0 --port 5000", port: 5000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, "main.py"), "app = object()\n")
+			writeFile(t, filepath.Join(dir, tt.file), tt.body)
+			if tt.port == 9000 {
+				writeFile(t, filepath.Join(dir, ".env.local"), "PORT=9000\n")
+			}
+			report, err := Run(Options{Root: dir})
+			if err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+			if len(report.Services) != 1 {
+				t.Fatalf("expected 1 service, got %+v", report.Services)
+			}
+			if report.Services[0].Command != tt.want {
+				t.Fatalf("command = %q, want %q", report.Services[0].Command, tt.want)
+			}
+			if report.Services[0].Port != tt.port {
+				t.Fatalf("port = %d, want %d", report.Services[0].Port, tt.port)
+			}
+		})
 	}
 }
 
@@ -550,6 +716,28 @@ processes:
 	}
 	if !hasFinding(report, codeMissingMergePort) {
 		t.Fatalf("expected missing_merge_port finding, got %+v", report.Findings)
+	}
+}
+
+func TestExistingConfigWarnsOnAlwaysRestartWithoutCapAndMissingTunnel(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `processes:
+  tunnel:
+    cmd: tunnel http 8080 --name demo
+    restart: always
+`)
+	old := tunnelInPath
+	tunnelInPath = func() bool { return false }
+	t.Cleanup(func() { tunnelInPath = old })
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range []string{"uncapped_always_restart", "missing_tunnel"} {
+		if !hasFinding(report, code) {
+			t.Fatalf("expected %s finding, got %+v", code, report.Findings)
+		}
 	}
 }
 

@@ -20,10 +20,17 @@ const (
 	codeDuplicatePort              = "duplicate_port"
 	codeDependencyWithoutReadiness = "dependency_without_readiness"
 	codeMissingMergePort           = "missing_merge_port"
+	codeUncappedAlwaysRestart      = "uncapped_always_restart"
+	codeMissingTunnel              = "missing_tunnel"
 )
 
 var mergePortInPath = func() bool {
 	_, err := exec.LookPath("merge-port")
+	return err == nil
+}
+
+var tunnelInPath = func() bool {
+	_, err := exec.LookPath("tunnel")
 	return err == nil
 }
 
@@ -96,6 +103,14 @@ func checkExistingConfig(report *Report, root string) {
 	}
 
 	for name, proc := range cfg.Processes {
+		if proc.Restart == "always" && proc.MaxRestarts == 0 {
+			report.Findings = append(report.Findings, Finding{
+				Severity:   SeverityInfo,
+				Code:       codeUncappedAlwaysRestart,
+				Message:    fmt.Sprintf("process %q uses restart: always without max_restarts", name),
+				Suggestion: "set max_restarts if repeated clean exits should stop instead of loop forever",
+			})
+		}
 		for _, dep := range proc.DependsOn {
 			depProc, ok := cfg.Processes[dep]
 			if ok && depProc.ReadyWhen == nil {
@@ -118,7 +133,33 @@ func checkExistingConfig(report *Report, root string) {
 		})
 	}
 
+	if usesTunnel(cfg) && !tunnelInPath() {
+		report.Findings = append(report.Findings, Finding{
+			Severity:   SeverityWarning,
+			Code:       codeMissingTunnel,
+			Message:    "a tunnel process is configured but tunnel is not on PATH",
+			Suggestion: "install tunnel or update the process command",
+		})
+	}
+
 	_ = root
+}
+
+// usesTunnel reports whether a config likely depends on the optional tunnel
+// binary. It checks process names and shell commands, treating exact or
+// whitespace-delimited `tunnel` command usage as a match while leaving unrelated
+// words alone.
+func usesTunnel(cfg *config.Config) bool {
+	for name, proc := range cfg.Processes {
+		cmd := strings.TrimSpace(proc.Cmd)
+		if name == "tunnel" || strings.HasPrefix(name, "tunnel-") || strings.HasSuffix(name, "-tunnel") {
+			return true
+		}
+		if cmd == "tunnel" || strings.HasPrefix(cmd, "tunnel ") || strings.Contains(cmd, " tunnel ") {
+			return true
+		}
+	}
+	return false
 }
 
 func loadConfigShape(path string) (*config.Config, error) {
