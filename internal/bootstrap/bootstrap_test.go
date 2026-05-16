@@ -76,6 +76,27 @@ func TestRunWriteRefusesExistingConfig(t *testing.T) {
 	}
 }
 
+func TestRunWriteOverwriteReplacesExistingConfig(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "package.json"), `{"scripts":{"dev":"vite"},"dependencies":{"vite":"latest"}}`)
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), "processes: {}\n")
+
+	report, err := Run(Options{Root: dir, Write: true, Overwrite: true})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "proc-compose.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "npm run dev") {
+		t.Fatalf("overwritten config missing generated command:\n%s", string(data))
+	}
+	if len(report.AppliedChanges) != 1 || !strings.Contains(report.AppliedChanges[0].Message, "overwrote") {
+		t.Fatalf("applied changes = %+v", report.AppliedChanges)
+	}
+}
+
 func TestRunWriteCreatesConfig(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "package.json"), `{"scripts":{"dev":"vite"},"dependencies":{"vite":"latest"}}`)

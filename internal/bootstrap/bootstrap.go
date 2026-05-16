@@ -26,18 +26,24 @@ func Run(opts Options) (*Report, error) {
 	report.Doctor = doctorReport
 
 	if opts.Write {
-		if doctorReport.ConfigExists {
+		if doctorReport.ConfigExists && !opts.Overwrite {
 			return report, fmt.Errorf("%s already exists", doctorReport.ConfigPath)
 		}
 		if strings.TrimSpace(doctorReport.SuggestedYAML) == "" || doctorReport.SuggestedYAML == "processes: {}\n" {
 			return report, fmt.Errorf("no services detected; refusing to write empty proc-compose.yml")
 		}
-		if err := writeConfigExclusive(doctorReport.ConfigPath, doctorReport.SuggestedYAML); err != nil {
+		message := "wrote generated proc-compose config"
+		write := writeConfigExclusive
+		if opts.Overwrite {
+			message = "overwrote proc-compose config with generated config"
+			write = writeConfigOverwrite
+		}
+		if err := write(doctorReport.ConfigPath, doctorReport.SuggestedYAML); err != nil {
 			return report, err
 		}
 		report.AppliedChanges = append(report.AppliedChanges, AppliedChange{
 			Path:    doctorReport.ConfigPath,
-			Message: "wrote generated proc-compose config",
+			Message: message,
 		})
 	}
 
@@ -84,6 +90,13 @@ func writeConfigExclusive(path, contents string) error {
 		return err
 	}
 	return nil
+}
+
+func writeConfigOverwrite(path, contents string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(contents), configFileMode)
 }
 
 func writeTempConfig(contents string) (string, func(), error) {

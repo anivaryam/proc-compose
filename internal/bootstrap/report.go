@@ -19,6 +19,7 @@ type Options struct {
 	Root       string
 	ConfigFile string
 	Write      bool
+	Overwrite  bool
 	Verify     bool
 	Verifier   Verifier
 }
