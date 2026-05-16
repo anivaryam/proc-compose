@@ -129,7 +129,7 @@ Frontend, backend, and the merge-port proxy all start together. Logs are interle
 
 ## Mental Model
 
-`proc-compose.yml` declares named processes. Each process is a shell command plus optional working directory, environment, readiness probe, dependencies, and restart policy.
+`proc-compose.yml` declares named processes. Each process is a shell command with a mode plus optional working directory, environment, readiness probe, dependencies, and restart policy. Most processes are long-running services. Tasks run once for setup work such as migrations, seeding, codegen, or prestart build steps.
 
 When you run `proc-compose up`, the runner:
 
@@ -137,8 +137,9 @@ When you run `proc-compose up`, the runner:
 2. starts processes whose dependencies are ready
 3. prefixes and streams stdout/stderr into one log
 4. tracks readiness through `http`, `tcp`, or `log` probes
-5. applies restart policies
-6. forwards shutdown to the full process tree
+5. marks successful tasks completed so dependents can start
+6. applies restart policies to services
+7. forwards shutdown to the full process tree
 
 Daemon commands (`status`, `logs`, `monitor`, `restart`, `reload`, `stop`) talk to the background runner for the current config file.
 
@@ -213,7 +214,7 @@ proc-compose up frontend backend
 proc-compose up --silent --log-file app.log
 ```
 
-The process starts daemonized. Logs are written to `app.log`. Use `monitor` to watch it live or `stop` to shut it down.
+The process starts daemonized. Logs are written to `app.log`. Use `monitor` to watch it live or `stop` to shut it down. A task-only stack runs in the foreground because no service remains for the daemon to manage, so `--silent` requires at least one service process.
 
 ### Monitor a running daemon
 
@@ -225,11 +226,12 @@ Opens an interactive TUI showing process status, readiness, resource usage, and 
 
 ```
 proc-compose monitor               q=quit  ?=help  ↑↓/jk=nav  ⏎=filter  a=all  PgUp/Dn=scroll
-  ready 3/3  failed 0  restarting 0
+  ready 3/3  tasks 1 done  failed 0  restarting 0
   PROCESS    STATUS        RESTARTS  CPU%    MEM       READY     UPTIME
 ▶ backend    ● running     0         12.5%    45.2MB   ready     1m32s
   frontend   ● running     0          8.1%    32.1MB   ready     1m32s
   merge-port ● running     0          0.2%     8.4MB   ready     1m32s
+  migrate    ✓ completed   0          0.0%     0.0MB   done      1m32s
 ──────────────────────────────────────────────────────────────────────────────────────────────
 Logs: all
 backend    │ listening on :3001
@@ -251,6 +253,8 @@ Keys:
 | `g`             | Jump to top of log buffer             |
 
 `NO_COLOR=1` (or `--no-color` on `up`) disables colour output in both the runner and the monitor.
+
+Completed task rows stay visible as `✓ completed` with readiness `done`.
 
 ### Auto-restart on reboot (--survive)
 
@@ -312,8 +316,9 @@ proc-compose status --json       # machine-readable, scriptable
 ```
 
 `status` reads a one-shot snapshot from the running daemon and exits. The
-`--json` output includes a `ready` flag per process that distinguishes
-"started" from "started and passed its readiness probe".
+text table includes a `MODE` column, and successful tasks appear as
+`completed`. The `--json` output includes a `ready` flag per process that
+distinguishes "started" from "started and passed its readiness probe".
 
 ### Validate a config
 
@@ -365,8 +370,10 @@ proc-compose up --silent --log-file app.log --wait-ready --wait-timeout 60
 Without `--wait-ready`, `up --silent` returns once the daemon has bound
 its IPC socket — processes may still be starting. With `--wait-ready` the
 command blocks until every started process passes its `ready_when` probe
-(or `--wait-timeout` elapses). Useful in container entrypoints and CI
-fixtures that need a hard guarantee before running the next step.
+and every task completes successfully (or `--wait-timeout` elapses). Useful
+in container entrypoints and CI fixtures that need a hard guarantee before
+running the next step. A task-only stack cannot daemonize because no service
+remains to manage.
 
 ### Log rotation
 
@@ -406,6 +413,7 @@ proc-compose falls back to `proc-compose.yaml` automatically. Pass
 processes:
   name:
     cmd: "command to run"        # required — passed to sh -c
+    mode: service                # optional, service or task
     dir: "./working/directory"   # optional — working directory
     env_file: ".env.backend"     # optional — load env vars from file
     env:                         # optional — extra environment variables
@@ -425,6 +433,7 @@ processes:
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `cmd` | Yes | — | Shell command to run (via `sh -c`) |
+| `mode` | No | `service` | Process mode: `service` for long-running processes, `task` for one-shot work |
 | `dir` | No | `.` | Working directory for the process |
 | `env_file` | No | — | Path to `.env` file; values are merged before `env` block |
 | `env` | No | — | Extra environment variables (merged with system env; overrides `env_file`) |
@@ -436,6 +445,9 @@ processes:
 | `depends_on` | No | — | List of process names to wait for before starting |
 
 ### Restart Policies
+
+Restart policies apply to service processes. Task processes always run once
+and must use `restart: never`.
 
 | Policy | Behavior |
 |--------|----------|
@@ -475,7 +487,7 @@ processes:
       log: "Worker ready"                 # regex matched in stdout
 ```
 
-Probes poll every 3 seconds until success or process exit. The default readiness deadline is 60 seconds — set `ready_timeout` to override (`-1` disables the limit). Without `ready_when`, a process is considered ready as soon as it starts.
+Probes poll every 3 seconds until success or process exit. The default readiness deadline is 60 seconds — set `ready_timeout` to override (`-1` disables the limit). Without `ready_when`, a service is considered ready as soon as it starts. Tasks cannot use `ready_when` or `ready_timeout`; they become ready only after they exit successfully.
 
 ### Startup Dependencies
 
@@ -498,6 +510,25 @@ processes:
 When a `merge:` section is present, proc-compose auto-injects `depends_on` on `merge-port` for every upstream process so you don't need to wire it manually — see [merge-port Integration](#merge-port-integration) below.
 
 If a dependency fails before becoming ready, dependent processes also fail.
+
+Task dependencies are useful for one-time setup before services start:
+
+```yaml
+processes:
+  migrate:
+    mode: task
+    cmd: npm run migrate
+  api:
+    cmd: npm run dev
+    depends_on: [migrate]
+    ready_when:
+      http: http://localhost:3000/health
+```
+
+With `mode: task`, the command runs once. Exit code `0` marks the process
+`completed`, sets `ready: true`, and lets dependents start. A non-zero exit
+fails the stack and stops running processes. Tasks can't use `ready_when`,
+`ready_timeout`, restart policies other than `never`, or `max_restarts`.
 
 ### Environment File
 
