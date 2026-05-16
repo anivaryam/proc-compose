@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
 func TestValidateUnitName(t *testing.T) {
@@ -247,4 +251,180 @@ func TestGetHomeDir(t *testing.T) {
 	if !filepath.IsAbs(home) {
 		t.Errorf("getHomeDir() = %q, want absolute path", home)
 	}
+}
+
+func TestPrintStatusTable_ModeColumn(t *testing.T) {
+	procs := []ipc.ProcState{
+		{Name: "svc", State: "running", Mode: "service", PID: 12345, Restarts: 0},
+		{Name: "task", State: "completed", Mode: "task", PID: 0, Restarts: 0},
+	}
+
+	pr, pw, _ := os.Pipe()
+	oldStdout := os.Stdout
+	os.Stdout = pw
+	printStatusTable(procs, "")
+	pw.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	buf.ReadFrom(pr)
+	output := buf.String()
+
+	if !strings.Contains(output, "MODE") {
+		t.Error("expected MODE column header in status table")
+	}
+	if !strings.Contains(output, "task") {
+		t.Error("expected task mode in status table")
+	}
+	if !strings.Contains(output, "service") {
+		t.Error("expected service mode in status table")
+	}
+}
+
+func TestPrintStatusTable_TerminalPIDHiding(t *testing.T) {
+	procs := []ipc.ProcState{
+		{Name: "completed_task", State: "completed", Mode: "task", PID: 11111, Restarts: 0},
+		{Name: "exited_svc", State: "exited", Mode: "service", PID: 22222, Restarts: 0},
+		{Name: "failed_svc", State: "failed", Mode: "service", PID: 33333, Restarts: 0},
+		{Name: "running_svc", State: "running", Mode: "service", PID: 99999, Restarts: 0},
+	}
+
+	pr, pw, _ := os.Pipe()
+	oldStdout := os.Stdout
+	os.Stdout = pw
+	printStatusTable(procs, "")
+	pw.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	buf.ReadFrom(pr)
+	output := buf.String()
+
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "completed_task") {
+			if strings.Contains(line, "11111") {
+				t.Errorf("completed_task should not show stale PID 11111, got: %s", line)
+			}
+		}
+		if strings.Contains(line, "exited_svc") {
+			if strings.Contains(line, "22222") {
+				t.Errorf("exited_svc should not show stale PID 22222, got: %s", line)
+			}
+		}
+		if strings.Contains(line, "failed_svc") {
+			if strings.Contains(line, "33333") {
+				t.Errorf("failed_svc should not show stale PID 33333, got: %s", line)
+			}
+		}
+		if strings.Contains(line, "running_svc") {
+			if !strings.Contains(line, "99999") {
+				t.Errorf("running_svc should show PID 99999, got: %s", line)
+			}
+		}
+	}
+}
+
+func TestPrintStatusJSON_IncludesMode(t *testing.T) {
+	procs := []ipc.ProcState{
+		{Name: "svc", State: "running", Mode: "service", PID: 12345, Restarts: 0},
+		{Name: "task", State: "completed", Mode: "task", PID: 0, Restarts: 0},
+	}
+
+	pr, pw, _ := os.Pipe()
+	oldStdout := os.Stdout
+	os.Stdout = pw
+	err := printStatusJSON(procs, "")
+	pw.Close()
+	os.Stdout = oldStdout
+	if err != nil {
+		t.Fatalf("printStatusJSON failed: %v", err)
+	}
+	var buf bytes.Buffer
+	buf.ReadFrom(pr)
+	output := buf.String()
+
+	if !strings.Contains(output, `"mode"`) {
+		t.Error("expected mode field in JSON output")
+	}
+	if !strings.Contains(output, `"task"`) {
+		t.Error("expected task value in JSON output")
+	}
+	if !strings.Contains(output, `"service"`) {
+		t.Error("expected service value in JSON output")
+	}
+}
+
+func TestWaitForProcessesReady_CompletedTaskAccepted(t *testing.T) {
+	timeout := 500 * time.Millisecond
+
+	socketPath, server, stopServer := ipcServerForTest(t)
+	defer stopServer()
+
+	want := map[string]struct{}{"task": {}}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- waitForProcessesReady(socketPath, want, timeout)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	server.BroadcastState(ipc.ProcState{Name: "task", State: "completed", Mode: "task", Ready: true})
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("waitForProcessesReady returned error for completed task with Ready=true: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("waitForProcessesReady timed out waiting for completed task")
+	}
+	_ = server
+}
+
+func TestWaitForProcessesReady_FailedProcessRejected(t *testing.T) {
+	timeout := 500 * time.Millisecond
+
+	socketPath, server, stopServer := ipcServerForTest(t)
+	defer stopServer()
+
+	want := map[string]struct{}{"svc": {}}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- waitForProcessesReady(socketPath, want, timeout)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	server.BroadcastState(ipc.ProcState{Name: "svc", State: "failed", Mode: "service", Ready: false})
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Error("waitForProcessesReady should have returned error for failed process")
+		}
+		if !strings.Contains(err.Error(), "failed") {
+			t.Errorf("error should mention 'failed', got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("waitForProcessesReady timed out waiting for failed process")
+	}
+	_ = server
+}
+
+func ipcServerForTest(t *testing.T) (socketPath string, server *ipc.Server, stop func()) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "pc-test-*")
+	if err != nil {
+		t.Fatalf("temp socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socketPath = filepath.Join(dir, "pc.sock")
+
+	server = ipc.NewServer(socketPath)
+	if err := server.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	stop = func() { server.Shutdown() }
+	return
 }

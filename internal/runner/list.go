@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/anivaryam/proc-compose/internal/ansi"
+	"github.com/anivaryam/proc-compose/internal/config"
 )
 
 // ListProcesses prints the configured processes for the `list` command.
@@ -38,6 +39,9 @@ func (r *Runner) ListProcesses() {
 		restart := p.Restart
 		if restart == "" {
 			restart = "never"
+		}
+		if p.EffectiveMode() == config.ProcessModeTask {
+			restart = "task"
 		}
 		fmt.Printf("  %s%s%-*s%s  %s  %s(%s)%s\n",
 			wrap(colorBold), c, maxName, name, wrap(colorReset),

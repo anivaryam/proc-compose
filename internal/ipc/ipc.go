@@ -20,8 +20,9 @@ const (
 // State == "running".
 type ProcState struct {
 	Name       string    `json:"name"`
-	State      string    `json:"state"`      // running | restarting | exited | failed
-	Ready      bool      `json:"ready"`      // process passed its ready_when probe (or has none)
+	State      string    `json:"state"` // starting | running | restarting | exited | completed | failed
+	Mode       string    `json:"mode"`  // service (default) or task
+	Ready      bool      `json:"ready"` // process passed its ready_when probe (or has none)
 	PID        int       `json:"pid"`
 	Restarts   int       `json:"restarts"`
 	StartedAt  time.Time `json:"started_at,omitempty"`
@@ -40,10 +41,11 @@ type LogEntry struct {
 
 // CommandResult carries a runner's verdict for a command back to the
 // awaiting client. Status is one of:
-//   "ok"      — the command completed as requested
-//   "partial" — the command was accepted but couldn't be fully applied
-//               (e.g. reload skipped processes that were added or removed)
-//   "error"   — the command failed
+//
+//	"ok"      — the command completed as requested
+//	"partial" — the command was accepted but couldn't be fully applied
+//	            (e.g. reload skipped processes that were added or removed)
+//	"error"   — the command failed
 //
 // Message holds a human-readable explanation and is empty for plain "ok".
 type CommandResult struct {

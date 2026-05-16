@@ -9,7 +9,7 @@ import (
 
 type procState struct {
 	mu         sync.Mutex
-	state      string // running | restarting | exited | failed
+	state      string // starting | running | restarting | exited | completed | failed
 	pid        int
 	restarts   int
 	startedAt  time.Time
@@ -29,12 +29,16 @@ type procState struct {
 }
 
 type stateStore struct {
-	mu    sync.RWMutex
-	procs map[string]*procState
+	mu         sync.RWMutex
+	procs      map[string]*procState
+	infoByName map[string]procInfo
 }
 
 func newStateStore(infos []procInfo) *stateStore {
-	s := &stateStore{procs: make(map[string]*procState, len(infos))}
+	s := &stateStore{
+		procs:      make(map[string]*procState, len(infos)),
+		infoByName: make(map[string]procInfo, len(infos)),
+	}
 	for _, p := range infos {
 		s.procs[p.name] = &procState{
 			state:      "starting",
@@ -42,6 +46,7 @@ func newStateStore(infos []procInfo) *stateStore {
 			readyCh:    make(chan struct{}),
 			restartCh:  make(chan struct{}, 1),
 		}
+		s.infoByName[p.name] = p
 	}
 	return s
 }
@@ -122,9 +127,11 @@ func (s *stateStore) snapshot() []ipc.ProcState {
 	out := make([]ipc.ProcState, 0, len(s.procs))
 	for name, p := range s.procs {
 		p.mu.Lock()
+		info := s.infoByName[name]
 		out = append(out, ipc.ProcState{
 			Name:       name,
 			State:      p.state,
+			Mode:       info.proc.EffectiveMode(),
 			Ready:      p.readyClosed && p.readyOK,
 			PID:        p.pid,
 			Restarts:   p.restarts,

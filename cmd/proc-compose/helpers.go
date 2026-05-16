@@ -391,16 +391,12 @@ func notReadyNames(want map[string]struct{}, ready map[string]struct{}) []string
 	return out
 }
 
-// printStatusTable writes a one-line-per-process summary to stdout. Used by
-// `proc-compose status` (foreground, non-JSON). Mirrors the headings the
-// monitor TUI uses so output reads consistently across surfaces.
 func printStatusTable(procs []ipc.ProcState, tunnelURL string) {
 	if len(procs) == 0 {
 		fmt.Println("(no processes registered)")
 		return
 	}
 
-	// Stable order — daemon emits map iteration order otherwise.
 	sortProcs(procs)
 
 	maxName := len("PROCESS")
@@ -413,19 +409,23 @@ func printStatusTable(procs []ipc.ProcState, tunnelURL string) {
 	if tunnelURL != "" {
 		fmt.Printf("public: %s\n", tunnelURL)
 	}
-	fmt.Printf("%-*s  %-11s  %-8s  %-7s  %s\n",
-		maxName, "PROCESS", "STATE", "RESTARTS", "PID", "UPTIME")
+	fmt.Printf("%-*s  %-7s  %-11s  %-8s  %-7s  %s\n",
+		maxName, "PROCESS", "MODE", "STATE", "RESTARTS", "PID", "UPTIME")
 	for _, p := range procs {
 		uptime := "-"
 		if !p.StartedAt.IsZero() && (p.State == "running" || p.State == "restarting") {
 			uptime = formatStatusDuration(time.Since(p.StartedAt))
 		}
 		pid := "-"
-		if p.PID > 0 {
+		if p.PID > 0 && p.State != "completed" && p.State != "exited" && p.State != "failed" {
 			pid = fmt.Sprintf("%d", p.PID)
 		}
-		fmt.Printf("%-*s  %-11s  %-8d  %-7s  %s\n",
-			maxName, p.Name, p.State, p.Restarts, pid, uptime)
+		mode := p.Mode
+		if mode == "" {
+			mode = "service"
+		}
+		fmt.Printf("%-*s  %-7s  %-11s  %-8d  %-7s  %s\n",
+			maxName, p.Name, mode, p.State, p.Restarts, pid, uptime)
 	}
 }
 

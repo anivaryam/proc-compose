@@ -18,6 +18,7 @@ func (r *Runner) broadcastState(p procInfo, st *procState) {
 	snap := ipc.ProcState{
 		Name:       p.name,
 		State:      st.state,
+		Mode:       p.proc.EffectiveMode(),
 		Ready:      st.readyClosed && st.readyOK,
 		PID:        st.pid,
 		Restarts:   st.restarts,
