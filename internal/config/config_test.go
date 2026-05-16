@@ -979,6 +979,272 @@ processes:
 	}
 }
 
+// ─── Process mode validation ───────────────────────────────────────────────────
+
+func TestLoad_ModeDefault(t *testing.T) {
+	// No mode specified → defaults to "service"
+	yaml := `
+processes:
+  app:
+    cmd: echo hello
+`
+	cfg := loadFromString(t, yaml)
+	if cfg.Processes["app"].Mode != "" {
+		t.Errorf("Mode = %q, want empty string (raw)", cfg.Processes["app"].Mode)
+	}
+	if cfg.Processes["app"].EffectiveMode() != "service" {
+		t.Errorf("EffectiveMode() = %q, want service", cfg.Processes["app"].EffectiveMode())
+	}
+}
+
+func TestLoad_ModeService(t *testing.T) {
+	yaml := `
+processes:
+  app:
+    cmd: echo hello
+    mode: service
+`
+	cfg := loadFromString(t, yaml)
+	if cfg.Processes["app"].Mode != "service" {
+		t.Errorf("Mode = %q, want service", cfg.Processes["app"].Mode)
+	}
+	if cfg.Processes["app"].EffectiveMode() != "service" {
+		t.Errorf("EffectiveMode() = %q, want service", cfg.Processes["app"].EffectiveMode())
+	}
+}
+
+func TestLoad_ModeTask(t *testing.T) {
+	yaml := `
+processes:
+  migrate:
+    cmd: db-migrate
+    mode: task
+`
+	cfg := loadFromString(t, yaml)
+	if cfg.Processes["migrate"].Mode != "task" {
+		t.Errorf("Mode = %q, want task", cfg.Processes["migrate"].Mode)
+	}
+	if cfg.Processes["migrate"].EffectiveMode() != "task" {
+		t.Errorf("EffectiveMode() = %q, want task", cfg.Processes["migrate"].EffectiveMode())
+	}
+}
+
+func TestLoad_ModeInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want string // substring expected in error
+	}{
+		{
+			name: "unknown mode",
+			yaml: `
+processes:
+  app:
+    cmd: echo hi
+    mode: once
+`,
+			want: `app"`,
+		},
+		{
+			name: "typo task vs tasks",
+			yaml: `
+processes:
+  app:
+    cmd: echo hi
+    mode: tasks
+`,
+			want: `app"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "proc-compose.yml")
+			os.WriteFile(path, []byte(tc.yaml), 0644)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("expected error for invalid mode, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected error to mention %q, got: %v", tc.want, err)
+			}
+			// Error message should mention the invalid mode value
+			if !strings.Contains(err.Error(), "mode") {
+				t.Fatalf("expected error to mention 'mode', got: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoad_ModeTaskRejectsReadyWhen(t *testing.T) {
+	yaml := `
+processes:
+  migrate:
+    cmd: db-migrate
+    mode: task
+    ready_when:
+      log: "migration complete"
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proc-compose.yml")
+	os.WriteFile(path, []byte(yaml), 0644)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for ready_when with mode: task, got nil")
+	}
+	if !strings.Contains(err.Error(), "migrate") {
+		t.Fatalf("expected error to mention process name 'migrate', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "mode: task") {
+		t.Fatalf("expected error to mention 'mode: task', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "ready_when") {
+		t.Fatalf("expected error to mention 'ready_when', got: %v", err)
+	}
+}
+
+func TestLoad_ModeTaskRejectsReadyTimeout(t *testing.T) {
+	yaml := `
+processes:
+  migrate:
+    cmd: db-migrate
+    mode: task
+    ready_timeout: 30
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proc-compose.yml")
+	os.WriteFile(path, []byte(yaml), 0644)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for ready_timeout with mode: task, got nil")
+	}
+	if !strings.Contains(err.Error(), "migrate") {
+		t.Fatalf("expected error to mention process name 'migrate', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "mode: task") {
+		t.Fatalf("expected error to mention 'mode: task', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "ready_timeout") {
+		t.Fatalf("expected error to mention 'ready_timeout', got: %v", err)
+	}
+}
+
+func TestLoad_ModeTaskRejectsRestartOnFailure(t *testing.T) {
+	yaml := `
+processes:
+  migrate:
+    cmd: db-migrate
+    mode: task
+    restart: on-failure
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proc-compose.yml")
+	os.WriteFile(path, []byte(yaml), 0644)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for restart: on-failure with mode: task, got nil")
+	}
+	if !strings.Contains(err.Error(), "migrate") {
+		t.Fatalf("expected error to mention process name 'migrate', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "mode: task") {
+		t.Fatalf("expected error to mention 'mode: task', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "restart") {
+		t.Fatalf("expected error to mention 'restart', got: %v", err)
+	}
+}
+
+func TestLoad_ModeTaskRejectsRestartAlways(t *testing.T) {
+	yaml := `
+processes:
+  migrate:
+    cmd: db-migrate
+    mode: task
+    restart: always
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proc-compose.yml")
+	os.WriteFile(path, []byte(yaml), 0644)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for restart: always with mode: task, got nil")
+	}
+	if !strings.Contains(err.Error(), "migrate") {
+		t.Fatalf("expected error to mention process name 'migrate', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "mode: task") {
+		t.Fatalf("expected error to mention 'mode: task', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "restart") {
+		t.Fatalf("expected error to mention 'restart', got: %v", err)
+	}
+}
+
+func TestLoad_ModeTaskRejectsMaxRestarts(t *testing.T) {
+	yaml := `
+processes:
+  migrate:
+    cmd: db-migrate
+    mode: task
+    max_restarts: 5
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proc-compose.yml")
+	os.WriteFile(path, []byte(yaml), 0644)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for max_restarts with mode: task, got nil")
+	}
+	if !strings.Contains(err.Error(), "migrate") {
+		t.Fatalf("expected error to mention process name 'migrate', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "mode: task") {
+		t.Fatalf("expected error to mention 'mode: task', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "max_restarts") {
+		t.Fatalf("expected error to mention 'max_restarts', got: %v", err)
+	}
+}
+
+func TestLoad_ModeTaskAllowsRestartNever(t *testing.T) {
+	// mode: task with restart: never (or no restart) should be valid
+	yaml := `
+processes:
+  migrate:
+    cmd: db-migrate
+    mode: task
+    restart: never
+`
+	cfg := loadFromString(t, yaml)
+	if cfg.Processes["migrate"].Mode != "task" {
+		t.Errorf("Mode = %q, want task", cfg.Processes["migrate"].Mode)
+	}
+	if cfg.Processes["migrate"].Restart != "never" {
+		t.Errorf("Restart = %q, want never", cfg.Processes["migrate"].Restart)
+	}
+}
+
+func TestLoad_ModeTaskAllowsNoReadyWhenOrTimeout(t *testing.T) {
+	// mode: task with no ready_when and no ready_timeout should be valid
+	yaml := `
+processes:
+  migrate:
+    cmd: db-migrate
+    mode: task
+`
+	cfg := loadFromString(t, yaml)
+	if cfg.Processes["migrate"].Mode != "task" {
+		t.Errorf("Mode = %q, want task", cfg.Processes["migrate"].Mode)
+	}
+	if cfg.Processes["migrate"].ReadyWhen != nil {
+		t.Errorf("ReadyWhen = %v, want nil", cfg.Processes["migrate"].ReadyWhen)
+	}
+	if cfg.Processes["migrate"].ReadyTimeout != 0 {
+		t.Errorf("ReadyTimeout = %d, want 0", cfg.Processes["migrate"].ReadyTimeout)
+	}
+}
+
 func equalSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

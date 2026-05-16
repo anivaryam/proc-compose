@@ -25,17 +25,30 @@ type ReadyWhen struct {
 	Log  string `yaml:"log,omitempty"`  // Go regex; ready when matched in stdout
 }
 
+const (
+	ProcessModeService = "service"
+	ProcessModeTask    = "task"
+)
+
 type Process struct {
 	Cmd             string            `yaml:"cmd"`
 	Dir             string            `yaml:"dir,omitempty"`
-	EnvFile         string            `yaml:"env_file,omitempty"`         // path to .env file; merged before env block
+	EnvFile         string            `yaml:"env_file,omitempty"` // path to .env file; merged before env block
 	Env             map[string]string `yaml:"env,omitempty"`
+	Mode            string            `yaml:"mode,omitempty"`             // "service" (default), "task"
 	Restart         string            `yaml:"restart,omitempty"`          // "never" (default), "on-failure", "always"
 	MaxRestarts     int               `yaml:"max_restarts,omitempty"`     // 0 = unlimited; only applies when restart != "never"
 	ShutdownTimeout int               `yaml:"shutdown_timeout,omitempty"` // seconds before SIGKILL; 0 = platform default (5s on Unix)
 	ReadyWhen       *ReadyWhen        `yaml:"ready_when,omitempty"`       // probe to determine when process is ready
 	ReadyTimeout    int               `yaml:"ready_timeout,omitempty"`    // seconds to wait for readiness before failing; 0 = default (60s); -1 = no limit
 	DependsOn       []string          `yaml:"depends_on,omitempty"`       // wait for these processes to be ready before starting
+}
+
+func (p Process) EffectiveMode() string {
+	if p.Mode == "" {
+		return ProcessModeService
+	}
+	return p.Mode
 }
 
 type Merge struct {
@@ -146,6 +159,25 @@ func Load(path string) (*Config, error) {
 		case "never", "on-failure", "always":
 		default:
 			return nil, fmt.Errorf("process %q has invalid restart policy %q (use never, on-failure, or always)", name, proc.Restart)
+		}
+		switch proc.Mode {
+		case "", ProcessModeService, ProcessModeTask:
+		default:
+			return nil, fmt.Errorf("process %q: invalid mode %q (use service or task)", name, proc.Mode)
+		}
+		if proc.Mode == ProcessModeTask {
+			if proc.ReadyWhen != nil {
+				return nil, fmt.Errorf("process %q: mode: task cannot use ready_when", name)
+			}
+			if proc.ReadyTimeout != 0 {
+				return nil, fmt.Errorf("process %q: mode: task cannot use ready_timeout", name)
+			}
+			if proc.Restart != "never" {
+				return nil, fmt.Errorf("process %q: mode: task cannot use restart: %s (only restart: never is allowed)", name, proc.Restart)
+			}
+			if proc.MaxRestarts > 0 {
+				return nil, fmt.Errorf("process %q: mode: task cannot use max_restarts", name)
+			}
 		}
 		if proc.MaxRestarts < 0 {
 			return nil, fmt.Errorf("process %q: max_restarts must be >= 0", name)
