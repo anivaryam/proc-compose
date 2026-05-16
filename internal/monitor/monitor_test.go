@@ -143,6 +143,23 @@ func TestRebuildOrder_SortsByHealthThenName(t *testing.T) {
 	}
 }
 
+func TestRebuildOrder_KeepsUnhealthyRowsAboveCompletedTasks(t *testing.T) {
+	m := newTestMonitor()
+	m.procs["zz-done-migration"] = &ipc.ProcState{Name: "zz-done-migration", State: "completed", Ready: true, Mode: "task"}
+	m.procs["failed-api"] = &ipc.ProcState{Name: "failed-api", State: "failed"}
+	m.procs["ready-web"] = &ipc.ProcState{Name: "ready-web", State: "running", Ready: true}
+	m.procs["restarting-db"] = &ipc.ProcState{Name: "restarting-db", State: "restarting"}
+	m.procs["starting-worker"] = &ipc.ProcState{Name: "starting-worker", State: "running"}
+	m.procs["aa-exited-old"] = &ipc.ProcState{Name: "aa-exited-old", State: "exited"}
+
+	m.rebuildOrder()
+
+	want := []string{"failed-api", "restarting-db", "starting-worker", "ready-web", "zz-done-migration", "aa-exited-old"}
+	if got := strings.Join(m.procOrder, ","); got != strings.Join(want, ",") {
+		t.Errorf("procOrder = %q, want %q", got, strings.Join(want, ","))
+	}
+}
+
 func TestRebuildOrder_ClampSelected(t *testing.T) {
 	m := newTestMonitor()
 	m.procs["a"] = &ipc.ProcState{Name: "a"}
@@ -200,6 +217,7 @@ func TestStateDisplay(t *testing.T) {
 		{"running", "● "},
 		{"restarting", "↺ "},
 		{"failed", "✗ "},
+		{"completed", "✓ "},
 		{"exited", "■ "},
 		{"unknown", "■ "},
 	}
@@ -208,6 +226,13 @@ func TestStateDisplay(t *testing.T) {
 		if sym != c.wantSym {
 			t.Errorf("stateDisplay(%q) sym = %q, want %q", c.state, sym, c.wantSym)
 		}
+	}
+}
+
+func TestReadinessDisplayShowsDoneForCompletedReadyTask(t *testing.T) {
+	got := readinessDisplay(&ipc.ProcState{Name: "migration", State: "completed", Ready: true, Mode: "task"})
+	if got != "done" {
+		t.Errorf("readinessDisplay(completed ready task) = %q, want done", got)
 	}
 }
 
@@ -314,6 +339,30 @@ func TestRenderFrameShowsReadinessSummaryAndFilterState(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("render output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestRenderFrameShowsCompletedTaskAsDoneAndCountsSummary(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 120
+	m.height = 20
+	m.applyEvent(ipc.Event{
+		Type: ipc.TypeSnapshot,
+		Processes: []ipc.ProcState{
+			{Name: "api", State: "running", Ready: true},
+			{Name: "migration", State: "completed", Ready: true, Mode: "task"},
+			{Name: "legacy-service", State: "completed", Ready: true, Mode: "service"},
+		},
+	})
+
+	out := string(stripColor(m.renderFrame()))
+	for _, want := range []string{"tasks 1 done", "✓ completed", "done"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("render output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "tasks 2 done") {
+		t.Errorf("render output counted completed service as done:\n%s", out)
 	}
 }
 

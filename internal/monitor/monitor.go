@@ -288,18 +288,22 @@ func (m *monitor) rebuildOrder() {
 
 func healthRank(st *ipc.ProcState) int {
 	if st == nil {
-		return 4
+		return 5
 	}
 	switch st.State {
-	case "failed", "restarting":
+	case "failed":
 		return 0
+	case "restarting":
+		return 1
 	case "running":
 		if st.Ready {
-			return 2
+			return 3
 		}
-		return 1
+		return 2
+	case "completed":
+		return 4
 	default:
-		return 3
+		return 5
 	}
 }
 
@@ -786,6 +790,7 @@ func (m *monitor) procColorIdx(name string) int {
 func (m *monitor) summaryLine() string {
 	total := len(m.procOrder)
 	ready := 0
+	completedTasks := 0
 	failed := 0
 	restarting := 0
 	for _, name := range m.procOrder {
@@ -796,6 +801,9 @@ func (m *monitor) summaryLine() string {
 		if st.State == "running" && st.Ready {
 			ready++
 		}
+		if isCompletedTask(st) {
+			completedTasks++
+		}
 		switch st.State {
 		case "failed":
 			failed++
@@ -803,7 +811,7 @@ func (m *monitor) summaryLine() string {
 			restarting++
 		}
 	}
-	return fmt.Sprintf("ready %d/%d  failed %d  restarting %d", ready, total, failed, restarting)
+	return fmt.Sprintf("ready %d/%d  tasks %d done  failed %d  restarting %d", ready, total, completedTasks, failed, restarting)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -811,6 +819,9 @@ func (m *monitor) summaryLine() string {
 func readinessDisplay(st *ipc.ProcState) string {
 	if st == nil {
 		return "-"
+	}
+	if st.State == "completed" && st.Ready {
+		return "done"
 	}
 	if st.State != "running" {
 		return "-"
@@ -829,9 +840,15 @@ func stateDisplay(state string) (color, sym string) {
 		return ansiYellow, "↺ "
 	case "failed":
 		return ansiRed, "✗ "
+	case "completed":
+		return ansiGreen, "✓ "
 	default:
 		return ansiDim, "■ "
 	}
+}
+
+func isCompletedTask(st *ipc.ProcState) bool {
+	return st != nil && st.State == "completed" && st.Ready && st.Mode == "task"
 }
 
 func formatDuration(d time.Duration) string {
