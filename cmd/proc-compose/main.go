@@ -38,6 +38,26 @@ func main() {
 		Long: `A lightweight process runner that starts, logs, and manages
 multiple local services from a single YAML config.
 
+Config discovery:
+  Without -f, proc-compose searches the current directory and walks upward
+  for proc-compose.yml (and falls back to proc-compose.yaml). This lets
+  commands run from any nested directory of a monorepo.
+
+Daemon files (per absolute config path):
+  Socket: $XDG_RUNTIME_DIR/pc-<hash>.sock (falls back to $TMPDIR)
+  PID:    $XDG_RUNTIME_DIR/pc-<hash>.pid
+  Log:    $XDG_RUNTIME_DIR/pc-<hash>.log (used when --log-file is not set)
+
+Environment variables read directly:
+  NO_COLOR    Disable ANSI colour output (any non-empty value).
+  PORT        Used as merge-port listen port when merge.port is omitted.
+  XDG_RUNTIME_DIR   Base dir for socket / PID / log; defaults to $TMPDIR.
+
+Short-flag conflict:
+  -v at the root prints the version. -v on "up" enables verbose debug
+  output (cobra subcommand override). Use --version explicitly when in
+  doubt.
+
 Example:
   proc-compose up
   proc-compose up --silent              # daemonize
@@ -85,11 +105,30 @@ Example:
 		Use:     "up [processes...]",
 		Aliases: []string{"u"},
 		Short:   "Start all (or named) processes",
-		Example: `  proc-compose up                    # start all processes
-  proc-compose up frontend backend   # start specific processes
-  proc-compose up -s --log-file app.log   # daemonize with log file
-  proc-compose up --log-format json       # JSON log output
-  proc-compose up --verbose              # verbose debug output`,
+		Long: `Start every service in the config (or only the named ones, with
+their transitive dependencies). Logs are streamed with one colour
+per process; Ctrl+C tears the whole tree down.
+
+Process modes:
+  service (default)   Long-running. Ready when started, or when
+                      ready_when passes. Honours restart policy.
+  task                One-shot. Ready when it exits 0; non-zero exit
+                      fails the stack. Cannot use ready_when,
+                      ready_timeout, max_restarts, or restart != never.
+
+A task-only invocation always runs in the foreground: --silent
+requires at least one service in the started closure so the daemon
+has something to manage after tasks finish.`,
+		Example: `  proc-compose up                                # start all processes
+  proc-compose up frontend backend               # start subset (deps auto-included)
+  proc-compose up --dry-run                      # validate + list, do not start
+  proc-compose up -s --log-file app.log          # daemonize with log file
+  proc-compose up -s --wait-ready --wait-timeout 90   # block until probes pass
+  proc-compose up -s --health-port 8081          # expose /health on :8081
+  proc-compose up --survive --name myapp --install    # systemd auto-restart
+  proc-compose up --log-format json              # JSON log output
+  proc-compose up --no-color                     # disable ANSI colour
+  proc-compose up --verbose                      # verbose debug output`,
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -293,6 +332,19 @@ Example:
 		Use:           "monitor",
 		Aliases:       []string{"m"},
 		Short:         "Open a TUI monitor for a running daemon",
+		Long: `Open a TUI monitor for a running daemon.
+
+Keys:
+  q, Ctrl+C       quit
+  ?, h            toggle help overlay
+  up/down, k/j    navigate processes
+  Enter           toggle log filter for selected process
+  a               clear filter (show all logs)
+  PgUp, PgDn      scroll log buffer
+  G               jump to live tail
+  g               jump to top of log buffer
+
+NO_COLOR=1 disables colour output in the TUI as well as the runner.`,
 		Example:       "  proc-compose monitor           # open TUI\n  proc-compose monitor -f myapp.yml   # monitor specific config",
 		SilenceUsage:  true,
 		SilenceErrors: false,
@@ -313,7 +365,15 @@ Example:
 	stopCmd := &cobra.Command{
 		Use:           "stop",
 		Short:         "Stop a running proc-compose daemon",
-		Example:       "  proc-compose stop              # graceful, 10s timeout\n  proc-compose stop --timeout 30 # graceful, 30s timeout\n  proc-compose stop --force      # SIGKILL immediately",
+		Long: `Stop the proc-compose daemon associated with the resolved config file.
+
+Daemons are scoped per absolute config path. Use -f to stop a daemon
+started with a different config file. Sends SIGTERM, waits up to
+--timeout seconds, then escalates to SIGKILL.
+
+On Windows the graceful path is unavailable; --timeout is ignored and
+stop always uses taskkill /T /F.`,
+		Example:       "  proc-compose stop              # graceful, 10s timeout\n  proc-compose stop --timeout 30 # graceful, 30s timeout\n  proc-compose stop --force      # SIGKILL immediately\n  proc-compose stop -f myapp.yml # stop daemon for a specific config",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -375,6 +435,7 @@ Example:
 		Use:           "list",
 		Aliases:       []string{"l"},
 		Short:         "List processes defined in the config file",
+		Example:       "  proc-compose list              # show processes with restart policy\n  proc-compose list -f myapp.yml",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -394,6 +455,9 @@ Example:
 		Use:     "init",
 		Aliases: []string{"i"},
 		Short:   "Generate a starter proc-compose.yml",
+		Long: `Generate a starter proc-compose.yml in the current directory. Refuses
+to overwrite an existing file. Use 'bootstrap' instead if you want
+proc-compose to scan the project and propose a config tailored to it.`,
 		Example: `  proc-compose init                  # minimal language-agnostic
   proc-compose init --template node  # frontend+backend with merge-port
   proc-compose init --template go    # microservices skeleton
@@ -422,6 +486,12 @@ Example:
 		Use:           "uninstall",
 		Aliases:       []string{"un"},
 		Short:         "Remove systemd unit installed via --survive --install",
+		Long: `Stop, disable, and remove the systemd user unit previously installed
+with "up --survive --install --name <n>", then run daemon-reload.
+
+Linux/macOS only — Windows has no systemd user units. The --name flag
+is required and must match the name passed to --install.`,
+		Example:       "  proc-compose uninstall --name myapp",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -480,6 +550,11 @@ Example:
 		Use:           "restart <process>",
 		Aliases:       []string{"r"},
 		Short:         "Restart a single process in a running daemon",
+		Long: `Restart one named process in the running daemon without disturbing
+others. The daemon (not the local config) is the source of truth for
+process names — an unknown name returns "unknown process" from the
+daemon. Exits non-zero if the daemon rejects the request or is busy
+applying another command.`,
 		Example:       "  proc-compose restart backend    # restart single process\n  proc-compose restart -f myapp.yml backend",
 		Args:          cobra.ExactArgs(1),
 		SilenceUsage:  true,
@@ -533,6 +608,13 @@ Example:
 		Use:           "reload",
 		Aliases:       []string{"rl"},
 		Short:         "Reload config and restart changed processes",
+		Long: `Re-read the config and restart processes whose definition (cmd, env,
+dir, etc.) changed. Unchanged processes keep running.
+
+Hot-add / hot-remove are not supported: if processes were added or
+removed the daemon returns "partial" naming the skipped entries —
+restart the daemon to pick those up. Exits 0 on "ok" and "partial",
+non-zero on rejection or daemon-busy.`,
 		Example:       "  proc-compose reload            # reload and restart changed processes\n  proc-compose reload -f myapp.yml",
 		SilenceUsage:  true,
 		SilenceErrors: false,
@@ -626,6 +708,11 @@ Example:
 		Use:           "validate",
 		Aliases:       []string{"check"},
 		Short:         "Parse and validate the config without starting anything",
+		Long: `Parse the config and run all validation rules without starting any
+process. Exits non-zero on unknown fields, bad restart policies,
+circular depends_on, invalid readiness regex, or malformed merge
+sections. Suitable for CI and pre-commit checks.`,
+		Example:       "  proc-compose validate          # parse + validate\n  proc-compose validate -f myapp.yml",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -644,6 +731,16 @@ Example:
 	logsCmd := &cobra.Command{
 		Use:           "logs",
 		Short:         "Show logs from a running or past daemon",
+		Long: `Print the tail of the daemon log file for the resolved config.
+
+When --silent was used without --log-file, the daemon writes to
+$XDG_RUNTIME_DIR/pc-<hash>.log (where <hash> is derived from the
+absolute config path). When --log-file was passed explicitly, the
+daemon writes to that file and this command will not find it — read
+the explicit file directly.
+
+Defaults to the last 50 lines; pass -n 0 to print the whole file.`,
+		Example:       "  proc-compose logs              # last 50 lines\n  proc-compose logs -n 200       # last 200 lines\n  proc-compose logs -n 0         # entire log file",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -674,9 +771,10 @@ Example:
 	// ── man ───────────────────────────────────────────────────────────────────
 	var manDir string
 	manCmd := &cobra.Command{
-		Use:   "man",
-		Short: "Generate man page to stdout (or to a directory with --dir)",
-		Args:  cobra.NoArgs,
+		Use:     "man",
+		Short:   "Generate man page to stdout (or to a directory with --dir)",
+		Example: "  proc-compose man                            # write man page to stdout\n  proc-compose man --dir /usr/local/share/man/man1  # install pages to a directory",
+		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if manDir != "" {
 				if err := os.MkdirAll(manDir, 0755); err != nil {
@@ -693,6 +791,13 @@ Example:
 	bootstrapCmd := &cobra.Command{
 		Use:   "bootstrap",
 		Short: "Generate and optionally verify proc-compose setup",
+		Long: `Scan the project, propose a config, and (optionally) verify the
+generated config through proc-compose. Safe and read-only by default.
+
+When -f is set, bootstrap scans and resolves paths relative to that
+file's directory; otherwise it works in the current directory.
+--write refuses to overwrite an existing config unless --force is
+passed as well.`,
 		Example: `  proc-compose bootstrap                  # show generated config without changing files
   proc-compose bootstrap --write          # create proc-compose.yml when missing
   proc-compose bootstrap --write --force  # overwrite existing config
@@ -737,6 +842,15 @@ Example:
 		Use:     "doctor",
 		Aliases: []string{"doc"},
 		Short:   "Scan project and diagnose proc-compose setup",
+		Long: `Diagnose a proc-compose project. Without an existing config, scans
+common Node/Go/Python layouts (npm/yarn/pnpm/bun, Vite/Next/SvelteKit/
+Astro, Go cmd/**/main.go, Django/Flask/Uvicorn/Hypercorn) and prints
+suggested processes, ports, readiness probes, and YAML. With an
+existing config, checks paths, env files, port conflicts, readiness
+gaps, restart loops, merge-port setup, and missing binaries.
+
+When -f is set, scans relative to that config file's directory.
+--write only creates proc-compose.yml when no config exists.`,
 		Example: `  proc-compose doctor          # report detected services and config issues
   proc-compose doctor --write  # create proc-compose.yml when missing
   proc-compose doctor --json   # machine-readable report`,

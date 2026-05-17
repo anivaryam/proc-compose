@@ -146,29 +146,35 @@ Daemon commands (`status`, `logs`, `monitor`, `restart`, `reload`, `stop`) talk 
 ## CLI Usage
 
 ```
-proc-compose bootstrap [--write] [--verify] [--json]  Generate and optionally verify setup
-proc-compose doctor [--write] [--json]                Scan project and diagnose setup
-proc-compose init [--template T]                       Generate starter config
-proc-compose validate                                  Parse config without starting
-proc-compose up [processes...]                         Start all or named processes
-proc-compose up --silent                               Run daemon in background
-proc-compose monitor                                   Open live TUI for daemon
-proc-compose status [--json]                           Show daemon process states
-proc-compose logs [-n N]                               Show daemon log file
-proc-compose restart <process>                         Restart one running process
-proc-compose reload                                    Reload config and restart changed processes
-proc-compose stop [--timeout N]                        Stop daemon gracefully
-proc-compose list                                      List config processes
-proc-compose man [--dir DIR]                           Generate man pages
-proc-compose uninstall --name <n>                      Remove systemd unit
-proc-compose --version                                 Print version
+proc-compose bootstrap [--write] [--verify] [--json]    Generate and optionally verify setup
+proc-compose doctor [--write] [--json]                  Scan project and diagnose setup
+proc-compose init [--template T]                        Generate starter config
+proc-compose validate                                   Parse config without starting
+proc-compose up [processes...]                          Start all or named processes
+proc-compose up --silent                                Run daemon in background
+proc-compose monitor                                    Open live TUI for daemon
+proc-compose status [--json]                            Show daemon process states
+proc-compose logs [-n N]                                Show daemon log file (default 50 lines)
+proc-compose restart <process>                          Restart one running process
+proc-compose reload                                     Reload config and restart changed processes
+proc-compose stop [--timeout N] [--force]               Stop daemon gracefully (or SIGKILL)
+proc-compose list                                       List config processes
+proc-compose man [--dir DIR]                            Generate man pages
+proc-compose uninstall --name <n>                       Remove systemd unit
+proc-compose completion <shell>                         Generate shell completion (bash/zsh/fish/powershell)
+proc-compose --version                                  Print version
+
+Aliases:
+  up=u  monitor=m  restart=r  reload=rl  status=st|ps  list=l
+  init=i  doctor=doc  validate=check  uninstall=un
 
 Global flags:
-  -f, --file string        Config file path (default "proc-compose.yml"; falls back to proc-compose.yaml and parent dirs)
-  -v, --version            Print version
+  -f, --file string        Config file path (default "proc-compose.yml"; falls back to proc-compose.yaml and walks parent dirs)
+  -v, --version            Print version (note: on `up`, -v is --verbose; use --version to be explicit)
 
 Important flags (up):
   -s, --silent             Daemonize — run in the background and exit
+  -v, --verbose            Verbose debug output (overrides root -v on this subcommand)
       --wait-ready         With --silent, block until every started process passes its readiness probe
       --wait-timeout int   Seconds to wait when --wait-ready is set (default 60)
       --log-file string    Write all output to a file (use with --silent)
@@ -194,7 +200,32 @@ Flags (stop):
 
 Flags (init):
       --template string    Starter template: minimal (default), node, go, python
+
+Flags (logs):
+  -n, --tail int           Show last N lines (default 50; 0 = entire file)
 ```
+
+### Environment variables
+
+| Variable | Read by | Effect |
+|----------|---------|--------|
+| `NO_COLOR` | runner, monitor | Any non-empty value disables ANSI colour output |
+| `PORT` | merge-port config | Used as `merge.port` when not set explicitly (cloud platforms) |
+| `XDG_RUNTIME_DIR` | daemon | Base directory for socket / PID / log files; falls back to `$TMPDIR` |
+| `PROC_COMPOSE_INSTALL_DIR` | `install.sh` | Override install target (default `~/.local/bin`) |
+| `PROC_COMPOSE_VERSION` | `install.sh` | Pin a specific release tag (e.g. `v1.2.3`) |
+
+### Daemon file paths
+
+Each daemon is scoped per absolute config path (hashed into a stable id):
+
+```
+$XDG_RUNTIME_DIR/pc-<hash>.sock   # IPC socket (status/monitor/restart/reload/stop talk to this)
+$XDG_RUNTIME_DIR/pc-<hash>.pid    # daemon PID file
+$XDG_RUNTIME_DIR/pc-<hash>.log    # default log file when --log-file is not set
+```
+
+`logs` reads the default `.log` path. If you ran `up --silent --log-file PATH`, the daemon writes to `PATH` instead and `logs` will report "no log file found" — read `PATH` directly.
 
 ### Start all processes
 
@@ -443,6 +474,46 @@ processes:
 | `ready_when` | No | — | Readiness probe (see below) |
 | `ready_timeout` | No | `60` | Seconds to wait for readiness before failing (`-1` = no limit) |
 | `depends_on` | No | — | List of process names to wait for before starting |
+
+### Process Modes
+
+Every process is either a **service** (long-running) or a **task** (one-shot).
+The default is `service`. Set `mode: task` for migrations, seeding, codegen,
+prestart build steps, or any command meant to run once and exit cleanly.
+
+```yaml
+processes:
+  migrate:
+    mode: task
+    cmd: npm run migrate
+  api:
+    cmd: npm run dev
+    depends_on: [migrate]   # api waits for migrate to exit 0
+```
+
+Differences:
+
+| Aspect | Service (`mode: service`) | Task (`mode: task`) |
+|--------|---------------------------|---------------------|
+| Lifecycle | Long-running; expected to stay up | Runs once, exits |
+| Ready when | Started (or `ready_when` passes) | Exits with code `0` |
+| `ready_when` | Allowed (`http` / `tcp` / `log`) | Not allowed |
+| `ready_timeout` | Allowed (default 60s, `-1` = none) | Not allowed |
+| `restart` | `never`, `on-failure`, `always` | Must be `never` |
+| `max_restarts` | Allowed when `restart != never` | Not allowed |
+| As a dependency | Dependents start once it's ready | Dependents start once it exits 0 |
+| Failure | Exit triggers restart per policy | Non-zero exit fails the stack |
+| Status | `running`, `restarting`, `failed` | `completed` (✓) or `failed` |
+| `up --silent` | Counts as a managed process | Daemon refuses a task-only stack |
+
+`up --silent` requires at least one service in the started closure —
+the daemon has nothing to manage once every task has exited, so
+task-only stacks always run in the foreground.
+
+The monitor's status line shows `tasks N done`; completed task rows
+stay visible as `✓ completed` with readiness `done`. `status` and
+`status --json` include a `MODE` column / `mode` field so scripts can
+treat tasks differently from services.
 
 ### Restart Policies
 
