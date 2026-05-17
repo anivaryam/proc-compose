@@ -31,6 +31,8 @@ type serverClient struct {
 	conn      net.Conn
 	send      chan []byte // buffered; closed on disconnect
 	closeOnce sync.Once
+	sendMu    sync.Mutex // guards send-channel close vs concurrent sends
+	closed    bool       // set under sendMu when send has been closed
 }
 
 // NewServer creates a Server for the given socket path.
@@ -75,8 +77,28 @@ func (s *Server) Shutdown() {
 // after the send channel is drained.
 func (c *serverClient) shutdown() {
 	c.closeOnce.Do(func() {
+		c.sendMu.Lock()
+		c.closed = true
 		close(c.send)
+		c.sendMu.Unlock()
 	})
+}
+
+// trySend delivers data to the client without panicking if the send
+// channel has already been closed by shutdown. Returns true if the
+// data was queued, false if the client is gone or the buffer is full.
+func (c *serverClient) trySend(data []byte) bool {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.closed {
+		return false
+	}
+	select {
+	case c.send <- data:
+		return true
+	default:
+		return false
+	}
 }
 
 // SetState seeds the initial process state (called before Listen).
@@ -240,10 +262,8 @@ func (c *serverClient) writeLoop() {
 
 func (s *Server) fanOut(clients []*serverClient, data []byte) {
 	for _, c := range clients {
-		select {
-		case c.send <- data:
-		default:
-			// Channel full — shut down this slow client.
+		if !c.trySend(data) {
+			// Channel full or already closed — shut down this slow client.
 			c.shutdown()
 		}
 	}
