@@ -668,36 +668,65 @@ func (m *monitor) renderHelpFrame() []byte {
 	var buf bytes.Buffer
 	buf.WriteString("\033[H\033[J")
 
-	lines := []string{
-		"Keyboard Shortcuts",
-		"",
-		"  q, Ctrl+C        Quit",
-		"  ?, h             Toggle this help",
-		"  Esc, Space       Close this help",
-		"  ↑/↓ or k/j       Navigate processes",
-		"  Enter            Toggle filter for selected process",
-		"  a                Show all logs (unfilter)",
-		"  PgUp/PgDn        Scroll log area",
-		"  G                Jump to live tail",
-		"  g                Jump to top of buffer",
-		"",
-		"Press Esc, Space, or any key to close; press q to quit",
+	type helpRow struct {
+		key, desc string
 	}
+	shortcuts := []helpRow{
+		{"q, Ctrl+C", "Quit"},
+		{"?, h", "Toggle this help"},
+		{"Esc, Space", "Close this help"},
+		{"↑/↓ or k/j", "Navigate processes"},
+		{"Enter", "Toggle filter for selected process"},
+		{"a", "Show all logs (unfilter)"},
+		{"PgUp/PgDn", "Scroll log area"},
+		{"G", "Jump to live tail"},
+		{"g", "Jump to top of buffer"},
+	}
+	header := "Keyboard Shortcuts"
+	footer := "Press Esc, Space, or any key to close; press q to quit"
 
-	// Calculate centered box dimensions.
-	boxWidth := 0
-	for _, line := range lines {
-		if w := utf8.RuneCountInString(line) + 4; w > boxWidth {
-			boxWidth = w
+	// Width of the key column (max key width).
+	keyW := 0
+	for _, s := range shortcuts {
+		if w := utf8.RuneCountInString(s.key); w > keyW {
+			keyW = w
 		}
 	}
+	const gap = 3 // spaces between key and description
+	// Width of shortcut content (key column + gap + longest description).
+	descW := 0
+	for _, s := range shortcuts {
+		if w := utf8.RuneCountInString(s.desc); w > descW {
+			descW = w
+		}
+	}
+	shortcutW := keyW + gap + descW
+
+	// Box must fit the widest of header/footer/shortcut block plus padding.
+	contentW := shortcutW
+	if w := utf8.RuneCountInString(header); w > contentW {
+		contentW = w
+	}
+	if w := utf8.RuneCountInString(footer); w > contentW {
+		contentW = w
+	}
+	boxWidth := contentW + 4 // 1 border + 1 pad each side
 	if boxWidth < 40 {
 		boxWidth = 40
 	}
 	if m.width > 0 && boxWidth > m.width {
 		boxWidth = m.width
 	}
-	boxHeight := len(lines) + 2 // +2 for border
+
+	// Interior width between the side borders (excluding borders, including pad).
+	innerW := boxWidth - 2
+	// Left offset of shortcut block within interior, centered.
+	shortcutIndent := (innerW - shortcutW) / 2
+	if shortcutIndent < 1 {
+		shortcutIndent = 1
+	}
+
+	boxHeight := len(shortcuts) + 5 // header, blank, shortcuts, blank, footer + top/bottom border
 	startRow := (m.height - boxHeight) / 2
 	if startRow < 1 {
 		startRow = 1
@@ -713,16 +742,37 @@ func (m *monitor) renderHelpFrame() []byte {
 		row, startCol, ansiBold, ansiCyan, strings.Repeat("─", boxWidth-2), ansiReset)
 	row++
 
-	for _, line := range lines {
-		leftPad := (boxWidth - 2 - utf8.RuneCountInString(line)) / 2
-		if leftPad < 0 {
-			leftPad = 0
+	writeCentered := func(text string) {
+		pad := (innerW - utf8.RuneCountInString(text)) / 2
+		if pad < 0 {
+			pad = 0
 		}
-		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s %s %s%s%s",
-			row, startCol, ansiCyan,
-			ansiReset, strings.Repeat(" ", leftPad), ansiBold+ansiCyan, line, ansiReset)
+		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s%s%s%s%s",
+			row, startCol, ansiCyan, ansiReset,
+			strings.Repeat(" ", pad), ansiBold+ansiCyan, text, ansiReset)
 		row++
 	}
+	writeBlank := func() {
+		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s",
+			row, startCol, ansiCyan, ansiReset)
+		row++
+	}
+
+	writeCentered(header)
+	writeBlank()
+	for _, s := range shortcuts {
+		keyPad := keyW - utf8.RuneCountInString(s.key)
+		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s%s%s%s%s%s%s%s",
+			row, startCol, ansiCyan, ansiReset,
+			strings.Repeat(" ", shortcutIndent),
+			strings.Repeat(" ", keyPad),
+			ansiBold+ansiCyan, s.key, ansiReset,
+			strings.Repeat(" ", gap),
+			s.desc)
+		row++
+	}
+	writeBlank()
+	writeCentered(footer)
 
 	// Bottom border
 	fmt.Fprintf(&buf, "\033[%d;%dH%s%s%s",
