@@ -524,7 +524,7 @@ func (m *monitor) renderFrame() []byte {
 	}
 
 	// ── Process table header ──────────────────────────────────────────────────
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s  %-*s  %-11s  %-8s  %-6s  %-8s  %-8s  %s%s",
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s  %-*s  %-13s  %-8s  %-6s  %-8s  %-8s  %s%s",
 		row, ansiDim,
 		m.maxProcNameLen(), "PROCESS", "STATUS", "RESTARTS", "CPU%", "MEM", "READY", "UPTIME", ansiReset)
 	row++
@@ -862,16 +862,16 @@ func formatDuration(d time.Duration) string {
 
 func formatCPU(cpu float64) string {
 	if cpu <= 0 {
-		return "   -"
+		return "-"
 	}
-	return fmt.Sprintf("%5.1f%%", cpu)
+	return fmt.Sprintf("%.1f%%", cpu)
 }
 
 func formatMemory(memMB float64) string {
 	if memMB <= 0 {
-		return "     -"
+		return "-"
 	}
-	return fmt.Sprintf("%6.1fMB", memMB)
+	return fmt.Sprintf("%.1fMB", memMB)
 }
 
 func truncate(s string, maxLen int) string {
