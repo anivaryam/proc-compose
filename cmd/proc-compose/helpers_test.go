@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -361,6 +362,9 @@ func TestPrintStatusJSON_IncludesMode(t *testing.T) {
 }
 
 func TestWaitForProcessesReady_CompletedTaskAccepted(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket IPC not used on Windows")
+	}
 	timeout := 500 * time.Millisecond
 
 	socketPath, server, stopServer := ipcServerForTest(t)
@@ -389,6 +393,9 @@ func TestWaitForProcessesReady_CompletedTaskAccepted(t *testing.T) {
 }
 
 func TestWaitForProcessesReady_FailedProcessRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket IPC not used on Windows")
+	}
 	timeout := 500 * time.Millisecond
 
 	socketPath, server, stopServer := ipcServerForTest(t)

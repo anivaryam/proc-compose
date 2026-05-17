@@ -667,6 +667,9 @@ func TestServeHealth_ServiceRunningIsHealthy(t *testing.T) {
 // ─── Restart guardrail tests ────────────────────────────────────────────
 
 func TestHandleRestart_RejectsTaskMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket IPC not used on Windows")
+	}
 	r := makeRunner(map[string]config.Process{
 		"migrate": {Cmd: helperCmd("exit", "0"), Restart: "never", Mode: config.ProcessModeTask},
 	})
