@@ -61,8 +61,12 @@ func (r *Runner) Reload() ipc.CommandResult {
 		r.systemEvent(fmt.Sprintf("reload: removed process %q ignored (hot-remove not supported)", name), false)
 	}
 	var skipped []string
+	store := r.store.Load()
 	for _, c := range changes {
-		st := r.store.get(c.name)
+		var st *procState
+		if store != nil {
+			st = store.get(c.name)
+		}
 		if st != nil && st.state == "completed" {
 			skipped = append(skipped, c.name)
 			r.systemEvent(fmt.Sprintf("reload: %q is completed and cannot be restarted; restart the daemon to apply changes", c.name), false)

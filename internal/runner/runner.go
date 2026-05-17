@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/ansi"
@@ -32,7 +33,7 @@ type Runner struct {
 	HealthPort int         // if > 0, HTTP server listens on this port for /health
 	Silent     bool        // suppress startup banner (daemon child sets this)
 
-	store *stateStore // set during Run for command dispatch
+	store atomic.Pointer[stateStore] // set during Run for command dispatch
 
 	// cfgMu guards concurrent access to Config.Processes between Reload (writer)
 	// and the per-process restart loop (reader). Run-time startup and
@@ -81,7 +82,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	// Seed IPC with initial state before any process starts.
 	store := newStateStore(procs)
-	r.store = store
+	r.store.Store(store)
 
 	// Start health server if configured. Bind synchronously so a failure
 	// surfaces to the caller (and aborts daemon startup) instead of silently

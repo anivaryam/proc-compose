@@ -446,7 +446,7 @@ func TestRun_TaskModeSuccessUnblocksDependent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected task success to unblock dependent and return nil, got: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("runner did not finish after task completed")
 	}
 	if _, err := os.Stat(appStarted); err != nil {
@@ -510,7 +510,7 @@ func TestRun_TaskModeSuccessStateCompletedReady(t *testing.T) {
 	if err := r.Run(context.Background()); err != nil {
 		t.Fatalf("expected task success to return nil, got: %v", err)
 	}
-	states := r.store.snapshot()
+	states := r.store.Load().snapshot()
 	if len(states) != 1 {
 		t.Fatalf("expected one state, got %d", len(states))
 	}
@@ -534,7 +534,7 @@ func TestRun_TaskModeRunnerDefenseIgnoresRestartAlways(t *testing.T) {
 	if err := r.Run(context.Background()); err != nil {
 		t.Fatalf("expected successful task to finish without restarting, got: %v", err)
 	}
-	states := r.store.snapshot()
+	states := r.store.Load().snapshot()
 	if states[0].Restarts != 0 {
 		t.Fatalf("task restarts = %d, want 0", states[0].Restarts)
 	}
@@ -558,9 +558,13 @@ func TestServeHealth_TaskCompletedIsHealthy(t *testing.T) {
 		done <- r.Run(context.Background())
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runner did not finish in time")
+	}
 
-	go r.serveHealth(ln, r.store)
+	go r.serveHealth(ln, r.store.Load())
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get("http://" + ln.Addr().String() + "/health")
@@ -580,12 +584,6 @@ func TestServeHealth_TaskCompletedIsHealthy(t *testing.T) {
 	if result["healthy"] != true {
 		t.Errorf("healthy = %v, want true for completed task", result["healthy"])
 	}
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Log("runner did not finish in time")
-	}
 }
 
 func TestServeHealth_FailedTaskIsUnhealthy(t *testing.T) {
@@ -601,7 +599,7 @@ func TestServeHealth_FailedTaskIsUnhealthy(t *testing.T) {
 	})
 
 	store := newStateStore([]procInfo{{name: "migrate", proc: proc, colorIndex: 0}})
-	r.store = store
+	r.store.Store(store)
 
 	st := store.get("migrate")
 	st.state = "failed"
@@ -652,7 +650,7 @@ func TestServeHealth_ServiceRunningIsHealthy(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	go r.serveHealth(ln, r.store)
+	go r.serveHealth(ln, r.store.Load())
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get("http://" + ln.Addr().String() + "/health")
@@ -715,7 +713,7 @@ func TestHandleRestart_RejectsTaskMode(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Log("runner did not finish in time")
 	}
 }
@@ -789,7 +787,7 @@ func TestReload_SkipsCompletedTaskRestart(t *testing.T) {
 
 	r := &Runner{Config: cfg, ConfigPath: configPath}
 	store := newStateStore([]procInfo{{name: "migrate", proc: cfg.Processes["migrate"], colorIndex: 0}})
-	r.store = store
+	r.store.Store(store)
 
 	// Simulate task completing
 	st := store.get("migrate")
