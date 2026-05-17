@@ -524,7 +524,7 @@ func (m *monitor) renderFrame() []byte {
 	}
 
 	// ── Process table header ──────────────────────────────────────────────────
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s  %-*s  %-11s  %-8s  %-6s  %-7s  %-8s  %s%s",
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s  %-*s  %-11s  %-8s  %-6s  %-8s  %-8s  %s%s",
 		row, ansiDim,
 		m.maxProcNameLen(), "PROCESS", "STATUS", "RESTARTS", "CPU%", "MEM", "READY", "UPTIME", ansiReset)
 	row++
@@ -553,7 +553,7 @@ func (m *monitor) renderFrame() []byte {
 		memStr := formatMemory(st.MemoryMB)
 		readyStr := readinessDisplay(st)
 
-		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%-*s%s  %s%s%-11s%s  %-8s  %-6s  %-7s  %-8s  %s%s",
+		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%-*s%s  %s%s%-11s%s  %-8s  %-6s  %-8s  %-8s  %s%s",
 			row,
 			cursor, prefix,
 			ansiBold+c, m.maxProcNameLen(), padRight(name, m.maxProcNameLen()), ansiReset,
