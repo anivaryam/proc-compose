@@ -120,7 +120,10 @@ func TestResolveConfigExtension_DefaultPrefersYml(t *testing.T) {
 }
 
 func TestResolveConfigExtension_DefaultFindsParentConfig(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	child := filepath.Join(dir, "apps", "web")
 	if err := os.MkdirAll(child, 0755); err != nil {
 		t.Fatal(err)
@@ -145,7 +148,10 @@ func TestResolveConfigExtension_DefaultFindsParentConfig(t *testing.T) {
 }
 
 func TestResolveConfigContextUsesParentConfigAsProjectRoot(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	child := filepath.Join(dir, "packages", "api")
 	if err := os.MkdirAll(child, 0755); err != nil {
 		t.Fatal(err)
