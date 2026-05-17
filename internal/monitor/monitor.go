@@ -664,11 +664,6 @@ func (m *monitor) renderMessage(msg string) {
 	m.write(buf.Bytes())
 }
 
-// renderHelp displays a centered help overlay with all keyboard shortcuts.
-func (m *monitor) renderHelp() {
-	m.write(m.renderHelpFrame())
-}
-
 func (m *monitor) renderHelpFrame() []byte {
 	var buf bytes.Buffer
 	buf.WriteString("\033[H\033[J")
