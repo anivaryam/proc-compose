@@ -134,6 +134,15 @@ func (m *monitor) run() error {
 	}
 	defer term.Restore(fd, old)
 
+	// Windows conhost ignores ANSI escapes unless ENABLE_VIRTUAL_TERMINAL_PROCESSING
+	// is set on stdout. Without this, cursor positioning is dropped and every log
+	// row overwrites the same line. No-op on Unix.
+	if restore, err := enableVTOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: failed to enable VT output: %v\n", err)
+	} else {
+		defer restore()
+	}
+
 	// Alternate screen + hide cursor.
 	fmt.Print("\033[?1049h\033[?25l")
 	defer fmt.Print("\033[?1049l\033[?25h")
