@@ -8,12 +8,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/paths"
 )
 
 // unitNameRe restricts --name to characters safe for both a systemd unit
@@ -547,4 +549,112 @@ processes:
 	default:
 		return "", fmt.Errorf("unknown template %q; valid: minimal, node, go, python", name)
 	}
+}
+
+// candidateRuntimeDirs returns ordered runtime dirs to probe when locating
+// a live daemon. Lets the read-side commands (monitor/stop/restart/reload/
+// status) find a daemon whose $XDG_RUNTIME_DIR at launch differs from the
+// current shell's. Order matches paths.runtimeDir()'s preference, then
+// adds /run/user/<uid> for the case where XDG is unset in this shell but
+// was set when the daemon launched, and finally os.TempDir() as last
+// resort. Duplicates are filtered to keep probing cheap.
+func candidateRuntimeDirs() []string {
+	seen := map[string]bool{}
+	var dirs []string
+	add := func(d string) {
+		if d == "" || seen[d] {
+			return
+		}
+		seen[d] = true
+		dirs = append(dirs, d)
+	}
+	add(os.Getenv("XDG_RUNTIME_DIR"))
+	if cache, err := os.UserCacheDir(); err == nil {
+		add(filepath.Join(cache, "proc-compose"))
+	}
+	if runtime.GOOS == "linux" {
+		add(fmt.Sprintf("/run/user/%d", os.Getuid()))
+	}
+	add(os.TempDir())
+	return dirs
+}
+
+// liveDaemonPaths locates the PID and socket path of a daemon running for
+// hash, probing every candidate runtime dir for a live PID file. The
+// recorded socket addr from that PID file is returned — that's the path
+// the daemon actually bound to, so dialing works even when the current
+// shell's $XDG_RUNTIME_DIR differs from the daemon's. Falls back to the
+// env-derived defaults when no live daemon is found, so the caller can
+// surface the usual "no daemon running" error.
+//
+// Windows named pipes live in a global namespace, so the env-derived
+// paths are always correct there.
+func liveDaemonPaths(hash string) (pidPath, socketPath string) {
+	defaultPID := paths.PID(hash)
+	defaultSock := paths.Socket(hash)
+	if runtime.GOOS == "windows" {
+		return defaultPID, defaultSock
+	}
+	for _, d := range candidateRuntimeDirs() {
+		pp := filepath.Join(d, "pc-"+hash+".pid")
+		if _, err := os.Stat(pp); err != nil {
+			continue
+		}
+		alive, _ := daemon.IsAliveFromPIDFile(pp)
+		if !alive {
+			continue
+		}
+		_, addr, err := daemon.ReadPID(pp)
+		if err != nil || addr == "" {
+			continue
+		}
+		return pp, addr
+	}
+	return defaultPID, defaultSock
+}
+
+// liveLogPath locates the log file for hash across candidate runtime dirs.
+// Prefers the log living next to a live PID file, so `proc-compose logs`
+// follows whatever runtime dir the daemon actually used. Falls back to
+// any candidate dir that has the log, then to the env-derived default.
+func liveLogPath(hash string) string {
+	candidates := candidateRuntimeDirs()
+	for _, d := range candidates {
+		pp := filepath.Join(d, "pc-"+hash+".pid")
+		if _, err := os.Stat(pp); err != nil {
+			continue
+		}
+		if alive, _ := daemon.IsAliveFromPIDFile(pp); !alive {
+			continue
+		}
+		lp := filepath.Join(d, "pc-"+hash+".log")
+		if _, err := os.Stat(lp); err == nil {
+			return lp
+		}
+	}
+	for _, d := range candidates {
+		lp := filepath.Join(d, "pc-"+hash+".log")
+		if _, err := os.Stat(lp); err == nil {
+			return lp
+		}
+	}
+	return paths.Log(hash)
+}
+
+// resolveLiveDaemonPaths is the read-side counterpart to resolveConfigPaths.
+// It resolves the absolute config path and hash the same way, but returns
+// the PID/socket paths of an already-running daemon (probed across
+// candidate runtime dirs) rather than the env-derived write paths.
+func resolveLiveDaemonPaths(configFile string) (absConfig, hash, socketPath, pidPath string, err error) {
+	configFile = resolveConfigExtension(configFile)
+	absConfig, err = filepath.Abs(configFile)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	hash, err = paths.FromConfig(absConfig)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	pidPath, socketPath = liveDaemonPaths(hash)
+	return absConfig, hash, socketPath, pidPath, nil
 }

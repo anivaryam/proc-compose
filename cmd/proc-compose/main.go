@@ -361,7 +361,7 @@ Screenshots and full key reference:
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, _, socketPath, _, err := resolveConfigPaths(configFile)
+			_, _, socketPath, _, err := resolveLiveDaemonPaths(configFile)
 			if err != nil {
 				return err
 			}
@@ -389,7 +389,7 @@ stop always uses taskkill /T /F.`,
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, _, socketPath, pidPath, err := resolveConfigPaths(configFile)
+			_, _, socketPath, pidPath, err := resolveLiveDaemonPaths(configFile)
 			if err != nil {
 				return err
 			}
@@ -578,7 +578,7 @@ applying another command.`,
 			// the daemon may be running a different (older) config and is
 			// the source of truth. The daemon's ack carries an
 			// "unknown process" error if the name doesn't match.
-			_, _, socketPath, _, err := resolveConfigPaths(configFile)
+			_, _, socketPath, _, err := resolveLiveDaemonPaths(configFile)
 			if err != nil {
 				return err
 			}
@@ -633,7 +633,7 @@ non-zero on rejection or daemon-busy.`,
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, _, socketPath, _, err := resolveConfigPaths(configFile)
+			_, _, socketPath, _, err := resolveLiveDaemonPaths(configFile)
 			if err != nil {
 				return err
 			}
@@ -688,7 +688,7 @@ non-zero on rejection or daemon-busy.`,
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, _, socketPath, _, err := resolveConfigPaths(configFile)
+			_, _, socketPath, _, err := resolveLiveDaemonPaths(configFile)
 			if err != nil {
 				return err
 			}
@@ -762,7 +762,7 @@ Defaults to the last 50 lines; pass -n 0 to print the whole file.`,
 			if err != nil {
 				return err
 			}
-			logPath := paths.Log(hash)
+			logPath := liveLogPath(hash)
 			if _, err := os.Stat(logPath); os.IsNotExist(err) {
 				return fmt.Errorf("no log file found at %s (daemon may not have run with --log-file)", sanitizePath(logPath))
 			}

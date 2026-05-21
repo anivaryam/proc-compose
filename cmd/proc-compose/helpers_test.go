@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/paths"
 )
 
 func TestValidateUnitName(t *testing.T) {
@@ -534,5 +536,172 @@ func TestSilentGuardrail_ServiceWithTaskAllowed(t *testing.T) {
 	err := validateSilentSelection(cfg, []string{"app"})
 	if err != nil {
 		t.Errorf("expected nil error for service with task dependency, got: %v", err)
+	}
+}
+
+// TestLiveDaemonPaths_PrefersRecordedAddr ensures the read-side commands
+// can find a daemon launched under a different $XDG_RUNTIME_DIR — the bug
+// where a daemon launched with no XDG (PID file in ~/.cache/proc-compose/)
+// became unreachable from a shell that had XDG set.
+func TestLiveDaemonPaths_PrefersRecordedAddr(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named pipes don't have the XDG mismatch problem")
+	}
+
+	// Stash the daemon's PID file in an unrelated dir (simulating a
+	// daemon launched with no XDG_RUNTIME_DIR), then point this test's
+	// XDG_RUNTIME_DIR at a *different* empty dir. liveDaemonPaths must
+	// still discover the daemon via the candidate-dir probe.
+	daemonDir := t.TempDir()
+	shellRuntime := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", shellRuntime)
+
+	hash := "deadbeef"
+	pidPath := filepath.Join(daemonDir, "pc-"+hash+".pid")
+	recordedSock := filepath.Join(daemonDir, "pc-"+hash+".sock")
+	// Use our own PID so IsAliveFromPIDFile returns true.
+	if err := daemon.WritePID(pidPath, os.Getpid(), recordedSock); err != nil {
+		t.Fatalf("WritePID: %v", err)
+	}
+
+	// Force candidateRuntimeDirs to include daemonDir by mocking
+	// os.UserCacheDir via $XDG_CACHE_HOME — Go's os.UserCacheDir on Linux
+	// honours $XDG_CACHE_HOME. liveDaemonPaths probes
+	// <UserCacheDir>/proc-compose, so a daemon dir reachable via
+	// $XDG_CACHE_HOME/proc-compose lets us simulate the real-world case.
+	cacheHome := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cacheHome, "proc-compose"), 0700); err != nil {
+		t.Fatalf("mkdir cache: %v", err)
+	}
+	t.Setenv("XDG_CACHE_HOME", cacheHome)
+	// Move the PID file into the cache-derived dir so the probe finds it.
+	dst := filepath.Join(cacheHome, "proc-compose", "pc-"+hash+".pid")
+	if err := os.Rename(pidPath, dst); err != nil {
+		t.Fatalf("rename pid: %v", err)
+	}
+
+	gotPID, gotSock := liveDaemonPaths(hash)
+	if gotPID != dst {
+		t.Errorf("pidPath = %q; want %q", gotPID, dst)
+	}
+	if gotSock != recordedSock {
+		t.Errorf("socketPath = %q; want %q (the daemon's recorded addr)", gotSock, recordedSock)
+	}
+}
+
+// TestLiveDaemonPaths_FallsBackWhenNoDaemon makes sure callers still get
+// the env-derived defaults (so they can surface "no daemon running") when
+// no live PID file is anywhere on the candidate path.
+func TestLiveDaemonPaths_FallsBackWhenNoDaemon(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named pipes don't have the XDG mismatch problem")
+	}
+
+	xdg := t.TempDir()
+	cache := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	t.Setenv("XDG_CACHE_HOME", cache)
+
+	hash := "cafebabe"
+	gotPID, gotSock := liveDaemonPaths(hash)
+	if gotPID != paths.PID(hash) {
+		t.Errorf("pidPath fallback = %q; want %q", gotPID, paths.PID(hash))
+	}
+	if gotSock != paths.Socket(hash) {
+		t.Errorf("socketPath fallback = %q; want %q", gotSock, paths.Socket(hash))
+	}
+}
+
+// TestLiveLogPath_PrefersLogNextToLivePID covers the same XDG mismatch
+// for `proc-compose logs` — daemon writes to one runtime dir, user runs
+// logs from a shell with a different XDG_RUNTIME_DIR.
+func TestLiveLogPath_PrefersLogNextToLivePID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named pipes don't have the XDG mismatch problem")
+	}
+
+	xdg := t.TempDir() // empty — no daemon files here
+	cache := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	t.Setenv("XDG_CACHE_HOME", cache)
+
+	cacheDir := filepath.Join(cache, "proc-compose")
+	if err := os.MkdirAll(cacheDir, 0700); err != nil {
+		t.Fatalf("mkdir cache: %v", err)
+	}
+
+	hash := "abcd1234"
+	pidPath := filepath.Join(cacheDir, "pc-"+hash+".pid")
+	logPath := filepath.Join(cacheDir, "pc-"+hash+".log")
+	if err := daemon.WritePID(pidPath, os.Getpid(), filepath.Join(cacheDir, "pc-"+hash+".sock")); err != nil {
+		t.Fatalf("WritePID: %v", err)
+	}
+	if err := os.WriteFile(logPath, []byte("hello\n"), 0600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	got := liveLogPath(hash)
+	if got != logPath {
+		t.Errorf("liveLogPath = %q; want %q (next to live PID)", got, logPath)
+	}
+}
+
+// TestLiveLogPath_FallsBackToExistingLog returns any candidate-dir log
+// when no live daemon is found — useful for post-mortem reads after the
+// daemon already exited.
+func TestLiveLogPath_FallsBackToExistingLog(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named pipes don't have the XDG mismatch problem")
+	}
+
+	xdg := t.TempDir()
+	cache := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	t.Setenv("XDG_CACHE_HOME", cache)
+
+	cacheDir := filepath.Join(cache, "proc-compose")
+	if err := os.MkdirAll(cacheDir, 0700); err != nil {
+		t.Fatalf("mkdir cache: %v", err)
+	}
+
+	hash := "11112222"
+	leftover := filepath.Join(cacheDir, "pc-"+hash+".log")
+	if err := os.WriteFile(leftover, []byte("dead daemon log\n"), 0600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	got := liveLogPath(hash)
+	if got != leftover {
+		t.Errorf("liveLogPath = %q; want %q", got, leftover)
+	}
+}
+
+// TestLiveDaemonPaths_SkipsStalePIDFile guards against returning a dead
+// daemon's recorded addr — the probe must keep walking to the next
+// candidate dir if the first PID file points at a process that's gone.
+func TestLiveDaemonPaths_SkipsStalePIDFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named pipes don't have the XDG mismatch problem")
+	}
+
+	xdg := t.TempDir()
+	cache := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", xdg)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	if err := os.MkdirAll(filepath.Join(cache, "proc-compose"), 0700); err != nil {
+		t.Fatalf("mkdir cache: %v", err)
+	}
+
+	hash := "feed1234"
+	// PID 1 is init — guaranteed alive but the PID file's recorded start
+	// time won't match, so IsAliveFromPIDFile rejects it as stale.
+	stalePID := filepath.Join(cache, "proc-compose", "pc-"+hash+".pid")
+	if err := os.WriteFile(stalePID, []byte(`{"pid":1,"addr":"/tmp/wrong.sock","started_at":1}`), 0600); err != nil {
+		t.Fatalf("write stale pidfile: %v", err)
+	}
+
+	_, gotSock := liveDaemonPaths(hash)
+	if gotSock == "/tmp/wrong.sock" {
+		t.Errorf("returned stale recorded addr; want fallback")
 	}
 }
