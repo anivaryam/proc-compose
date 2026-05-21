@@ -2,6 +2,7 @@ bin/
 dist/
 .worktrees/
 docs/*
+!docs/monitor.gif
 .sisyphus
 /proc-compose
 coverage.out

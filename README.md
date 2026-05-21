@@ -1,5 +1,7 @@
 # proc-compose
 
+![proc-compose monitor TUI](docs/monitor.gif)
+
 `proc-compose` is a local process orchestrator for development and small deployments. It starts every service in your stack from one YAML file, streams their logs with stable names and colors, waits for readiness, restarts failed processes when configured, and shuts the whole tree down cleanly with one Ctrl+C.
 
 Use it when a project needs more than one command to run:
