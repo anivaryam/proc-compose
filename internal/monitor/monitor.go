@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
+	"unicode"
 
 	"github.com/anivaryam/proc-compose/internal/ansi"
 	"github.com/anivaryam/proc-compose/internal/ipc"
@@ -492,50 +492,74 @@ func (m *monitor) renderFrame() []byte {
 	var buf bytes.Buffer
 
 	// Cursor to top-left only — no leading clear. Each row erases its
-	// own tail with \033[K, and a single \033[J at the end wipes any
-	// leftover rows. This "overwrite, don't clear" pattern avoids the
-	// blank-screen flash that would otherwise flicker on terminals that
-	// don't honour DEC mode 2026 (synchronized output).
+	// own tail with \033[K while immediately redrawing the full bordered
+	// row. This "overwrite, don't clear" pattern avoids the blank-screen
+	// flash that would otherwise flicker on terminals that don't honour
+	// DEC mode 2026 (synchronized output).
 	buf.WriteString("\033[H")
 
-	row := 1
+	innerW := m.width - 2
+	contentLimit := innerW - 1
+	frameContent := func(content string) string {
+		contentW := visibleWidth(content)
+		if contentW > contentLimit {
+			content = truncate(string(stripColor([]byte(content))), contentLimit)
+			contentW = visibleWidth(content)
+		}
+		return content + strings.Repeat(" ", contentLimit-contentW)
+	}
+	writeBorderedRow := func(row int, content string) {
+		if row <= 1 || row >= m.height {
+			return
+		}
+		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s│%s%s",
+			row, ansiCyan, ansiReset, frameContent(content))
+		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s", row, m.width, ansiCyan, ansiReset)
+	}
+	writeBlankRows := func(from int) {
+		for r := from; r < m.height; r++ {
+			writeBorderedRow(r, "")
+		}
+	}
+
+	fmt.Fprintf(&buf, "\033[1;1H\033[K%s┌%s┐%s",
+		ansiBold+ansiCyan, strings.Repeat("─", innerW), ansiReset)
+
+	row := 2
 
 	// ── Header ────────────────────────────────────────────────────────────────
 	title := "proc-compose monitor"
 	hints := "q=quit  ?=help  ↑↓/jk=nav  ⏎=filter  a=all  PgUp/Dn=scroll"
-	gap := m.width - utf8.RuneCountInString(title) - utf8.RuneCountInString(hints) - 2
+	gap := innerW - cellWidthString(title) - cellWidthString(hints) - 2
 	if gap < 1 {
 		gap = 1
 	}
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%s%s%s%s",
-		row,
+	writeBorderedRow(row, fmt.Sprintf("%s%s%s%s%s%s%s",
 		ansiBold+ansiCyan, title, ansiReset,
 		strings.Repeat(" ", gap),
-		ansiDim, hints, ansiReset)
+		ansiDim, hints, ansiReset))
 	row++
 
 	// ── Summary ───────────────────────────────────────────────────────────────
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K  %s%s%s",
-		row, ansiBold, m.summaryLine(), ansiReset)
+	writeBorderedRow(row, fmt.Sprintf("  %s%s%s", ansiBold, m.summaryLine(), ansiReset))
 	row++
 
 	// ── Tunnel URL (only shown when --tunnel is active) ───────────────────────
 	if m.tunnelURL != "" {
 		label := "  public: "
 		urlPart := m.tunnelURL
-		maxURLLen := m.width - utf8.RuneCountInString(label) - 2
-		if maxURLLen > 10 && utf8.RuneCountInString(urlPart) > maxURLLen {
-			urlPart = string([]rune(urlPart)[:maxURLLen-1]) + "…"
+		maxURLLen := innerW - cellWidthString(label) - 2
+		if maxURLLen > 10 && cellWidthString(urlPart) > maxURLLen {
+			urlPart = truncate(urlPart, maxURLLen)
 		}
-		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%s%s",
-			row, ansiDim, label, ansiBold+ansiGreen, urlPart, ansiReset)
+		writeBorderedRow(row, fmt.Sprintf("%s%s%s%s%s", ansiDim, label, ansiBold+ansiGreen, urlPart, ansiReset))
 		row++
 	}
 
 	// ── Process table header ──────────────────────────────────────────────────
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s  %-*s  %-13s  %-8s  %-6s  %-8s  %-8s  %s%s",
-		row, ansiDim,
-		m.maxProcNameLen(), "PROCESS", "STATUS", "RESTARTS", "CPU%", "MEM", "READY", "UPTIME", ansiReset)
+	writeBorderedRow(row, fmt.Sprintf("%s  %s  %-13s  %-8s  %-6s  %-8s  %-8s  %s%s",
+		ansiDim,
+		padRight("PROCESS", m.maxProcNameLen()), "STATUS", "RESTARTS", "CPU%", "MEM", "READY", "UPTIME", ansiReset))
 	row++
 
 	// ── Process rows ──────────────────────────────────────────────────────────
@@ -562,16 +586,15 @@ func (m *monitor) renderFrame() []byte {
 		memStr := formatMemory(st.MemoryMB)
 		readyStr := readinessDisplay(st)
 
-		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%-*s%s  %s%s%-11s%s  %-8s  %-6s  %-8s  %-8s  %s%s",
-			row,
+		writeBorderedRow(row, fmt.Sprintf("%s%s%s%s%s  %s%s%-11s%s  %-8s  %-6s  %-8s  %-8s  %s%s",
 			cursor, prefix,
-			ansiBold+c, m.maxProcNameLen(), padRight(name, m.maxProcNameLen()), ansiReset,
+			ansiBold+c, padRight(name, m.maxProcNameLen()), ansiReset,
 			stateColor, stateSym, st.State, ansiReset,
 			restarts,
 			cpuStr,
 			memStr,
 			readyStr,
-			uptime, suffix)
+			uptime, suffix))
 		row++
 	}
 
@@ -584,16 +607,18 @@ func (m *monitor) renderFrame() []byte {
 	if m.logOffset > 0 {
 		scrollHint = fmt.Sprintf("  %s[+%d lines]%s", ansiYellow, m.logOffset, ansiReset)
 	}
-	div := strings.Repeat("─", m.width)
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s", row, div)
+	div := strings.Repeat("─", innerW)
+	writeBorderedRow(row, div)
 	row++
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s%s",
-		row, ansiBold, filterLabel, ansiReset, scrollHint)
+	writeBorderedRow(row, fmt.Sprintf("%s%s%s%s", ansiBold, filterLabel, ansiReset, scrollHint))
 	row++
 
 	// ── Log lines ─────────────────────────────────────────────────────────────
 	logRows := m.height - row
 	if logRows < 1 {
+		writeBlankRows(row)
+		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s└%s┘%s",
+			m.height, ansiBold+ansiCyan, strings.Repeat("─", innerW), ansiReset)
 		return buf.Bytes()
 	}
 
@@ -615,7 +640,7 @@ func (m *monitor) renderFrame() []byte {
 		if m.filter != "" {
 			message = fmt.Sprintf("No logs for %s yet", m.filter)
 		}
-		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%s", row, ansiDim, message, ansiReset)
+		writeBorderedRow(row, fmt.Sprintf("%s%s%s", ansiDim, message, ansiReset))
 		row++
 	}
 
@@ -628,21 +653,18 @@ func (m *monitor) renderFrame() []byte {
 			lineColor = ansiYellow
 		}
 
-		line := truncate(entry.Line, m.width-m.maxProcNameLen()-4)
-		fmt.Fprintf(&buf, "\033[%d;1H\033[K%s%s%-*s%s %s│%s %s%s%s",
-			row,
-			ansiBold+c, "", m.maxProcNameLen(), entry.Process, ansiReset,
+		lineWidth := innerW - m.maxProcNameLen() - 4
+		line := truncate(sanitizeLogLine(entry.Line), lineWidth)
+		writeBorderedRow(row, fmt.Sprintf("%s%s%s %s│%s %s%s%s",
+			ansiBold+c, padRight(entry.Process, m.maxProcNameLen()), ansiReset,
 			ansiDim, ansiReset,
-			lineColor, line, ansiReset)
+			lineColor, line, ansiReset))
 		row++
 	}
 
-	// Single clear-to-end-of-screen wipes any leftover rows below the
-	// last log line. Cheaper than per-row \033[2K and produces no
-	// flash because content above is already painted.
-	if row <= m.height {
-		fmt.Fprintf(&buf, "\033[%d;1H\033[J", row)
-	}
+	writeBlankRows(row)
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K%s└%s┘%s",
+		m.height, ansiBold+ansiCyan, strings.Repeat("─", innerW), ansiReset)
 
 	return buf.Bytes()
 }
@@ -697,7 +719,7 @@ func (m *monitor) renderHelpFrame() []byte {
 	// Width of the key column (max key width).
 	keyW := 0
 	for _, s := range shortcuts {
-		if w := utf8.RuneCountInString(s.key); w > keyW {
+		if w := cellWidthString(s.key); w > keyW {
 			keyW = w
 		}
 	}
@@ -705,7 +727,7 @@ func (m *monitor) renderHelpFrame() []byte {
 	// Width of shortcut content (key column + gap + longest description).
 	descW := 0
 	for _, s := range shortcuts {
-		if w := utf8.RuneCountInString(s.desc); w > descW {
+		if w := cellWidthString(s.desc); w > descW {
 			descW = w
 		}
 	}
@@ -713,10 +735,10 @@ func (m *monitor) renderHelpFrame() []byte {
 
 	// Box must fit the widest of header/footer/shortcut block plus padding.
 	contentW := shortcutW
-	if w := utf8.RuneCountInString(header); w > contentW {
+	if w := cellWidthString(header); w > contentW {
 		contentW = w
 	}
-	if w := utf8.RuneCountInString(footer); w > contentW {
+	if w := cellWidthString(footer); w > contentW {
 		contentW = w
 	}
 	boxWidth := contentW + 4 // 1 border + 1 pad each side
@@ -747,45 +769,71 @@ func (m *monitor) renderHelpFrame() []byte {
 
 	row := startRow
 	// Top border
-	fmt.Fprintf(&buf, "\033[%d;%dH%s%s%s%s",
-		row, startCol, ansiBold, ansiCyan, strings.Repeat("─", boxWidth-2), ansiReset)
+	fmt.Fprintf(&buf, "\033[%d;%dH%s┌%s┐%s",
+		row, startCol, ansiBold+ansiCyan, strings.Repeat("─", innerW), ansiReset)
 	row++
+	fitText := func(text string, width int) string {
+		if width <= 0 {
+			return ""
+		}
+		if cellWidthString(text) > width {
+			return truncate(text, width)
+		}
+		return text
+	}
 
 	writeCentered := func(text string) {
-		pad := (innerW - utf8.RuneCountInString(text)) / 2
+		text = fitText(text, innerW)
+		textW := cellWidthString(text)
+		pad := (innerW - textW) / 2
 		if pad < 0 {
 			pad = 0
 		}
-		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s%s%s%s%s",
-			row, startCol, ansiCyan, ansiReset,
-			strings.Repeat(" ", pad), ansiBold+ansiCyan, text, ansiReset)
+		trail := innerW - pad - textW
+		if trail < 0 {
+			trail = 0
+		}
+		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s%s%s%s%s%s%s│%s",
+			row, startCol,
+			ansiCyan, ansiReset,
+			strings.Repeat(" ", pad), ansiBold+ansiCyan, text, ansiReset,
+			strings.Repeat(" ", trail), ansiCyan, ansiReset)
 		row++
 	}
 	writeBlank := func() {
-		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s",
-			row, startCol, ansiCyan, ansiReset)
+		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s%s%s│%s",
+			row, startCol, ansiCyan, ansiReset, strings.Repeat(" ", innerW), ansiCyan, ansiReset)
 		row++
 	}
 
 	writeCentered(header)
 	writeBlank()
 	for _, s := range shortcuts {
-		keyPad := keyW - utf8.RuneCountInString(s.key)
-		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s%s%s%s%s%s%s%s",
+		desc := s.desc
+		keyPad := keyW - cellWidthString(s.key)
+		descW := innerW - shortcutIndent - keyPad - cellWidthString(s.key) - gap
+		desc = fitText(desc, descW)
+		rowW := shortcutIndent + keyPad + cellWidthString(s.key) + gap + cellWidthString(desc)
+		trail := innerW - rowW
+		if trail < 0 {
+			trail = 0
+		}
+		fmt.Fprintf(&buf, "\033[%d;%dH%s│%s%s%s%s%s%s%s%s%s%s│%s",
 			row, startCol, ansiCyan, ansiReset,
 			strings.Repeat(" ", shortcutIndent),
 			strings.Repeat(" ", keyPad),
 			ansiBold+ansiCyan, s.key, ansiReset,
 			strings.Repeat(" ", gap),
-			s.desc)
+			desc,
+			strings.Repeat(" ", trail), ansiCyan, ansiReset)
 		row++
 	}
 	writeBlank()
 	writeCentered(footer)
 
 	// Bottom border
-	fmt.Fprintf(&buf, "\033[%d;%dH%s%s%s",
-		row, startCol, ansiBold+ansiCyan, strings.Repeat("─", boxWidth-2), ansiReset)
+	fmt.Fprintf(&buf, "\033[%d;%dH%s└%s┘%s",
+		row, startCol, ansiBold+ansiCyan, strings.Repeat("─", innerW), ansiReset)
 
 	return buf.Bytes()
 }
@@ -817,10 +865,10 @@ func (m *monitor) logAreaRows() int {
 }
 
 func (m *monitor) maxProcNameLen() int {
-	n := 7 // minimum "PROCESS"
+	n := cellWidthString("PROCESS")
 	for _, name := range m.procOrder {
-		if len(name) > n {
-			n = len(name)
+		if w := cellWidthString(name); w > n {
+			n = w
 		}
 	}
 	return n
@@ -937,17 +985,93 @@ func truncate(s string, maxLen int) string {
 	if maxLen <= 0 {
 		return ""
 	}
-	if utf8.RuneCountInString(s) <= maxLen {
+	if cellWidthString(s) <= maxLen {
 		return s
 	}
-	runes := []rune(s)
-	return string(runes[:maxLen-1]) + "…"
+	if maxLen == 1 {
+		return "…"
+	}
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		w := cellWidthRune(r)
+		if used+w > maxLen-1 {
+			break
+		}
+		b.WriteRune(r)
+		used += w
+	}
+	return b.String() + "…"
 }
 
 func padRight(s string, width int) string {
-	remain := width - utf8.RuneCountInString(s)
+	remain := width - cellWidthString(s)
 	if remain <= 0 {
 		return s
 	}
 	return s + strings.Repeat(" ", remain)
+}
+
+func sanitizeLogLine(s string) string {
+	s = string(stripColor([]byte(s)))
+	var b strings.Builder
+	changed := false
+	for _, r := range s {
+		switch {
+		case r == '\t':
+			b.WriteString("    ")
+			changed = true
+		case r < 0x20 || (r >= 0x7f && r < 0xa0):
+			b.WriteRune(' ')
+			changed = true
+		default:
+			b.WriteRune(r)
+		}
+	}
+	if !changed {
+		return s
+	}
+	return b.String()
+}
+
+func visibleWidth(s string) int {
+	return cellWidthString(string(stripColor([]byte(s))))
+}
+
+func cellWidthString(s string) int {
+	width := 0
+	for _, r := range s {
+		width += cellWidthRune(r)
+	}
+	return width
+}
+
+func cellWidthRune(r rune) int {
+	switch {
+	case r == '\t':
+		return 4
+	case r < 0x20 || (r >= 0x7f && r < 0xa0):
+		return 0
+	case unicode.Is(unicode.Mn, r):
+		return 0
+	case isWideRune(r):
+		return 2
+	default:
+		return 1
+	}
+}
+
+func isWideRune(r rune) bool {
+	return (r >= 0x1100 && r <= 0x115f) ||
+		(r >= 0x2300 && r <= 0x23ff) ||
+		(r >= 0x2329 && r <= 0x232a) ||
+		(r >= 0x2600 && r <= 0x27bf) ||
+		(r >= 0x2e80 && r <= 0xa4cf) ||
+		(r >= 0xac00 && r <= 0xd7a3) ||
+		(r >= 0xf900 && r <= 0xfaff) ||
+		(r >= 0xfe10 && r <= 0xfe19) ||
+		(r >= 0xfe30 && r <= 0xfe6f) ||
+		(r >= 0xff00 && r <= 0xff60) ||
+		(r >= 0xffe0 && r <= 0xffe6) ||
+		(r >= 0x1f300 && r <= 0x1faff)
 }

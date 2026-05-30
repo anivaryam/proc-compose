@@ -2,14 +2,18 @@ package monitor
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
 var testCSIRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+var testCursorLineRe = regexp.MustCompile(`\x1b\[[0-9]+;[0-9]+H([^\x1b]*)`)
+var testCursorRowRe = regexp.MustCompile(`\x1b\[([0-9]+);([0-9]+)H(?:\x1b\[[0-9;?]*K)?([^\x1b]*)`)
 
 func plainFrameLines(frame []byte) []string {
 	plain := string(stripColor(frame))
@@ -22,6 +26,84 @@ func plainFrameLines(frame []byte) []string {
 		}
 	}
 	return lines
+}
+
+func cursorRows(frame []byte) map[int]string {
+	plain := string(stripColor(frame))
+	rows := map[int]string{}
+	for _, match := range testCursorRowRe.FindAllStringSubmatch(plain, -1) {
+		row, err := strconv.Atoi(match[1])
+		if err != nil {
+			continue
+		}
+		col, err := strconv.Atoi(match[2])
+		if err != nil {
+			continue
+		}
+		text := match[3]
+		if col > 1 {
+			prefix := rows[row]
+			if prefix == "" {
+				prefix = strings.Repeat(" ", col-1)
+			} else if got := testCellWidth(prefix); got < col-1 {
+				prefix += strings.Repeat(" ", col-1-got)
+			}
+			text = prefix + text
+		}
+		rows[row] = text
+	}
+	return rows
+}
+
+func verticalBarPositions(s string) []int {
+	positions := []int{}
+	for i, r := range []rune(s) {
+		if r == '│' {
+			positions = append(positions, i)
+		}
+	}
+	return positions
+}
+
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func testCellWidth(s string) int {
+	width := 0
+	for _, r := range s {
+		switch {
+		case r == '\t':
+			width += 4
+		case r < 0x20 || (r >= 0x7f && r < 0xa0):
+			continue
+		case unicode.Is(unicode.Mn, r):
+			continue
+		case isTestWideRune(r):
+			width += 2
+		default:
+			width++
+		}
+	}
+	return width
+}
+
+func isTestWideRune(r rune) bool {
+	return (r >= 0x1100 && r <= 0x115f) ||
+		(r >= 0x2300 && r <= 0x23ff) ||
+		(r >= 0x2329 && r <= 0x232a) ||
+		(r >= 0x2600 && r <= 0x27bf) ||
+		(r >= 0x2e80 && r <= 0xa4cf) ||
+		(r >= 0xac00 && r <= 0xd7a3) ||
+		(r >= 0xf900 && r <= 0xfaff) ||
+		(r >= 0xfe10 && r <= 0xfe19) ||
+		(r >= 0xfe30 && r <= 0xfe6f) ||
+		(r >= 0xff00 && r <= 0xff60) ||
+		(r >= 0xffe0 && r <= 0xffe6) ||
+		(r >= 0x1f300 && r <= 0x1faff)
 }
 
 func newTestMonitor() *monitor {
@@ -404,13 +486,179 @@ func TestRenderFrameAlignsLogHeaderToLeftEdge(t *testing.T) {
 	lines := plainFrameLines(m.renderFrame())
 	for _, line := range lines {
 		if strings.Contains(line, "Logs: all") {
-			if !strings.HasPrefix(line, "Logs: all") {
-				t.Fatalf("log header = %q, want left-aligned", line)
+			if !strings.HasPrefix(line, "│Logs: all") {
+				t.Fatalf("log header = %q, want left-aligned inside border", line)
 			}
 			return
 		}
 	}
 	t.Fatalf("missing Logs: all header in lines: %#v", lines)
+}
+
+func TestRenderFrameDrawsConnectedFullscreenBorder(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 60
+	m.height = 12
+	m.applyEvent(ipc.Event{
+		Type: ipc.TypeSnapshot,
+		Processes: []ipc.ProcState{
+			{Name: "api", State: "running", Ready: true},
+		},
+		RecentLogs: []ipc.LogEntry{{Process: "api", Line: "listening"}},
+	})
+
+	rows := cursorRows(m.renderFrame())
+	top := rows[1]
+	bottom := rows[m.height]
+	wantTop := "┌" + strings.Repeat("─", m.width-2) + "┐"
+	wantBottom := "└" + strings.Repeat("─", m.width-2) + "┘"
+	if top != wantTop {
+		t.Fatalf("top row = %q, want %q", top, wantTop)
+	}
+	if bottom != wantBottom {
+		t.Fatalf("bottom row = %q, want %q", bottom, wantBottom)
+	}
+
+	for row := 2; row < m.height; row++ {
+		line := rows[row]
+		if !strings.HasPrefix(line, "│") || !strings.HasSuffix(line, "│") {
+			t.Fatalf("row %d = %q, want side borders", row, line)
+		}
+		if len([]rune(line)) > m.width {
+			t.Fatalf("row %d width = %d, want <= %d: %q", row, len([]rune(line)), m.width, line)
+		}
+	}
+
+	if strings.HasPrefix(rows[2], "proc-compose monitor") {
+		t.Fatalf("header was not inset inside border: %q", rows[2])
+	}
+	if !strings.Contains(rows[2], "proc-compose monitor") {
+		t.Fatalf("header missing from inset row: %q", rows[2])
+	}
+	foundLog := false
+	for row := 2; row < m.height; row++ {
+		if strings.Contains(rows[row], "listening") {
+			foundLog = true
+			break
+		}
+	}
+	if !foundLog {
+		t.Fatalf("log line missing from content area: %#v", rows)
+	}
+}
+
+func TestRenderFrameWideKeepsLogsFullWidthWithoutDetailsPane(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 120
+	m.height = 30
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "api", State: "running", Ready: true},
+		{Name: "db", State: "running", Ready: true},
+	}})
+	m.pushLog(ipc.LogEntry{Process: "api", Line: strings.Repeat("long log line ", 20)})
+
+	rows := cursorRows(m.renderFrame())
+	for row, line := range rows {
+		if got := len([]rune(line)); got > m.width {
+			t.Fatalf("row %d width = %d, want <= %d: %q", row, got, m.width, line)
+		}
+	}
+
+	out := string(stripColor(m.renderFrame()))
+	if strings.Contains(out, "Details:") {
+		t.Fatalf("render output should not include details pane:\n%s", out)
+	}
+	for _, line := range rows {
+		if strings.Contains(line, "Logs: all") {
+			bars := verticalBarPositions(line)
+			if len(bars) != 2 {
+				t.Fatalf("log header row has %d vertical bars, want only outer borders: %q", len(bars), line)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing log header row: %#v", rows)
+}
+
+func TestRenderFrameWideLogRowsFitDisplayCellWidths(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 120
+	m.height = 30
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "server", State: "running", Ready: true},
+		{Name: "client", State: "running", Ready: true},
+	}})
+	m.pushLog(ipc.LogEntry{Process: "server", Line: strings.Repeat("ログ界", 60)})
+
+	rows := cursorRows(m.renderFrame())
+	for row, line := range rows {
+		if got := testCellWidth(line); got > m.width {
+			t.Fatalf("row %d display width = %d, want <= %d: %q", row, got, m.width, line)
+		}
+	}
+}
+
+func TestRenderFrameEmojiLogRowsFitTerminalCellWidths(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 60
+	m.height = 20
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "server", State: "running", Ready: true},
+	}})
+	m.pushLog(ipc.LogEntry{Process: "server", Line: strings.Repeat("✅ ", 40)})
+	m.pushLog(ipc.LogEntry{Process: "server", Line: strings.Repeat("⏰ ", 40)})
+
+	rows := cursorRows(m.renderFrame())
+	for row, line := range rows {
+		if strings.Contains(line, "✅") || strings.Contains(line, "⏰") {
+			if got := testCellWidth(line); got > m.width {
+				t.Fatalf("row %d display width = %d, want <= %d: %q", row, got, m.width, line)
+			}
+			if !strings.HasPrefix(line, "│") || !strings.HasSuffix(line, "│") {
+				t.Fatalf("emoji log row %d = %q, want side borders", row, line)
+			}
+		}
+	}
+}
+
+func TestCellWidthTreatsEmojiPresentationRunesAsWide(t *testing.T) {
+	for _, s := range []string{"✅", "⏰", "📅"} {
+		if got := cellWidthString(s); got != 2 {
+			t.Fatalf("cellWidthString(%q) = %d, want 2", s, got)
+		}
+	}
+}
+
+func TestRenderFrameSanitizesLogControlCharacters(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 80
+	m.height = 20
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "server", State: "running", Ready: true},
+	}})
+	m.pushLog(ipc.LogEntry{Process: "server", Line: "ready\rrewritten\twith tab\b"})
+
+	frame := string(stripColor(m.renderFrame()))
+	if strings.ContainsAny(frame, "\r\b\t") {
+		t.Fatalf("rendered frame contains raw log control characters: %q", frame)
+	}
+
+	rows := cursorRows([]byte(frame))
+	for row, line := range rows {
+		if row <= 1 || row >= m.height {
+			continue
+		}
+		if strings.Contains(line, "rewritten") {
+			if !strings.HasPrefix(line, "│") || !strings.HasSuffix(line, "│") {
+				t.Fatalf("log row %d = %q, want side borders", row, line)
+			}
+			if got := testCellWidth(line); got > m.width {
+				t.Fatalf("log row %d display width = %d, want <= %d: %q", row, got, m.width, line)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing sanitized log row: %#v", rows)
 }
 
 func TestSummaryLineCountsOnlyRunningReadyProcesses(t *testing.T) {
@@ -454,6 +702,61 @@ func TestRenderHelpMentionsDismissKeysAndQuit(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestRenderHelpFrameDrawsConnectedBorder(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 80
+	m.height = 24
+
+	matches := testCursorLineRe.FindAllStringSubmatch(string(stripColor(m.renderHelpFrame())), -1)
+	if len(matches) < 3 {
+		t.Fatalf("help frame drew %d rows, want at least 3", len(matches))
+	}
+
+	rows := make([]string, 0, len(matches))
+	for _, match := range matches {
+		rows = append(rows, match[1])
+	}
+
+	top := rows[0]
+	bottom := rows[len(rows)-1]
+	if !strings.HasPrefix(top, "┌") || !strings.HasSuffix(top, "┐") {
+		t.Fatalf("top border = %q, want connected corners", top)
+	}
+	if !strings.HasPrefix(bottom, "└") || !strings.HasSuffix(bottom, "┘") {
+		t.Fatalf("bottom border = %q, want connected corners", bottom)
+	}
+
+	for i, row := range rows[1 : len(rows)-1] {
+		if !strings.HasPrefix(row, "│") || !strings.HasSuffix(row, "│") {
+			t.Fatalf("interior row %d = %q, want left and right border", i+1, row)
+		}
+	}
+}
+
+func TestRenderHelpFrameFitsNarrowAllowedWidths(t *testing.T) {
+	for _, width := range []int{40, 45, 50, 57} {
+		t.Run(strconv.Itoa(width), func(t *testing.T) {
+			m := newTestMonitor()
+			m.width = width
+			m.height = 24
+
+			rows := cursorRows(m.renderHelpFrame())
+			if len(rows) == 0 {
+				t.Fatal("help frame drew no rows")
+			}
+			for row, line := range rows {
+				if got := len([]rune(line)); got > width {
+					t.Fatalf("row %d width = %d, want <= %d: %q", row, got, width, line)
+				}
+				trimmed := strings.TrimLeft(line, " ")
+				if strings.HasPrefix(trimmed, "│") && !strings.HasSuffix(trimmed, "│") {
+					t.Fatalf("row %d missing right border within width %d: %q", row, width, line)
+				}
+			}
+		})
 	}
 }
 
