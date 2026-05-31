@@ -80,7 +80,7 @@ proc-compose unlocks additional capabilities when these binaries are available o
 | [`merge-port`](https://github.com/anivaryam/merge-port) | `merge:` config section — combine frontend + backend into one port | `brokit install merge-port` |
 | [`tunnel`](https://github.com/anivaryam/tunnel) | Public URL for a local port (see "Full-stack with public tunnel" example) | `brokit install tunnel` |
 
-These are optional. proc-compose works without them; the features that depend on them simply won't be available.
+If `merge:` is configured but merge-port is not on PATH, `up`, `validate`, and `up --dry-run` fail with an actionable error. `doctor` reports a finding. Without `merge:`, merge-port is not required.
 
 ## Quick Start
 
@@ -445,7 +445,7 @@ proc-compose falls back to `proc-compose.yaml` automatically. Pass
 ```yaml
 processes:
   name:
-    cmd: "command to run"        # required — passed to sh -c
+    cmd: "command to run"        # required, passed to the platform shell
     mode: service                # optional, service or task
     dir: "./working/directory"   # optional — working directory
     env_file: ".env.backend"     # optional — load env vars from file
@@ -465,9 +465,9 @@ processes:
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `cmd` | Yes | — | Shell command to run (via `sh -c`) |
+| `cmd` | Yes | — | Shell command to run. Linux/macOS use `sh -c`; Windows uses `cmd /c`. |
 | `mode` | No | `service` | Process mode: `service` for long-running processes, `task` for one-shot work |
-| `dir` | No | `.` | Working directory for the process |
+| `dir` | No | `.` | Working directory for the process; relative paths are resolved from the config file's directory, not the invocation CWD |
 | `env_file` | No | — | Path to `.env` file; values are merged before `env` block |
 | `env` | No | — | Extra environment variables (merged with system env; overrides `env_file`) |
 | `restart` | No | `never` | Restart policy: `never`, `on-failure`, or `always` |
@@ -674,6 +674,8 @@ The upshot: a fresh `proc-compose up` on the simple example below boots `client`
 
 Override the auto-detected client process with `merge.client_process` (also used by the env-injection step). Upstream ports that don't match any managed process are left alone — proc-compose won't fabricate dependencies on external services.
 
+Before starting, proc-compose always checks that the merge-port proxy output port (`merge.port`, or `$PORT`/`8080`) is free. It also checks upstream ports owned by managed processes — ownership is determined by a process `env.PORT` matching `merge.client`, `merge.server`, or a `merge.routes` target port. Managed upstream ports must be free because proc-compose is about to start those processes. Upstream ports with no matching managed process are treated as external services and may already be listening; proc-compose does not reject those occupied external targets.
+
 #### Client API URL auto-injection
 
 When a `merge:` section is present, proc-compose looks at the client process's `.env.example` (or `.env`) and, for any of these well-known frontend variables present in the file, injects the merge-port URL into the client's environment:
@@ -750,7 +752,7 @@ processes:
 
 ### Full-stack with public tunnel
 
-Tunnel runs as a regular process. The [`tunnel`](https://github.com/anivaryam/tunnel) binary spawns a background daemon (managed via a unix socket in `$TMPDIR`); the foreground command is a client attached to it. If proc-compose kills the client, the daemon keeps running and the public URL stays open. Wrap the command with a `trap` so SIGTERM stops the daemon too:
+Tunnel runs as a regular process. The [`tunnel`](https://github.com/anivaryam/tunnel) binary spawns a background daemon (managed via a unix socket in `$TMPDIR`); the foreground command is a client attached to it. If proc-compose kills the client, the daemon keeps running and the public URL stays open. On Linux/macOS, wrap the command with `bash` and `trap` so SIGTERM stops the daemon too:
 
 ```yaml
 merge:
@@ -778,13 +780,13 @@ processes:
       http: http://localhost:8080/health
 ```
 
-The `trap` runs `tunnel stop --name myapp` on shutdown so the daemon and its socket are cleaned up. Without it, `proc-compose stop` (or Ctrl+C) leaves the tunnel exposing your port until you kill it manually.
+The `trap` runs `tunnel stop --name myapp` on shutdown so the daemon and its socket are cleaned up. Without it, `proc-compose stop` (or Ctrl+C) leaves the tunnel exposing your port until you kill it manually. This `bash`/`trap` wrapper is a Linux/macOS example. On Windows, use an explicit Windows process wrapper that stops the tunnel on exit, or stop the tunnel manually.
 
 > **Do not pass `--silent` to `tunnel`.** That flag daemonizes and exits immediately — proc-compose treats the immediate exit as a crash and restarts in a loop. Default (foreground) is correct here.
 
 ### Multiple tunnels for multiple services
 
-Same pattern repeated per service. Each tunnel waits on its upstream via `depends_on` + `ready_when`, so the public URL only opens once the local service serves requests:
+Same Linux/macOS pattern repeated per service. Each tunnel waits on its upstream via `depends_on` + `ready_when`, so the public URL only opens once the local service serves requests:
 
 ```yaml
 processes:
@@ -918,9 +920,9 @@ proc-compose.yml
       ▼
   proc-compose up
       │
-      ├── sh -c "npm run dev"         → frontend    │ http://localhost:5173
-      ├── sh -c "go run ."            → backend     │ http://localhost:3001
-      └── sh -c "merge-port ..."      → merge-port  │ http://localhost:8080  ← merge: section
+      ├── platform shell "npm run dev"         → frontend    │ http://localhost:5173
+      ├── platform shell "go run ."            → backend     │ http://localhost:3001
+      └── platform shell "merge-port ..."      → merge-port  │ http://localhost:8080  ← merge: section
       │
    Ctrl+C → context cancellation → SIGTERM → SIGKILL (5s) → all processes stop
 ```
@@ -930,7 +932,7 @@ The two tools compose a layered stack:
 - **proc-compose** — orchestrates all processes, handles logs, restarts, and shutdown
 - **merge-port** — auto-injected from the `merge:` config section; routes `/api` → backend, `/*` → frontend on a single port
 
-Each process runs via `sh -c` in its own process group so child trees (npm → node, nodemon → ts-node, etc.) terminate cleanly. Names are sorted alphabetically for deterministic color assignment.
+Each process runs through the platform shell in its own process group so child trees (npm → node, nodemon → ts-node, etc.) terminate cleanly. Linux/macOS use `sh -c`; Windows uses `cmd /c`. Names are sorted alphabetically for deterministic color assignment.
 
 ## Development
 
@@ -945,16 +947,33 @@ make test
 make install
 ```
 
-## Windows
+## Platform Support
 
-proc-compose has limited Windows support:
+### Platform matrix
 
-- **IPC** uses named pipes (via `go-winio`)
-- **Process tree termination** uses Windows Job Objects (via `go-winjob`)
-- **`merge:` sections** require `merge-port` binary on PATH
-- **Shell commands** in configs use `cmd /c` — Unix shell syntax (`$VAR`, `./path`) may need adjustment for Windows
-- **`stop --timeout`** has no graceful path on Windows: console processes started with `CREATE_NEW_PROCESS_GROUP` cannot receive SIGTERM, so `stop` always uses `taskkill /T /F` regardless of the timeout value
-- **`--survive`** uses systemd user units and is unavailable on Windows; use a Service or scheduled task instead
+| Feature | Linux | macOS | Windows |
+|---------|-------|-------|---------|
+| Process orchestration | Full | Full | Full |
+| `merge:` sections | Full | Full | Full (requires `merge-port`) |
+| `--survive` / systemd auto-restart | Full | N/A | N/A |
+| `uninstall` | Full | N/A | N/A |
+| Named pipes IPC | Unix sockets | Unix sockets | Full |
+| Graceful stop (`--timeout`) | Full (SIGTERM) | Full (SIGTERM) | N/A (always `taskkill /F`) |
+| `init` template | POSIX shell | POSIX shell | PowerShell |
+
+### Linux
+
+Full support including `--survive` for systemd user unit auto-restart on reboot.
+
+### macOS
+
+Full process orchestration support. No systemd user services, so `--survive`, `--install`, and `uninstall` are unavailable. Use `launchd` or a similar mechanism for auto-restart on macOS.
+
+### Windows
+
+Full process orchestration support. Named pipes IPC via `go-winio`. Windows Job Objects for process tree termination via `go-winjob`. No `--survive` or `uninstall` (no systemd user units on Windows). `stop --timeout` is ignored; `stop` always uses `taskkill /T /F`.
+
+Shell commands in configs use `cmd /c`. Use cmd environment syntax such as `echo %PORT%`. If you want PowerShell syntax, make it explicit in the command text: `powershell -NoProfile -Command "Write-Output $env:PORT"`. POSIX syntax such as `$VAR`, `$(...)`, `trap`, `export`, and shell loops is not promised to be portable. Existing `$VAR` translation is best-effort compatibility only. Paths with spaces need quoting, and Windows-native commands may need backslashes. POSIX examples elsewhere in this README are Linux/macOS examples unless labelled otherwise. The `init --template minimal` on Windows generates a PowerShell-based template.
 
 ### Install on Windows
 
