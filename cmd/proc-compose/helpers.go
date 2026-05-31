@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +30,20 @@ func validateUnitName(name string) error {
 	}
 	if !unitNameRe.MatchString(name) {
 		return fmt.Errorf("--name must match [A-Za-z0-9._-]{1,64}, got %q", name)
+	}
+	return nil
+}
+
+func validateSurvivePlatform(goos string) error {
+	if goos != "linux" {
+		return fmt.Errorf("--survive requires Linux with systemd user services")
+	}
+	return nil
+}
+
+func validateUninstallPlatform(goos string) error {
+	if goos != "linux" {
+		return fmt.Errorf("uninstall is only supported on Linux with systemd user services")
 	}
 	return nil
 }
@@ -54,18 +70,8 @@ func preflightCheck(pidPath, socketPath string, cfg *config.Config) error {
 		return nil
 	}
 
-	type portRole struct {
-		port int
-		role string
-	}
-	check := []portRole{
-		{cfg.Merge.Port, "proxy (merge-port)"},
-		{cfg.Merge.Client, "client"},
-		{cfg.Merge.Server, "server"},
-	}
-
 	var busy []string
-	for _, pr := range check {
+	for _, pr := range mergePreflightPorts(cfg) {
 		if pr.port == 0 {
 			continue
 		}
@@ -85,6 +91,91 @@ func preflightCheck(pidPath, socketPath string, cfg *config.Config) error {
 	return nil
 }
 
+type mergePortRole struct {
+	port int
+	role string
+}
+
+func mergePreflightPorts(cfg *config.Config) []mergePortRole {
+	if cfg == nil || cfg.Merge == nil {
+		return nil
+	}
+
+	checks := []mergePortRole{{port: cfg.Merge.Port, role: "proxy (merge-port output)"}}
+	checks = append(checks, managedMergeUpstreamPorts(cfg)...)
+	return checks
+}
+
+func managedMergeUpstreamPorts(cfg *config.Config) []mergePortRole {
+	if cfg == nil || cfg.Merge == nil {
+		return nil
+	}
+
+	portsByProcess := processPorts(cfg.Processes)
+	var targets []int
+	if len(cfg.Merge.Routes) > 0 {
+		for _, route := range cfg.Merge.Routes {
+			if port := routeTargetPort(route); port > 0 {
+				targets = append(targets, port)
+			}
+		}
+	} else {
+		if cfg.Merge.Client > 0 {
+			targets = append(targets, cfg.Merge.Client)
+		}
+		if cfg.Merge.Server > 0 {
+			targets = append(targets, cfg.Merge.Server)
+		}
+	}
+
+	seen := make(map[string]bool)
+	var checks []mergePortRole
+	for _, target := range targets {
+		owners := portsByProcess[target]
+		sort.Strings(owners)
+		for _, owner := range owners {
+			key := fmt.Sprintf("%d/%s", target, owner)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			checks = append(checks, mergePortRole{port: target, role: "managed upstream " + owner})
+		}
+	}
+	return checks
+}
+
+func processPorts(processes map[string]config.Process) map[int][]string {
+	out := make(map[int][]string)
+	for name, proc := range processes {
+		if name == "merge-port" {
+			continue
+		}
+		value := ""
+		if proc.Env != nil {
+			value = proc.Env["PORT"]
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || port <= 0 {
+			continue
+		}
+		out[port] = append(out[port], name)
+	}
+	return out
+}
+
+func routeTargetPort(route string) int {
+	idx := strings.LastIndex(route, "=")
+	if idx < 0 {
+		return 0
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(route[idx+1:]))
+	if err != nil || port <= 0 {
+		return 0
+	}
+	return port
+}
+
 func isPortFree(port int) bool {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -94,12 +185,23 @@ func isPortFree(port int) bool {
 	return true
 }
 
-func checkOptionalBinaries(cfg *config.Config) {
+var mergePortInPath = func() bool {
+	_, err := exec.LookPath("merge-port")
+	return err == nil
+}
+
+func checkOptionalBinaries(cfg *config.Config) error {
 	if cfg.Merge != nil {
-		if _, err := exec.LookPath("merge-port"); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: merge-port not found in PATH — merge feature disabled\n")
+		if !mergePortInPath() {
+			return fmt.Errorf(
+				"merge-port is required for merge: config but was not found in PATH. "+
+					"Install it with brokit install merge-port, "+
+					"install from https://github.com/anivaryam/merge-port, "+
+					"or remove the merge: section.",
+			)
 		}
 	}
+	return nil
 }
 
 // buildChildArgs constructs the args slice for the daemonized child process.
@@ -549,6 +651,27 @@ processes:
 	default:
 		return "", fmt.Errorf("unknown template %q; valid: minimal, node, go, python", name)
 	}
+}
+
+// starterTemplateForPlatform is the platform-aware version of starterTemplate.
+// It delegates to starterTemplate for non-Windows platforms and for all
+// non-minimal templates. On Windows with minimal aliases ("", "minimal", "default"),
+// it returns a template using PowerShell commands that are native to Windows.
+func starterTemplateForPlatform(name, goos string) (string, error) {
+	if (name == "" || strings.ToLower(name) == "minimal" || strings.ToLower(name) == "default") && goos == "windows" {
+		return `# proc-compose minimal starter — replace with your real commands.
+# Run "proc-compose up" to start everything; Ctrl+C stops cleanly.
+
+processes:
+  hello:
+    cmd: powershell -NoProfile -Command "Write-Host 'hello from proc-compose'; Start-Sleep -Seconds 5"
+
+  ticker:
+    cmd: powershell -NoProfile -Command "while ($true) { Get-Date; Start-Sleep -Seconds 2 }"
+    restart: always
+`, nil
+	}
+	return starterTemplate(name)
 }
 
 // candidateRuntimeDirs returns ordered runtime dirs to probe when locating

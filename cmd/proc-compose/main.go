@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -142,6 +143,9 @@ auto-injection — see:
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if survive {
+				if err := validateSurvivePlatform(runtime.GOOS); err != nil {
+					return err
+				}
 				if err := validateUnitName(surviveName); err != nil {
 					return err
 				}
@@ -152,7 +156,9 @@ auto-injection — see:
 				return err
 			}
 
-			checkOptionalBinaries(cfg)
+			if err := checkOptionalBinaries(cfg); err != nil {
+				return err
+			}
 
 			if len(args) > 0 {
 				for _, name := range args {
@@ -321,7 +327,7 @@ auto-injection — see:
 	upCmd.Flags().StringVar(&logFile, "log-file", "", "write all process output to FILE")
 	upCmd.Flags().BoolVar(&noColor, "no-color", false, "disable ANSI color output (also: NO_COLOR env var)")
 	upCmd.Flags().Int64Var(&maxLogSize, "max-log-size", 0, "rotate log file when it exceeds this size in bytes (0 = no rotation)")
-	upCmd.Flags().BoolVar(&survive, "survive", false, "generate systemd unit for auto-restart on reboot (prints to stdout)")
+	upCmd.Flags().BoolVar(&survive, "survive", false, "generate systemd unit for auto-restart on reboot (Linux with systemd only; prints to stdout)")
 	upCmd.Flags().StringVar(&surviveName, "name", "", "service name for --survive (required)")
 	upCmd.Flags().BoolVar(&install, "install", false, "install and enable systemd unit (with --survive)")
 	upCmd.Flags().BoolVar(&force, "force", false, "overwrite existing unit file (with --install)")
@@ -480,7 +486,7 @@ proc-compose to scan the project and propose a config tailored to it.`,
 			if _, err := os.Stat(configFile); err == nil {
 				return fmt.Errorf("%s already exists", configFile)
 			}
-			template, err := starterTemplate(initTemplate)
+			template, err := starterTemplateForPlatform(initTemplate, runtime.GOOS)
 			if err != nil {
 				return err
 			}
@@ -501,14 +507,17 @@ proc-compose to scan the project and propose a config tailored to it.`,
 		Long: `Stop, disable, and remove the systemd user unit previously installed
 with "up --survive --install --name <n>", then run daemon-reload.
 
-Linux/macOS only — Windows has no systemd user units. The --name flag
-is required and must match the name passed to --install.
+Linux with systemd user services only. The --name flag is required and
+must match the name passed to --install.
 
 See: https://github.com/anivaryam/proc-compose#auto-restart-on-reboot---survive`,
 		Example:       "  proc-compose uninstall --name myapp",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateUninstallPlatform(runtime.GOOS); err != nil {
+				return err
+			}
 			if err := validateUnitName(uninstallName); err != nil {
 				return err
 			}
@@ -733,6 +742,9 @@ sections. Suitable for CI and pre-commit checks.`,
 			cfgPath := resolveConfigExtension(configFile)
 			cfg, err := config.Load(cfgPath)
 			if err != nil {
+				return err
+			}
+			if err := checkOptionalBinaries(cfg); err != nil {
 				return err
 			}
 			fmt.Printf("ok: %s parses cleanly (%d processes)\n", cfgPath, len(cfg.Processes))

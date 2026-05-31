@@ -128,8 +128,8 @@ func checkExistingConfig(report *Report, root string) {
 		report.Findings = append(report.Findings, Finding{
 			Severity:   SeverityWarning,
 			Code:       codeMissingMergePort,
-			Message:    "merge is configured but merge-port is not on PATH",
-			Suggestion: "install merge-port or remove merge config",
+			Message:    "merge: section requires merge-port but it is not on PATH",
+			Suggestion: "run: brokit install merge-port  — or remove the merge: section",
 		})
 	}
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -250,6 +252,133 @@ func TestIsPortFree(t *testing.T) {
 	}
 }
 
+func TestPreflightCheck_MergeProxyOutputPortOccupiedFails(t *testing.T) {
+	port, closePort := occupyTCPPort(t)
+	defer closePort()
+
+	cfg := &config.Config{
+		Merge: &config.Merge{Client: freeTCPPort(t), Server: freeTCPPort(t), Port: port},
+		Processes: map[string]config.Process{
+			"web": {Cmd: "npm run dev"},
+			"api": {Cmd: "go run ."},
+		},
+	}
+
+	err := preflightCheck(testPIDPath(t), testSocketPath(t), cfg)
+	if err == nil {
+		t.Fatal("expected occupied merge proxy output port to fail preflight")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, fmt.Sprintf(":%d", port)) {
+		t.Fatalf("error should mention occupied port %d, got: %s", port, msg)
+	}
+	if !strings.Contains(msg, "proxy (merge-port output)") {
+		t.Fatalf("error should identify proxy output role, got: %s", msg)
+	}
+}
+
+func TestPreflightCheck_ManagedSimpleUpstreamPortOccupiedFails(t *testing.T) {
+	port, closePort := occupyTCPPort(t)
+	defer closePort()
+
+	cfg := &config.Config{
+		Merge: &config.Merge{Client: port, Server: freeTCPPort(t), Port: freeTCPPort(t)},
+		Processes: map[string]config.Process{
+			"frontend": {Cmd: "npm run dev", Env: map[string]string{"PORT": fmt.Sprintf("%d", port)}},
+			"api":      {Cmd: "go run ."},
+		},
+	}
+
+	err := preflightCheck(testPIDPath(t), testSocketPath(t), cfg)
+	if err == nil {
+		t.Fatal("expected occupied managed upstream port to fail preflight")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, fmt.Sprintf(":%d", port)) {
+		t.Fatalf("error should mention occupied port %d, got: %s", port, msg)
+	}
+	if !strings.Contains(msg, "managed upstream frontend") {
+		t.Fatalf("error should identify managed upstream process, got: %s", msg)
+	}
+}
+
+func TestPreflightCheck_ExternalSimpleUpstreamPortOccupiedAllowed(t *testing.T) {
+	port, closePort := occupyTCPPort(t)
+	defer closePort()
+
+	cfg := &config.Config{
+		Merge: &config.Merge{Client: port, Server: freeTCPPort(t), Port: freeTCPPort(t)},
+		Processes: map[string]config.Process{
+			"frontend": {Cmd: "npm run dev", Env: map[string]string{"PORT": fmt.Sprintf("%d", freeTCPPort(t))}},
+			"api":      {Cmd: "go run ."},
+		},
+	}
+
+	if err := preflightCheck(testPIDPath(t), testSocketPath(t), cfg); err != nil {
+		t.Fatalf("external occupied upstream port should be allowed, got: %v", err)
+	}
+}
+
+func TestPreflightCheck_RouteModeMixedManagedExternalTargetsOnlyManagedFails(t *testing.T) {
+	externalPort, closeExternal := occupyTCPPort(t)
+	defer closeExternal()
+	managedPort, closeManaged := occupyTCPPort(t)
+	defer closeManaged()
+
+	cfg := &config.Config{
+		Merge: &config.Merge{
+			Routes: []string{fmt.Sprintf("/external=%d", externalPort), fmt.Sprintf("/api=%d", managedPort)},
+			Port:   freeTCPPort(t),
+		},
+		Processes: map[string]config.Process{
+			"api": {Cmd: "go run .", Env: map[string]string{"PORT": fmt.Sprintf("%d", managedPort)}},
+			"web": {Cmd: "npm run dev", Env: map[string]string{"PORT": fmt.Sprintf("%d", freeTCPPort(t))}},
+		},
+	}
+
+	err := preflightCheck(testPIDPath(t), testSocketPath(t), cfg)
+	if err == nil {
+		t.Fatal("expected occupied managed route target to fail preflight")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, fmt.Sprintf(":%d", managedPort)) {
+		t.Fatalf("error should mention managed occupied port %d, got: %s", managedPort, msg)
+	}
+	if !strings.Contains(msg, "managed upstream api") {
+		t.Fatalf("error should identify managed route target process, got: %s", msg)
+	}
+	if strings.Contains(msg, fmt.Sprintf(":%d", externalPort)) {
+		t.Fatalf("error should not mention occupied external route target %d, got: %s", externalPort, msg)
+	}
+}
+
+func occupyTCPPort(t *testing.T) (int, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on temp port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	return port, func() { _ = ln.Close() }
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	port, closePort := occupyTCPPort(t)
+	closePort()
+	return port
+}
+
+func testPIDPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "pc.pid")
+}
+
+func testSocketPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "pc.sock")
+}
+
 func TestGetHomeDir(t *testing.T) {
 	home, err := getHomeDir()
 	if err != nil {
@@ -459,8 +588,8 @@ func TestComputeClosure_AllProcs(t *testing.T) {
 
 func TestComputeClosure_WithDeps(t *testing.T) {
 	procs := map[string]config.Process{
-		"app":  {Cmd: "echo app", DependsOn: []string{"db"}},
-		"db":   {Cmd: "echo db", DependsOn: []string{"migrate"}},
+		"app":     {Cmd: "echo app", DependsOn: []string{"db"}},
+		"db":      {Cmd: "echo db", DependsOn: []string{"migrate"}},
 		"migrate": {Cmd: "echo migrate"},
 	}
 	got := computeClosure(procs, []string{"app"})
@@ -511,6 +640,58 @@ func TestComputeClosure_ServiceWithTaskAllowed(t *testing.T) {
 	}
 }
 
+func TestCheckOptionalBinaries_MergeWithoutMergePort_ReturnsError(t *testing.T) {
+	cfg := &config.Config{
+		Merge: &config.Merge{
+			Client: 5173,
+			Server: 3001,
+			Port:   8080,
+		},
+		Processes: map[string]config.Process{
+			"web": {Cmd: "npm run dev"},
+			"api": {Cmd: "go run ."},
+		},
+	}
+
+	old := mergePortInPath
+	mergePortInPath = func() bool { return false }
+	t.Cleanup(func() { mergePortInPath = old })
+
+	err := checkOptionalBinaries(cfg)
+	if err == nil {
+		t.Fatal("expected error when merge: is configured but merge-port is not on PATH")
+	}
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "merge-port is required for merge: config") {
+		t.Errorf("error should contain 'merge-port is required for merge: config', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "was not found in PATH") {
+		t.Errorf("error should contain 'was not found in PATH', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "brokit install merge-port") {
+		t.Errorf("error should contain 'brokit install merge-port', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "https://github.com/anivaryam/merge-port") {
+		t.Errorf("error should contain 'https://github.com/anivaryam/merge-port', got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "remove the merge: section") {
+		t.Errorf("error should contain 'remove the merge: section', got: %s", errMsg)
+	}
+}
+
+func TestCheckOptionalBinaries_NoMergeNoError(t *testing.T) {
+	cfg := &config.Config{
+		Processes: map[string]config.Process{
+			"web": {Cmd: "npm run dev"},
+		},
+	}
+
+	err := checkOptionalBinaries(cfg)
+	if err != nil {
+		t.Errorf("expected no error when merge: is not configured, got: %v", err)
+	}
+}
+
 func TestSilentGuardrail_TaskOnlyErrorMessage(t *testing.T) {
 	cfg := &config.Config{
 		Processes: map[string]config.Process{
@@ -544,6 +725,7 @@ func TestSilentGuardrail_ServiceWithTaskAllowed(t *testing.T) {
 //   - Linux: os.UserCacheDir reads $XDG_CACHE_HOME first, then $HOME/.cache
 //   - macOS: os.UserCacheDir reads $HOME/Library/Caches; $XDG_CACHE_HOME
 //     is ignored entirely
+//
 // Setting HOME (and clearing XDG_CACHE_HOME so the Linux path falls
 // through to HOME) gives a single setup that works on both. Returns the
 // proc-compose subdir under the redirected cache, already created.
@@ -687,5 +869,134 @@ func TestLiveDaemonPaths_SkipsStalePIDFile(t *testing.T) {
 	_, gotSock := liveDaemonPaths(hash)
 	if gotSock == "/tmp/wrong.sock" {
 		t.Errorf("returned stale recorded addr; want fallback")
+	}
+}
+
+// TestStarterTemplateForPlatform_MinimalWindows tests that the Windows minimal
+// template does not contain POSIX shell constructs.
+func TestStarterTemplateForPlatform_MinimalWindows(t *testing.T) {
+	s, err := starterTemplateForPlatform("minimal", "windows")
+	if err != nil {
+		t.Fatalf("starterTemplateForPlatform(%q, %q) error = %v", "minimal", "windows", err)
+	}
+	if strings.Contains(s, "sh -c") {
+		t.Errorf("Windows minimal template should not contain 'sh -c', got:\n%s", s)
+	}
+	if strings.Contains(s, "while true; do") {
+		t.Errorf("Windows minimal template should not contain 'while true; do', got:\n%s", s)
+	}
+	if !strings.Contains(s, "powershell") {
+		t.Errorf("Windows minimal template should contain 'powershell', got:\n%s", s)
+	}
+}
+
+// TestStarterTemplateForPlatform_EmptyWindows tests that the Windows "" alias
+// returns PowerShell template, not POSIX.
+func TestStarterTemplateForPlatform_EmptyWindows(t *testing.T) {
+	s, err := starterTemplateForPlatform("", "windows")
+	if err != nil {
+		t.Fatalf("starterTemplateForPlatform(%q, %q) error = %v", "", "windows", err)
+	}
+	if strings.Contains(s, "sh -c") {
+		t.Errorf("Windows '' template should not contain 'sh -c', got:\n%s", s)
+	}
+	if strings.Contains(s, "while true; do") {
+		t.Errorf("Windows '' template should not contain 'while true; do', got:\n%s", s)
+	}
+	if !strings.Contains(s, "powershell") {
+		t.Errorf("Windows '' template should contain 'powershell', got:\n%s", s)
+	}
+}
+
+// TestStarterTemplateForPlatform_DefaultWindows tests that the Windows "default"
+// alias returns PowerShell template, not POSIX.
+func TestStarterTemplateForPlatform_DefaultWindows(t *testing.T) {
+	s, err := starterTemplateForPlatform("default", "windows")
+	if err != nil {
+		t.Fatalf("starterTemplateForPlatform(%q, %q) error = %v", "default", "windows", err)
+	}
+	if strings.Contains(s, "sh -c") {
+		t.Errorf("Windows 'default' template should not contain 'sh -c', got:\n%s", s)
+	}
+	if strings.Contains(s, "while true; do") {
+		t.Errorf("Windows 'default' template should not contain 'while true; do', got:\n%s", s)
+	}
+	if !strings.Contains(s, "powershell") {
+		t.Errorf("Windows 'default' template should contain 'powershell', got:\n%s", s)
+	}
+}
+
+// TestStarterTemplateForPlatform_MinimalLinux tests that the Linux minimal
+// template still uses the POSIX loop (existing behavior preserved).
+func TestStarterTemplateForPlatform_MinimalLinux(t *testing.T) {
+	s, err := starterTemplateForPlatform("minimal", "linux")
+	if err != nil {
+		t.Fatalf("starterTemplateForPlatform(%q, %q) error = %v", "minimal", "linux", err)
+	}
+	if !strings.Contains(s, "processes:") {
+		t.Errorf("Linux minimal template should contain 'processes:', got:\n%s", s)
+	}
+}
+
+// TestSurviveRequiresLinux tests that the survive validation rejects non-Linux.
+func TestSurviveRequiresLinux(t *testing.T) {
+	tests := []struct {
+		goos  string
+		phase string // "validate" or "generate"
+	}{
+		{"darwin", "validate"},
+		{"darwin", "generate"},
+		{"windows", "validate"},
+		{"windows", "generate"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.goos+"_"+tt.phase, func(t *testing.T) {
+			err := validateSurvivePlatform(tt.goos)
+			if err == nil {
+				t.Errorf("validateSurvivePlatform(%q) = nil; want error containing '--survive requires Linux with systemd user services'", tt.goos)
+			}
+			if err != nil && !strings.Contains(err.Error(), "--survive requires Linux with systemd user services") {
+				t.Errorf("validateSurvivePlatform(%q) error = %v; want error containing '--survive requires Linux with systemd user services'", tt.goos, err)
+			}
+		})
+	}
+}
+
+// TestSurviveAllowedOnLinux tests that survive validation passes on Linux.
+func TestSurviveAllowedOnLinux(t *testing.T) {
+	err := validateSurvivePlatform("linux")
+	if err != nil {
+		t.Errorf("validateSurvivePlatform(%q) = %v; want nil", "linux", err)
+	}
+}
+
+// TestUninstallRequiresLinux tests that uninstall rejects non-Linux.
+func TestUninstallRequiresLinux(t *testing.T) {
+	tests := []struct {
+		goos string
+	}{
+		{"darwin"},
+		{"windows"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.goos, func(t *testing.T) {
+			err := validateUninstallPlatform(tt.goos)
+			if err == nil {
+				t.Errorf("validateUninstallPlatform(%q) = nil; want error containing 'uninstall is only supported on Linux with systemd user services'", tt.goos)
+			}
+			if err != nil && !strings.Contains(err.Error(), "uninstall is only supported on Linux with systemd user services") {
+				t.Errorf("validateUninstallPlatform(%q) error = %v; want error containing 'uninstall is only supported on Linux with systemd user services'", tt.goos, err)
+			}
+		})
+	}
+}
+
+// TestUninstallAllowedOnLinux tests that uninstall passes on Linux.
+func TestUninstallAllowedOnLinux(t *testing.T) {
+	err := validateUninstallPlatform("linux")
+	if err != nil {
+		t.Errorf("validateUninstallPlatform(%q) = %v; want nil", "linux", err)
 	}
 }
