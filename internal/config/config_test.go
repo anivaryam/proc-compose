@@ -794,6 +794,87 @@ processes:
 	}
 }
 
+func TestLoad_DirRelativeToConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	configDir := filepath.Join(dir, "configs")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	yaml := `
+processes:
+  client:
+    cmd: pwd
+    dir: ../client
+`
+	path := filepath.Join(configDir, "proc-compose.yml")
+	os.WriteFile(path, []byte(yaml), 0644)
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(cwd)
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	want := filepath.Clean(filepath.Join(configDir, "..", "client"))
+	if got := cfg.Processes["client"].Dir; got != want {
+		t.Fatalf("client dir = %q, want config-relative absolute path %q", got, want)
+	}
+}
+
+func TestLoad_DirPreservesAbsoluteAndEmpty(t *testing.T) {
+	dir := t.TempDir()
+	absDir := filepath.Join(dir, "already-absolute")
+
+	yaml := `
+processes:
+  absolute:
+    cmd: pwd
+    dir: ` + absDir + `
+  empty:
+    cmd: pwd
+`
+	path := filepath.Join(dir, "proc-compose.yml")
+	os.WriteFile(path, []byte(yaml), 0644)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if got := cfg.Processes["absolute"].Dir; got != filepath.Clean(absDir) {
+		t.Fatalf("absolute dir = %q, want %q", got, filepath.Clean(absDir))
+	}
+	if got := cfg.Processes["empty"].Dir; got != "" {
+		t.Fatalf("empty dir = %q, want empty", got)
+	}
+}
+
+func TestLoad_DirLeavesInjectedMergePortEmpty(t *testing.T) {
+	yaml := `
+merge:
+  client: 5173
+  server: 3001
+
+processes:
+  app:
+    cmd: npm start
+`
+	cfg := loadFromString(t, yaml)
+
+	if got := cfg.Processes["merge-port"].Dir; got != "" {
+		t.Fatalf("merge-port dir = %q, want empty", got)
+	}
+}
+
 func TestBuildMergeCmd_PortEnvVar(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -89,6 +89,9 @@ func Load(path string) (*Config, error) {
 	if abs, err := filepath.Abs(configDir); err == nil {
 		configDir = abs
 	}
+	// Invariant after Load: every non-empty relative YAML process.dir is an
+	// absolute path rooted at the config file directory, not the caller's CWD.
+	normalizeProcessDirs(cfg.Processes, configDir)
 
 	if cfg.Merge != nil {
 		// Auto-detect api_prefixes by scanning server source when none are configured.
@@ -249,6 +252,20 @@ func Load(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+func normalizeProcessDirs(processes map[string]Process, configDir string) {
+	for name, proc := range processes {
+		if proc.Dir == "" {
+			continue
+		}
+		if filepath.IsAbs(proc.Dir) {
+			proc.Dir = filepath.Clean(proc.Dir)
+		} else {
+			proc.Dir = filepath.Clean(filepath.Join(configDir, proc.Dir))
+		}
+		processes[name] = proc
+	}
 }
 
 // detectCycles checks for circular dependencies using DFS with three-color marking.
