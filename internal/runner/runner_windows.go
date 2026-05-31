@@ -15,6 +15,10 @@ var (
 
 // shellCommand returns the platform shell and arguments for running a command string.
 func shellCommand(command string) (string, []string) {
+	if isExplicitPowerShellCommand(command) {
+		return "cmd", []string{"/c", command}
+	}
+
 	if strings.HasPrefix(command, "sh -c ") {
 		inner := strings.TrimPrefix(command, "sh -c ")
 		inner = strings.Trim(inner, "\"'")
@@ -25,6 +29,15 @@ func shellCommand(command string) (string, []string) {
 		return "powershell", []string{"-Command", translateToPowerShell(command)}
 	}
 	return "cmd", []string{"/c", translateToCMD(command)}
+}
+
+func isExplicitPowerShellCommand(command string) bool {
+	cmd := strings.TrimSpace(command)
+	lower := strings.ToLower(cmd)
+	return strings.HasPrefix(lower, "powershell ") ||
+		strings.HasPrefix(lower, "powershell.exe ") ||
+		strings.HasPrefix(lower, "pwsh ") ||
+		strings.HasPrefix(lower, "pwsh.exe ")
 }
 
 func needsPowerShell(cmd string) bool {
