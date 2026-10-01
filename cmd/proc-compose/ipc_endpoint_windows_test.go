@@ -29,9 +29,11 @@ func testTempDir(t *testing.T) string {
 
 // testEndpointForTest returns an unused named-pipe address for this platform.
 //
-// A pipe name is not a path: it has no directory component and no extension, and
-// backslashes are reserved for the \\.\pipe\ prefix that the transport adds.
+// The address is a full pipe path, because that is what the product's transport
+// expects: paths.Socket returns \\.\pipe\pc-<hash> and go-winio is handed that
+// string unchanged. A bare pipe name is not a path the transport can open.
 func testEndpointForTest(t *testing.T) string {
 	t.Helper()
-	return "pc-test-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "-" + strconv.Itoa(os.Getpid())
+	return `\\.\pipe\pc-test-` + strconv.FormatInt(time.Now().UnixNano(), 36) +
+		"-" + strconv.Itoa(os.Getpid())
 }
