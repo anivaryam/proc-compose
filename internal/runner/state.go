@@ -69,6 +69,23 @@ func (st *procState) markReady(ok bool) {
 	close(ch)
 }
 
+// currentlyReady reports whether readiness should be advertised right now.
+// markReady latches per run cycle, so a latched success has to be combined
+// with the process's current state: an exited, failed, or restarting
+// service is no longer ready, while a task that completed successfully
+// stays ready. Callers must hold st.mu.
+func (st *procState) currentlyReady() bool {
+	if !st.readyClosed || !st.readyOK {
+		return false
+	}
+	switch st.state {
+	case "running", "completed":
+		return true
+	default:
+		return false
+	}
+}
+
 // requestRestart sends a non-blocking restart signal to the process goroutine.
 func (st *procState) requestRestart() {
 	select {
@@ -132,7 +149,7 @@ func (s *stateStore) snapshot() []ipc.ProcState {
 			Name:       name,
 			State:      p.state,
 			Mode:       info.proc.EffectiveMode(),
-			Ready:      p.readyClosed && p.readyOK,
+			Ready:      p.currentlyReady(),
 			PID:        p.pid,
 			Restarts:   p.restarts,
 			StartedAt:  p.startedAt,

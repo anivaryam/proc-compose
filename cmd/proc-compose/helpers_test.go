@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -557,6 +558,187 @@ func TestWaitForProcessesReady_FailedProcessRejected(t *testing.T) {
 	_ = server
 }
 
+// TestWaitForProcessesReady_LaterStateInvalidatesReady pins the fix for stale
+// readiness: a service that reported ready and then exited no longer satisfies
+// the waiter, even though "other" becomes ready afterwards. Without retraction
+// the waiter would return nil here.
+func TestWaitForProcessesReady_LaterStateInvalidatesReady(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket IPC not used on Windows")
+	}
+	timeout := 5 * time.Second
+
+	// "other" stays pending until after svc is invalidated so the waiter can
+	// only finish early if it wrongly counts svc as ready.
+	peer := newScriptedPeer(t, []ipc.ProcState{
+		{Name: "svc", State: "starting", Mode: "service"},
+		{Name: "other", State: "starting", Mode: "service"},
+	})
+	want := map[string]struct{}{"svc": {}, "other": {}}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- waitForProcessesReady(peer.socketPath, want, timeout)
+	}()
+
+	// The waiter is attached and its snapshot delivered, so the events below
+	// arrive in this exact order and the ready→exited transition is exercised
+	// rather than skipped.
+	peer.waitConnected(t)
+	peer.push(ipc.ProcState{Name: "svc", State: "running", Mode: "service", Ready: true})
+	peer.push(ipc.ProcState{Name: "svc", State: "exited", Mode: "service", Ready: false})
+	peer.push(ipc.ProcState{Name: "other", State: "running", Mode: "service", Ready: true})
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("waitForProcessesReady returned nil although svc exited after being ready")
+		}
+		if !strings.Contains(err.Error(), "svc") {
+			t.Errorf("error should list the unsatisfied process svc, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "other") {
+			t.Errorf("error should not list the satisfied process other, got: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("waitForProcessesReady did not return within the test deadline")
+	}
+}
+
+// TestWaitForProcessesReady_FailureAfterReadyRejected ensures a failure is not
+// masked by an earlier ready=true for the same process.
+func TestWaitForProcessesReady_FailureAfterReadyRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket IPC not used on Windows")
+	}
+	timeout := 5 * time.Second
+
+	peer := newScriptedPeer(t, []ipc.ProcState{
+		{Name: "svc", State: "starting", Mode: "service"},
+		{Name: "other", State: "starting", Mode: "service"},
+	})
+	want := map[string]struct{}{"svc": {}, "other": {}}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- waitForProcessesReady(peer.socketPath, want, timeout)
+	}()
+
+	peer.waitConnected(t)
+	peer.push(ipc.ProcState{Name: "svc", State: "running", Mode: "service", Ready: true})
+	// Defensive: even if a stale ready=true rides along with the failure,
+	// the failure must win.
+	peer.push(ipc.ProcState{Name: "svc", State: "failed", Mode: "service", Ready: true})
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("waitForProcessesReady returned nil although svc failed after being ready")
+		}
+		if !strings.Contains(err.Error(), "failed") {
+			t.Errorf("error should mention 'failed', got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitForProcessesReady did not return within the test deadline")
+	}
+}
+
+// TestWaitForProcessesReady_RestartingNotReady covers the restart window: a
+// service that was ready but is now restarting must not satisfy the waiter.
+func TestWaitForProcessesReady_RestartingNotReady(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket IPC not used on Windows")
+	}
+	timeout := 700 * time.Millisecond
+
+	// "other" never becomes ready so the waiter keeps waiting and observes
+	// svc's transition into restarting.
+	peer := newScriptedPeer(t, []ipc.ProcState{
+		{Name: "svc", State: "starting", Mode: "service"},
+		{Name: "other", State: "starting", Mode: "service"},
+	})
+	want := map[string]struct{}{"svc": {}, "other": {}}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- waitForProcessesReady(peer.socketPath, want, timeout)
+	}()
+
+	peer.waitConnected(t)
+	peer.push(ipc.ProcState{Name: "svc", State: "running", Mode: "service", Ready: true})
+	peer.push(ipc.ProcState{Name: "svc", State: "restarting", Mode: "service", Ready: true})
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("waitForProcessesReady returned nil although svc is restarting")
+		}
+		if !strings.Contains(err.Error(), "timed out") {
+			t.Errorf("expected a timeout error listing svc, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "svc") {
+			t.Errorf("timeout error should list the unsatisfied process svc, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitForProcessesReady did not return within the test deadline")
+	}
+}
+
+// TestWaitForProcessesReady_SilentPeerHitsTimeout is the regression for the
+// blocking-Recv bug: the daemon accepts the connection but never sends an
+// event, so the waiter must still honour the overall timeout instead of
+// blocking forever inside Recv.
+func TestWaitForProcessesReady_SilentPeerHitsTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket IPC not used on Windows")
+	}
+	timeout := 400 * time.Millisecond
+
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "silent.sock")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	stopAccept := make(chan struct{})
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- conn
+		// Hold the connection open but never write anything.
+		<-stopAccept
+		conn.Close()
+	}()
+
+	start := time.Now()
+	err = waitForProcessesReady(socketPath, map[string]struct{}{"svc": {}}, timeout)
+	elapsed := time.Since(start)
+
+	select {
+	case conn := <-accepted:
+		defer func() { conn.Close() }()
+	default:
+		t.Fatal("silent peer never accepted the connection")
+	}
+
+	if err == nil {
+		t.Fatal("expected a timeout error from a silent daemon")
+	}
+	if !strings.Contains(err.Error(), "timed out") || !strings.Contains(err.Error(), "svc") {
+		t.Errorf("error should report a wait-ready timeout listing svc, got: %v", err)
+	}
+	// Generous upper bound: the point is that it does not hang forever.
+	if elapsed > 5*time.Second {
+		t.Errorf("waiter took %s, expected it to stop near the %s timeout", elapsed, timeout)
+	}
+	close(stopAccept)
+}
+
 func ipcServerForTest(t *testing.T) (socketPath string, server *ipc.Server, stop func()) {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "pc-test-*")
@@ -572,6 +754,75 @@ func ipcServerForTest(t *testing.T) (socketPath string, server *ipc.Server, stop
 	}
 	stop = func() { server.Shutdown() }
 	return
+}
+
+// scriptedPeer is a minimal stand-in for the daemon that hands the waiter a
+// stream of state events in a caller-controlled order. Unlike ipc.Server it
+// exposes waitConnected, so a test can prove the client is attached before it
+// sends the event under test — fixed sleeps cannot, because a client that
+// connects late would receive only the newest state and never exercise the
+// transition being tested.
+type scriptedPeer struct {
+	socketPath string
+	connected  chan struct{}
+	send       chan ipc.ProcState
+}
+
+// newScriptedPeer starts a peer that accepts one client, sends it an initial
+// snapshot, then relays ProcStates from send in order. It stops with the test.
+func newScriptedPeer(t *testing.T, initial []ipc.ProcState) *scriptedPeer {
+	t.Helper()
+	dir := t.TempDir()
+	p := &scriptedPeer{
+		socketPath: filepath.Join(dir, "pc.sock"),
+		connected:  make(chan struct{}),
+		send:       make(chan ipc.ProcState, 16),
+	}
+	ln, err := net.Listen("unix", p.socketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		write := func(ev ipc.Event) {
+			data, err := json.Marshal(ev)
+			if err != nil {
+				return
+			}
+			conn.Write(append(data, '\n'))
+		}
+		write(ipc.Event{Type: ipc.TypeSnapshot, Processes: initial})
+		// Only signal once the snapshot is on the wire, so a waitConnected
+		// caller knows the client is attached and its first read can proceed.
+		close(p.connected)
+		for st := range p.send {
+			write(ipc.Event{Type: ipc.TypeState, Proc: &st})
+		}
+	}()
+	t.Cleanup(func() { close(p.send) })
+	return p
+}
+
+// waitConnected blocks until the peer has accepted the client and flushed its
+// initial snapshot, failing the test if that does not happen promptly.
+func (p *scriptedPeer) waitConnected(t *testing.T) {
+	t.Helper()
+	select {
+	case <-p.connected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer never accepted the waiter's connection")
+	}
+}
+
+// push queues one state event for delivery.
+func (p *scriptedPeer) push(st ipc.ProcState) {
+	p.send <- st
 }
 
 func TestComputeClosure_AllProcs(t *testing.T) {

@@ -3,12 +3,17 @@ package ipc
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strings"
 	"time"
 )
+
+// ErrRecvTimeout is returned by RecvTimeout when no event arrived within
+// the requested duration.
+var ErrRecvTimeout = errors.New("ipc: timed out waiting for event")
 
 // Client connects to a running daemon's socket/pipe and streams events.
 type Client struct {
@@ -57,6 +62,37 @@ func (c *Client) Recv() (Event, error) {
 	var ev Event
 	if err := json.Unmarshal(c.scanner.Bytes(), &ev); err != nil {
 		return Event{}, fmt.Errorf("bad event: %w", err)
+	}
+	return ev, nil
+}
+
+// RecvTimeout reads the next event, giving up after d. Unlike Recv it
+// bounds the blocking read with a connection deadline, so a connected but
+// silent daemon cannot pin the caller past its own budget.
+//
+// A receive timeout is terminal for this Client. bufio.Scanner latches the
+// read error and any partially buffered line is lost, so subsequent Recv or
+// RecvTimeout calls fail immediately with the same error; clearing the
+// connection deadline does not revive the stream. Callers that hit
+// ErrRecvTimeout must close the Client and stop reading.
+func (c *Client) RecvTimeout(d time.Duration) (Event, error) {
+	if err := c.conn.SetReadDeadline(time.Now().Add(d)); err != nil {
+		return Event{}, fmt.Errorf("set read deadline: %w", err)
+	}
+	ev, err := c.Recv()
+	if err != nil {
+		// A timeout left the scanner terminal, so there is nothing to keep
+		// alive for a later call — drop the deadline and report.
+		_ = c.conn.SetReadDeadline(time.Time{})
+		var nerr net.Error
+		if errors.As(err, &nerr) && nerr.Timeout() {
+			return Event{}, ErrRecvTimeout
+		}
+		return Event{}, err
+	}
+	// Success: clear the deadline so plain Recv keeps its blocking behaviour.
+	if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
+		return Event{}, fmt.Errorf("clear read deadline: %w", err)
 	}
 	return ev, nil
 }

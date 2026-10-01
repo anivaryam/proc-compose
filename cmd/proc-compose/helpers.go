@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -423,17 +424,41 @@ func waitForProcessesReady(socketPath string, want map[string]struct{}, timeout 
 
 	ready := make(map[string]struct{}, len(want))
 	failed := make([]string, 0)
-	check := func(p ipc.ProcState) bool {
-		if _, expected := want[p.Name]; !expected {
+
+	// satisfied reports whether a state event should count towards the
+	// waiter. Readiness is a per-cycle latch, so it is only honoured while
+	// the process is in a state that can serve traffic: a service must be
+	// running, a task must have completed. Any other observation (starting,
+	// restarting, exited, failed) retracts an earlier success so a stale
+	// ready=true can't satisfy the waiter.
+	satisfied := func(p ipc.ProcState) bool {
+		switch p.State {
+		case "completed":
+			return true // the runner only reaches "completed" on task success
+		case "running":
+			return p.Ready
+		default:
 			return false
 		}
-		switch {
-		case p.Ready:
-			ready[p.Name] = struct{}{}
-		case p.State == "failed":
-			failed = append(failed, p.Name)
+	}
+
+	// check folds one state observation into ready/failed. Failure wins over
+	// readiness regardless of order, so an earlier ready=true can never hide
+	// a later failure.
+	check := func(p ipc.ProcState) {
+		if _, expected := want[p.Name]; !expected {
+			return
 		}
-		return true
+		if p.State == "failed" {
+			failed = append(failed, p.Name)
+			delete(ready, p.Name)
+			return
+		}
+		if satisfied(p) {
+			ready[p.Name] = struct{}{}
+		} else {
+			delete(ready, p.Name)
+		}
 	}
 
 	allReady := func() bool {
@@ -456,8 +481,11 @@ func waitForProcessesReady(socketPath string, want map[string]struct{}, timeout 
 			return fmt.Errorf("wait-ready: timed out after %s; not ready: %s", timeout, strings.Join(notReadyNames(want, ready), ", "))
 		}
 
-		ev, err := client.Recv()
+		ev, err := client.RecvTimeout(left)
 		if err != nil {
+			if errors.Is(err, ipc.ErrRecvTimeout) {
+				return fmt.Errorf("wait-ready: timed out after %s; not ready: %s", timeout, strings.Join(notReadyNames(want, ready), ", "))
+			}
 			return fmt.Errorf("wait-ready: lost daemon connection: %w", err)
 		}
 		switch ev.Type {

@@ -142,6 +142,34 @@ func TestRunnerHelperProcess(t *testing.T) {
 		_, _ = os.Stdout.WriteString(args[2] + "\n")
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
+	case "ready-gate":
+		// ready-gate <line> <marker> <gate>: first incarnation prints the
+		// readiness line and exits (triggering a restart); every later
+		// incarnation waits for <gate> to appear before printing it, so a
+		// test can hold a restarted process unready until it chooses.
+		if len(args) != 4 {
+			os.Exit(2)
+		}
+		if _, err := os.Stat(args[2]); err != nil {
+			if err := os.WriteFile(args[2], []byte("first"), 0o644); err != nil {
+				os.Exit(2)
+			}
+			_, _ = os.Stdout.WriteString(args[1] + "\n")
+			os.Exit(0)
+		}
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			if _, err := os.Stat(args[3]); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				os.Exit(2)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_, _ = os.Stdout.WriteString(args[1] + "\n")
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
 	default:
 		os.Exit(2)
 	}
@@ -325,6 +353,147 @@ func TestRun_ReadyWhen_Log(t *testing.T) {
 	err := r.Run(ctx)
 	if err != nil {
 		t.Fatalf("expected nil (cancelled after ready), got: %v", err)
+	}
+}
+
+// TestRun_ReadyServiceThenExitsIsNotReady is the lifecycle-level regression for
+// stale readiness: a service that passed its log probe and then exited must
+// end up exited and not ready, so --wait-ready can't be satisfied by a process
+// that is already gone.
+func TestRun_ReadyServiceThenExitsIsNotReady(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"server": {
+			Cmd:     helperCmd("log", "listening on port 3000"),
+			Restart: "never",
+			ReadyWhen: &config.ReadyWhen{
+				Log: "listening on port",
+			},
+		},
+	})
+
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatalf("expected nil after clean exit, got: %v", err)
+	}
+
+	states := r.store.Load().snapshot()
+	if len(states) != 1 {
+		t.Fatalf("expected one state, got %d", len(states))
+	}
+	if states[0].State != "exited" {
+		t.Fatalf("service state = %q, want exited", states[0].State)
+	}
+	if states[0].Ready {
+		t.Fatal("exited service Ready = true, want false")
+	}
+}
+
+// TestRun_ReadyServiceThenFailsIsNotReady covers the failure variant: a process
+// that was marked ready on start and then died with a non-zero status must end
+// up failed and not ready — an earlier ready=true must not survive the failure.
+func TestRun_ReadyServiceThenFailsIsNotReady(t *testing.T) {
+	// No ready_when probe: readiness latches on start, then the command exits 1.
+	r := makeRunner(map[string]config.Process{
+		"server": {Cmd: helperCmd("exit", "1"), Restart: "never"},
+	})
+
+	if err := r.Run(context.Background()); err == nil {
+		t.Fatal("expected non-nil error when the process exits non-zero")
+	}
+
+	states := r.store.Load().snapshot()
+	if len(states) != 1 {
+		t.Fatalf("expected one state, got %d", len(states))
+	}
+	if states[0].State != "failed" {
+		t.Fatalf("service state = %q, want failed", states[0].State)
+	}
+	if states[0].Ready {
+		t.Fatal("failed service Ready = true, want false")
+	}
+}
+
+// TestRun_RestartResetsReadiness checks that an automatic restart starts a new
+// readiness cycle: the dead incarnation's latch must not carry over into the
+// replacement. It watches the *running* second incarnation before its probe is
+// released, so removing the resetReady() calls would make it see Ready=true
+// where it requires false.
+func TestRun_RestartResetsReadiness(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "first-incarnation")
+	gate := filepath.Join(dir, "probe-released")
+
+	r := makeRunner(map[string]config.Process{
+		"flappy": {
+			Cmd:          helperCmd("ready-gate", "READY", marker, gate),
+			Restart:      "always",
+			ReadyTimeout: -1, // no probe deadline; the test controls readiness
+			ReadyWhen:    &config.ReadyWhen{Log: "READY"},
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	// Second incarnation is running, but its probe is gated. If readiness
+	// had carried over from the first incarnation this would read true.
+	if !waitForProcState(t, r, "flappy", func(st ipc.ProcState) bool {
+		return st.State == "running" && st.Restarts >= 1
+	}, 15*time.Second) {
+		t.Fatalf("second incarnation never reached running with a restart recorded: %+v", snapshotOf(r, "flappy"))
+	}
+	if got := snapshotOf(r, "flappy"); got.Ready {
+		t.Fatalf("restarted service Ready = true before its probe ran, want false (state %q)", got.State)
+	}
+
+	// Release the probe and the same process must become ready on its own.
+	if err := os.WriteFile(gate, []byte("go"), 0o644); err != nil {
+		t.Fatalf("release gate: %v", err)
+	}
+	if !waitForProcState(t, r, "flappy", func(st ipc.ProcState) bool {
+		return st.State == "running" && st.Ready
+	}, 10*time.Second) {
+		t.Fatalf("restarted service never became ready after its probe ran: %+v", snapshotOf(r, "flappy"))
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("runner did not stop after cancel")
+	}
+}
+
+// snapshotOf returns the current state for name, or a zero value if the store
+// is not published yet or the name is absent.
+func snapshotOf(r *Runner, name string) ipc.ProcState {
+	store := r.store.Load()
+	if store == nil {
+		return ipc.ProcState{Name: name}
+	}
+	for _, st := range store.snapshot() {
+		if st.Name == name {
+			return st
+		}
+	}
+	return ipc.ProcState{Name: name}
+}
+
+// waitForProcState polls the runner's state store until pred holds for name,
+// returning false if it does not within timeout. Polling the store keeps the
+// assertion independent of broadcast timing.
+func waitForProcState(t *testing.T, r *Runner, name string, pred func(ipc.ProcState) bool, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if pred(snapshotOf(r, name)) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

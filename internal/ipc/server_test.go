@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -46,6 +47,35 @@ func testSocketPath(t *testing.T, name string) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, name)
+}
+
+// TestClient_RecvTimeoutSilentServer pins the deadline guarantee: a server
+// that accepts the connection and then stays silent must make RecvTimeout
+// return ErrRecvTimeout instead of blocking forever.
+func TestClient_RecvTimeoutSilentServer(t *testing.T) {
+	s := NewServer(testSocketPath(t, "pc-silent-test"))
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer s.Shutdown()
+
+	// Drain snapshot so the client is connected but has nothing left to read.
+	c, err := Dial(s.socketPath)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+	if _, err := c.Recv(); err != nil {
+		t.Fatalf("snapshot Recv: %v", err)
+	}
+
+	start := time.Now()
+	if _, err := c.RecvTimeout(200 * time.Millisecond); !errors.Is(err, ErrRecvTimeout) {
+		t.Fatalf("RecvTimeout on a silent server = %v, want ErrRecvTimeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("RecvTimeout took %s, expected it to give up near 200ms", elapsed)
+	}
 }
 
 func TestServer_AckSignalsBusyWhenChannelFull(t *testing.T) {

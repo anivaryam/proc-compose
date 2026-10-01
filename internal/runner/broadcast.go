@@ -19,7 +19,7 @@ func (r *Runner) broadcastState(p procInfo, st *procState) {
 		Name:       p.name,
 		State:      st.state,
 		Mode:       p.proc.EffectiveMode(),
-		Ready:      st.readyClosed && st.readyOK,
+		Ready:      st.currentlyReady(),
 		PID:        st.pid,
 		Restarts:   st.restarts,
 		StartedAt:  st.startedAt,

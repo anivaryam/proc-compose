@@ -167,6 +167,9 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 				}
 				PrintProcessEvent(p.name, maxName, p.colorIndex, "exited, restarting...")
 				r.logEvent(p, "exited, restarting...")
+				// A fresh cycle means a fresh readiness latch: dependents must
+				// wait for the new incarnation's probe, not the dead one's.
+				st.resetReady()
 				st.mu.Lock()
 				st.restarts++
 				st.state = "restarting"
@@ -198,6 +201,9 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			return processRunResult{failed: r.giveUp(p, maxName, st)}
 		}
 
+		// Fresh cycle, fresh readiness latch — same reasoning as the
+		// automatic-restart branch above.
+		st.resetReady()
 		st.mu.Lock()
 		st.restarts++
 		st.state = "restarting"
@@ -210,9 +216,9 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		case <-ctx.Done():
 			return processRunResult{}
 		case <-st.restartCh:
-			// Restart requested during backoff — skip the wait.
+			// Restart requested during backoff — skip the wait. Readiness
+			// was already reset above, before the wait started.
 			backoff = time.Second
-			st.resetReady()
 			continue
 		case <-time.After(backoff):
 		}
