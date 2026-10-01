@@ -135,6 +135,9 @@ func survivorsError(results []GroupResult) error {
 		switch r.State {
 		case GroupUnavailable:
 			b.WriteString("\n    process group containment was unavailable, so termination could not be attempted")
+			if reason := unavailableReason(); reason != "" {
+				fmt.Fprintf(&b, ": %s", reason)
+			}
 		case GroupOwned:
 			fmt.Fprintf(&b, "\n    process group %s", describeGroup(r))
 			if len(r.Members) > 0 {
@@ -154,6 +157,19 @@ func survivorsError(results []GroupResult) error {
 		return nil
 	}
 	return errors.New("managed process tree could not be verified as terminated:" + b.String())
+}
+
+// unavailableReason explains why a containment could not be established, when the
+// platform knows. It exists so an operator sees the actual cause instead of a bare
+// "unavailable".
+func unavailableReason() string {
+	if err := lastProbeFailure(); err != nil {
+		return err.Error()
+	}
+	if err := lastTrackFailure(); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // describeGroup renders a group's identifier for an operator-facing message,

@@ -8,10 +8,12 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -754,16 +756,11 @@ func ipcServerForTest(t *testing.T) (socketPath string, server *ipc.Server, stop
 	return
 }
 
-// socketDirForTest avoids test-name-prefixed paths that exceed macOS's Unix
-// socket path limit.
+// socketDirForTest is the scratch directory for files a test writes alongside an
+// endpoint. The platform-specific naming lives in testTempDir.
 func socketDirForTest(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "pc-test-*")
-	if err != nil {
-		t.Fatalf("temp socket dir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	return dir
+	return testTempDir(t)
 }
 
 // scriptedPeer is a minimal stand-in for the daemon that hands the waiter a
@@ -1720,20 +1717,14 @@ func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn)) *
 		}
 	})
 
-	// A short directory keeps the socket path inside macOS's 104-byte limit.
-	dir, err := os.MkdirTemp("/tmp", "pc-test-*")
-	if err != nil {
-		t.Fatalf("temp socket dir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	fd.socketPath = filepath.Join(dir, "d.sock")
+	fd.socketPath = testEndpointForTest(t)
 
 	if script == nil {
 		// No peer: leave the path unused so connecting fails, modelling an
 		// older daemon or a dead socket.
 		return fd
 	}
-	ln, err := net.Listen("unix", fd.socketPath)
+	ln, err := testListenEndpoint(fd.socketPath)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -1821,7 +1812,7 @@ func TestStopDaemon_SurvivorVerdictMakesStopFail(t *testing.T) {
 // fact.
 func scriptedInto(fd *fakeDaemon, script func(*fakeDaemon, net.Conn)) {
 	fd.t.Helper()
-	ln, err := net.Listen("unix", fd.socketPath)
+	ln, err := testListenEndpoint(fd.socketPath)
 	if err != nil {
 		fd.t.Fatalf("listen: %v", err)
 	}
@@ -1902,38 +1893,56 @@ func TestStopDaemon_UnreachableDaemonIsLabelledUnverified(t *testing.T) {
 	}
 }
 
-// quoteForScript makes a value safe to embed in a single-quoted sh script.
-func quoteForScript(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+// TestSignalWitnessHelper is the child process the signal witness runs.
+//
+// It is the test binary re-invoked rather than a shell script so the fixture works
+// the same way on every platform. On Unix it traps the signals under test and
+// records them before exiting, which is what makes a graceful stop distinguishable
+// from a forced one. On Windows there is no SIGTERM to trap — the product's own
+// contract is that `stop` is always forced there — so it only idles, and the
+// graceful-phase assertions that depend on a recorded signal are skipped by the
+// tests that make them.
+func TestSignalWitnessHelper(t *testing.T) {
+	if len(os.Args) < 3 || os.Args[len(os.Args)-3] != signalWitnessSentinel {
+		return
+	}
+	marker, ready := os.Args[len(os.Args)-2], os.Args[len(os.Args)-1]
+
+	if runtime.GOOS != "windows" {
+		// Record only when a signal is actually delivered, so an empty marker
+		// after a forced stop is real evidence that nothing graceful was tried.
+		ch := make(chan os.Signal, 4)
+		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+		_ = os.WriteFile(ready, []byte("ready"), 0o644)
+		sig := <-ch
+		_ = os.WriteFile(marker, []byte("term"), 0o644)
+		t.Logf("witness received %v", sig)
+		return
+	}
+	_ = os.WriteFile(ready, []byte("ready"), 0o644)
+	for {
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
-// signalWitness records which termination signal actually reached a process, so
-// a test can prove which operation a fallback chose rather than inferring it
-// from timing. It works by trapping the signals it cares about and recording
-// them, then exiting, so a graceful stop and a forced stop are distinguishable.
+const signalWitnessSentinel = "__PROC_COMPOSE_SIGNAL_WITNESS__"
+
+// signalWitness starts a process that records whether it was asked to stop
+// gracefully, so a test can prove which operation a fallback chose rather than
+// inferring it from timing.
 func signalWitness(t *testing.T, marker string) *exec.Cmd {
 	t.Helper()
-	var cmd *exec.Cmd
-	// The witness must survive SIGTERM in order to record that a graceful signal
-	// was delivered, so it traps TERM instead of dying from it.
 	dir := t.TempDir()
-	script := filepath.Join(dir, "witness.sh")
 	ready := filepath.Join(dir, "ready")
-	// Records a signal only when one is actually delivered, so an empty marker
-	// after a forced stop is real evidence that no graceful signal was attempted.
-	body := "#!/bin/sh\n" +
-		"trap 'echo term >> " + quoteForScript(marker) + "; exit 0' TERM\n" +
-		": > " + quoteForScript(ready) + "\n" +
-		"while :; do sleep 1; done\n"
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
-		t.Fatalf("write witness: %v", err)
-	}
-	cmd = exec.Command(script)
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSignalWitnessHelper$",
+		"--", signalWitnessSentinel, marker, ready)
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=0")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start witness: %v", err)
 	}
 	// Deterministic gate: the trap is installed before the ready file appears, so
-	// a SIGTERM after this point is guaranteed to be recorded.
+	// a signal after this point is guaranteed to be recorded.
 	waitForFile(t, ready, 20*time.Second)
 	// Reap promptly: an unreaped zombie still answers signal 0, which
 	// daemon.IsAlive counts as alive and would make every exit check hang.
@@ -1953,6 +1962,19 @@ func signalWitness(t *testing.T, marker string) *exec.Cmd {
 		}
 	})
 	return cmd
+}
+
+// requireGracefulSignalPhase skips the assertion that a graceful signal was
+// delivered first.
+//
+// Windows has no SIGTERM for console applications: `stop` there is documented as
+// always forced, so there is no graceful phase to observe. This skips one specific
+// assertion, not the test — the surrounding fallback behaviour is still checked.
+func requireGracefulSignalPhase(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows `stop` is always forced; there is no graceful signal phase to observe")
+	}
 }
 
 // waitForFile blocks until path exists, so a fixture is only used once it is
@@ -1998,6 +2020,7 @@ func TestStopDaemon_FallbackPreservesGracefulIntent(t *testing.T) {
 	}
 	// The witness must have been asked to stop before anything was killed: it
 	// records a term and exits, which is observable in its marker file.
+	requireGracefulSignalPhase(t)
 	if got := signalsSeen(t, marker); !strings.Contains(got, "term") {
 		t.Fatalf("witness recorded %q, want a SIGTERM; the graceful fallback did not signal", got)
 	}
@@ -2020,6 +2043,7 @@ func TestStopDaemon_FallbackPreservesForceIntent(t *testing.T) {
 	if !strings.Contains(err.Error(), "NOT verified") {
 		t.Fatalf("error = %q, want it to state managed processes were not verified", err)
 	}
+	requireGracefulSignalPhase(t)
 	if got := signalsSeen(t, marker); strings.Contains(got, "term") {
 		t.Fatalf("witness recorded %q: --force degraded into a graceful stop before killing", got)
 	}

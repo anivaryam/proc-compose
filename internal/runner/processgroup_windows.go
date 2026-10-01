@@ -151,3 +151,13 @@ func (pg *windowsProcessGroup) Close() error {
 	pg.job = nil
 	return err
 }
+
+// lastProbeFailure returns why the job handle could not be queried, or nil.
+//
+// Windows answers from the kernel's own job counters rather than a probe, so
+// there is no probe error to report; the accessor exists so the shared verdict
+// reporter does not need to know which mechanism a platform uses.
+func lastProbeFailure() error { return nil }
+
+// lastTrackFailure returns why containment could not be established, or nil.
+func lastTrackFailure() error { return nil }

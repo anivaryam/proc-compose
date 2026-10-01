@@ -40,6 +40,20 @@ func helperCmd(args ...string) string {
 	return posixQuote(os.Args[0]) + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel + " " + payload
 }
 
+// discardOwnOutput redirects the leader shell's own standard streams to the null
+// device, so the runner's log pipe reaches end-of-stream while the command is
+// still running.
+//
+// The device and the syntax are platform-specific: POSIX shells take /dev/null and
+// an exec redirect, while cmd.exe takes NUL. Without this the fixture would be a
+// shell syntax error on Windows rather than the shape under test.
+var discardOwnOutput = func() string {
+	if runtime.GOOS == "windows" {
+		return "2>nul >nul"
+	}
+	return "exec >/dev/null 2>&1;"
+}
+
 func posixQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
@@ -2313,12 +2327,12 @@ func TestRun_EOFDoesNotTerminateAHealthyService(t *testing.T) {
 	working := filepath.Join(dir, "working")
 	release := filepath.Join(dir, "release")
 
-	// The leading "exec >/dev/null 2>&1" is applied by the leader shell to itself,
-	// which is what makes EOF arrive while the service is still running. Merely
-	// appending a redirect to the command would not: the shell forks, and the
-	// forked leader keeps holding the log pipe, so EOF would only arrive once the
-	// command had already finished.
-	cmd := "exec >/dev/null 2>&1; " + helperCmd("quiet-loop", pidFile, working, release)
+	// The leading self-redirect is applied by the leader shell to itself, which is
+	// what makes EOF arrive while the service is still running. Merely appending a
+	// redirect to the command would not: the shell forks, and the forked leader
+	// keeps holding the log pipe, so EOF would only arrive once the command had
+	// already finished.
+	cmd := discardOwnOutput() + " " + helperCmd("quiet-loop", pidFile, working, release)
 
 	r := makeRunner(map[string]config.Process{
 		"svc": {
@@ -2393,7 +2407,7 @@ func TestRun_StopTerminatesAHealthyServiceThatClosedItsOutput(t *testing.T) {
 
 	// The redirect is applied by the leader shell to itself, which is what makes
 	// the runner's log pipe reach EOF while the command is still running.
-	cmd := "exec >/dev/null 2>&1; " + helperCmd("quiet-stubborn", pidFile)
+	cmd := discardOwnOutput() + " " + helperCmd("quiet-stubborn", pidFile)
 
 	r := makeRunner(map[string]config.Process{
 		"svc": {

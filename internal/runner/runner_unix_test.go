@@ -256,41 +256,63 @@ func TestObserveLeaderExit_AlreadyExitedChildIsDetectedAtSetup(t *testing.T) {
 	_ = cmd.Wait()
 }
 
-// TestState_GroupExistenceIsDecidedByTheProbe pins how a group's existence is
-// judged, using the only signal that behaves the same way on Linux and macOS.
+// TestState_AbsenceIsDecidedByMembershipNotTheProbe pins how a group is judged
+// gone.
 //
-// A failed kill(-pgid, 0) is the kernel saying it does not know of such a group,
-// and that is the same evidence on both systems. It must not be reinterpreted as a
-// permission failure: on macOS the error is not ESRCH, so keying on ESRCH alone
-// reported every group as unverifiable and turned every clean shutdown into a
-// failure.
-func TestState_GroupExistenceIsDecidedByTheProbe(t *testing.T) {
+// Absence is established by enumerating the group's members and finding nothing
+// running. It is not established by kill(-pgid, 0), because that call's error
+// does not mean "gone": on macOS it answers EPERM for a group the kernel does not
+// know, which is why an ESRCH-only reading marked every macOS group unverifiable
+// and an any-error reading would mark them all terminated instead.
+//
+// The probe is still meaningful, but only in one direction: a success proves
+// something is there.
+func TestState_AbsenceIsDecidedByMembershipNotTheProbe(t *testing.T) {
 	dir := t.TempDir()
 	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
 	stay := writeScript(t, dir, "stay.sh", stayScript)
 	descendantPIDFile := filepath.Join(dir, "d.pid")
 	pg, _ := startTrackedGroup(t, stay+" "+stubborn+" "+descendantPIDFile)
-	// The probe below is made to fail, so cleanup must not depend on the group
-	// responding. Track the group directly and let it be torn down by PID.
 	if pgid := groupPGID(pg); pgid > 1 {
-		groupForCleanup(t, pgid, "probe-controlled group")
+		groupForCleanup(t, pgid, "membership-controlled group")
 	}
 
 	if got := pg.State(); got != GroupOwned {
 		t.Fatalf("State() with a live group = %v, want %v", got, GroupOwned)
 	}
 
-	// A probe failure means the kernel does not know the group. macOS answers
-	// with something other than ESRCH, so this must not key on ESRCH.
+	// The probe now failing changes nothing: membership, not the probe, decides.
+	for _, probeErr := range []error{syscall.EPERM, syscall.ESRCH, errors.New("probe could not answer")} {
+		restore := groupKill
+		groupKill = func(pid int, _ syscall.Signal) error { return probeErr }
+		got := pg.State()
+		groupKill = restore
+		if got != GroupOwned {
+			t.Fatalf("State() with a live member and probe error %v = %v, want %v; "+
+				"a live member must be reported however the probe behaves", probeErr, got, GroupOwned)
+		}
+	}
+
+	// With the group emptied, every probe outcome agrees it is gone.
 	restore := groupKill
 	groupKill = func(pid int, _ syscall.Signal) error { return syscall.EPERM }
 	t.Cleanup(func() { groupKill = restore })
-
-	if got := pg.State(); got != GroupEmpty {
-		t.Fatalf("State() when the probe reports no such group = %v, want %v", got, GroupEmpty)
+	if err := pg.Kill(); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		got := pg.State()
+		if got == GroupEmpty {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("State() = %v, want %v once the group is empty", got, GroupEmpty)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	if err := survivorsError(groupResult("svc", pg, pg.State())); err != nil {
-		t.Fatalf("survivorsError() for a group the kernel does not know = %v, want nil", err)
+		t.Fatalf("survivorsError() for an empty group = %v, want nil", err)
 	}
 }
 

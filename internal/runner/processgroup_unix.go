@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -80,23 +81,52 @@ func (pg *unixProcessGroup) State() GroupState {
 	if pg.trackErr != nil {
 		return GroupUnavailable
 	}
-	// Only a successful probe counts as proof of anything. Measured on macOS CI:
-	// kill(-pgid, 0) there does not answer ESRCH for an absent group, so an
-	// ESRCH-only reading of this call reported GroupUnavailable for every group
-	// on the platform. A successful probe is the same evidence on both systems,
-	// because the probe itself only succeeds when the group exists.
+	// Absence is established by enumerating the group and finding nothing running,
+	// not by asking kill(2) whether the group still exists.
 	//
-	// An unreaped zombie leader also makes this succeed, so liveMembers decides
-	// whether anything is actually still running.
-	if groupKill(-pgid, 0) != nil {
-		return GroupEmpty
+	// That distinction is measured, not stylistic. kill(-pgid, 0) returns EPERM on
+	// macOS for a group the kernel does not know — the errno is reported in the
+	// verdict as "operation not permitted" — so keying absence on ESRCH marked
+	// every macOS group unverifiable, and keying it on any probe failure at all
+	// would read EPERM as proof of termination. The probe is therefore only ever
+	// allowed to ADD a conclusion: a success proves something is there, and a
+	// failure contributes nothing.
+	members, known := processGroupMembers(pgid)
+	if !known {
+		// Membership could not be read, so nothing can be established either way.
+		// Fall back to the probe: a live group is still evidence of one.
+		if groupKill(-pgid, 0) == nil {
+			return GroupOwned
+		}
+		probeErr := fmt.Errorf("process group membership could not be enumerated")
+		groupProbeFailure.Store(&probeErr)
+		return GroupUnavailable
 	}
-	if liveMembers(pgid) {
+	if members > 0 {
 		return GroupOwned
 	}
+	// No member is running. A group whose only remaining members are terminated
+	// but unreaped is not a survivor, which is why this is decided by state rather
+	// than by the leader's presence.
 	return GroupEmpty
 }
 
+// groupProbeFailure records why the last existence probe could not be answered,
+// so State can explain an unverifiable verdict. It is written before State returns
+// and read immediately after, under no lock, because a group is only probed by the
+// goroutine that owns its teardown.
+var groupProbeFailure atomic.Pointer[error]
+
+// lastProbeFailure returns the probe error that produced the most recent
+// GroupUnavailable, or nil.
+func lastProbeFailure() error {
+	if p := groupProbeFailure.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// Identify returns the group's process-group ID for operator-facing messages.
 func (pg *unixProcessGroup) Identify() string {
 	pg.mu.Lock()
 	defer pg.mu.Unlock()
@@ -106,10 +136,22 @@ func (pg *unixProcessGroup) Identify() string {
 	return identifyPID(pg.pgid)
 }
 
+// Close releases the group's identity.
 func (pg *unixProcessGroup) Close() error {
 	pg.mu.Lock()
 	defer pg.mu.Unlock()
 	pg.pgid = 0
+	return nil
+}
+
+// groupTrackFailure records why Track could not establish containment.
+var groupTrackFailure atomic.Pointer[error]
+
+// lastTrackFailure returns the most recent Track error, or nil.
+func lastTrackFailure() error {
+	if p := groupTrackFailure.Load(); p != nil {
+		return *p
+	}
 	return nil
 }
 
