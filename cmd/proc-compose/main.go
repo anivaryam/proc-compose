@@ -344,9 +344,9 @@ auto-injection — see:
 
 	// ── monitor ───────────────────────────────────────────────────────────────
 	monitorCmd := &cobra.Command{
-		Use:           "monitor",
-		Aliases:       []string{"m"},
-		Short:         "Open a TUI monitor for a running daemon",
+		Use:     "monitor",
+		Aliases: []string{"m"},
+		Short:   "Open a TUI monitor for a running daemon",
 		Long: `Open a TUI monitor for a running daemon.
 
 Keys:
@@ -377,21 +377,32 @@ Screenshots and full key reference:
 
 	// ── stop ──────────────────────────────────────────────────────────────────
 	var (
-		stopTimeout int
-		stopForce   bool
+		stopTimeoutSeconds int
+		stopForce          bool
 	)
 	stopCmd := &cobra.Command{
-		Use:           "stop",
-		Short:         "Stop a running proc-compose daemon",
+		Use:   "stop",
+		Short: "Stop a running proc-compose daemon",
 		Long: `Stop the proc-compose daemon associated with the resolved config file.
 
 Daemons are scoped per absolute config path. Use -f to stop a daemon
 started with a different config file. Sends SIGTERM, waits up to
 --timeout seconds, then escalates to SIGKILL.
 
+A stop is only reported as successful once the daemon has confirmed that
+every managed process it started — not just the command leaders — has
+actually terminated. If the daemon cannot be stopped gracefully, this
+command reports the failure instead of claiming success, because killing
+the daemon alone leaves its managed processes running.
+
+--force asks the daemon to force-terminate its managed processes and then
+exit, rather than signalling the daemon itself. If the daemon cannot be
+reached (an older proc-compose, or a dead socket), it is killed and the
+command warns that managed processes could not be verified.
+
 On Windows the graceful path is unavailable; --timeout is ignored and
-stop always uses taskkill /T /F.`,
-		Example:       "  proc-compose stop              # graceful, 10s timeout\n  proc-compose stop --timeout 30 # graceful, 30s timeout\n  proc-compose stop --force      # SIGKILL immediately\n  proc-compose stop -f myapp.yml # stop daemon for a specific config",
+managed processes are always terminated with taskkill /T /F.`,
+		Example:       "  proc-compose stop              # graceful, 10s timeout\n  proc-compose stop --timeout 30 # graceful, 30s timeout\n  proc-compose stop --force      # force-terminate managed processes\n  proc-compose stop -f myapp.yml # stop daemon for a specific config",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -415,38 +426,12 @@ stop always uses taskkill /T /F.`,
 				return err
 			}
 
-			if stopForce {
-				if err := daemon.KillProcess(proc); err != nil {
-					return fmt.Errorf("failed to SIGKILL %d: %w", pid, err)
-				}
-				fmt.Printf("killed proc-compose daemon (PID %d)\n", pid)
-				return nil
-			}
-
-			if err := daemon.StopProcess(proc); err != nil {
-				return fmt.Errorf("failed to stop process %d: %w", pid, err)
-			}
-
-			deadline := time.Now().Add(time.Duration(stopTimeout) * time.Second)
-			for time.Now().Before(deadline) {
-				if !daemon.IsAlive(pid) {
-					fmt.Printf("stopped proc-compose daemon (PID %d)\n", pid)
-					return nil
-				}
-				time.Sleep(200 * time.Millisecond)
-			}
-
-			// Graceful timeout exceeded — escalate.
-			fmt.Fprintf(os.Stderr, "daemon did not exit within %ds; sending SIGKILL\n", stopTimeout)
-			if err := daemon.KillProcess(proc); err != nil {
-				return fmt.Errorf("failed to SIGKILL after timeout: %w", err)
-			}
-			fmt.Printf("killed proc-compose daemon (PID %d)\n", pid)
-			return nil
+			stopTimeout := time.Duration(stopTimeoutSeconds) * time.Second
+			return stopDaemon(socketPath, pidPath, pid, proc, stopForce, stopTimeout)
 		},
 	}
-	stopCmd.Flags().IntVar(&stopTimeout, "timeout", 10, "seconds to wait for graceful shutdown before SIGKILL")
-	stopCmd.Flags().BoolVar(&stopForce, "force", false, "SIGKILL immediately without graceful shutdown")
+	stopCmd.Flags().IntVar(&stopTimeoutSeconds, "timeout", 10, "seconds to wait for graceful shutdown before SIGKILL")
+	stopCmd.Flags().BoolVar(&stopForce, "force", false, "force-terminate managed processes instead of shutting down gracefully")
 
 	// ── list ──────────────────────────────────────────────────────────────────
 	listCmd := &cobra.Command{
@@ -501,9 +486,9 @@ proc-compose to scan the project and propose a config tailored to it.`,
 
 	// ── uninstall ────────────────────────────────────────────────────────────
 	uninstallCmd := &cobra.Command{
-		Use:           "uninstall",
-		Aliases:       []string{"un"},
-		Short:         "Remove systemd unit installed via --survive --install",
+		Use:     "uninstall",
+		Aliases: []string{"un"},
+		Short:   "Remove systemd unit installed via --survive --install",
 		Long: `Stop, disable, and remove the systemd user unit previously installed
 with "up --survive --install --name <n>", then run daemon-reload.
 
@@ -570,9 +555,9 @@ See: https://github.com/anivaryam/proc-compose#auto-restart-on-reboot---survive`
 
 	// ── restart ──────────────────────────────────────────────────────────────
 	restartCmd := &cobra.Command{
-		Use:           "restart <process>",
-		Aliases:       []string{"r"},
-		Short:         "Restart a single process in a running daemon",
+		Use:     "restart <process>",
+		Aliases: []string{"r"},
+		Short:   "Restart a single process in a running daemon",
 		Long: `Restart one named process in the running daemon without disturbing
 others. The daemon (not the local config) is the source of truth for
 process names — an unknown name returns "unknown process" from the
@@ -628,9 +613,9 @@ applying another command.`,
 
 	// ── reload ───────────────────────────────────────────────────────────────
 	reloadCmd := &cobra.Command{
-		Use:           "reload",
-		Aliases:       []string{"rl"},
-		Short:         "Reload config and restart changed processes",
+		Use:     "reload",
+		Aliases: []string{"rl"},
+		Short:   "Reload config and restart changed processes",
 		Long: `Re-read the config and restart processes whose definition (cmd, env,
 dir, etc.) changed. Unchanged processes keep running.
 
@@ -728,9 +713,9 @@ non-zero on rejection or daemon-busy.`,
 
 	// ── validate ─────────────────────────────────────────────────────────────
 	validateCmd := &cobra.Command{
-		Use:           "validate",
-		Aliases:       []string{"check"},
-		Short:         "Parse and validate the config without starting anything",
+		Use:     "validate",
+		Aliases: []string{"check"},
+		Short:   "Parse and validate the config without starting anything",
 		Long: `Parse the config and run all validation rules without starting any
 process. Exits non-zero on unknown fields, bad restart policies,
 circular depends_on, invalid readiness regex, or malformed merge
@@ -755,8 +740,8 @@ sections. Suitable for CI and pre-commit checks.`,
 	// ── logs ─────────────────────────────────────────────────────────────────
 	var tailLines int
 	logsCmd := &cobra.Command{
-		Use:           "logs",
-		Short:         "Show logs from a running or past daemon",
+		Use:   "logs",
+		Short: "Show logs from a running or past daemon",
 		Long: `Print the tail of the daemon log file for the resolved config.
 
 When --silent was used without --log-file, the daemon writes to

@@ -4,17 +4,22 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
@@ -37,6 +42,13 @@ func helperCmd(args ...string) string {
 
 func posixQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// encodeHelperArgs builds the payload token helperCmd uses, for the rare case a
+// fixture has to re-invoke the helper binary itself rather than name it in a
+// command string.
+func encodeHelperArgs(args ...string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strings.Join(args, "\x00")))
 }
 
 func TestRunnerHelperProcess(t *testing.T) {
@@ -170,9 +182,257 @@ func TestRunnerHelperProcess(t *testing.T) {
 		_, _ = os.Stdout.WriteString(args[1] + "\n")
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
+	case "quiet-loop":
+		// quiet-loop <pidfile> <ready> <release>: record the PID, close both
+		// output streams so the runner's log pipe reaches EOF immediately, then
+		// signal on a non-output channel that work is under way and exit only
+		// when released.
+		//
+		// This is the deterministic way to model a service whose output ends
+		// before it does. A shell script cannot be trusted here: the leader's
+		// process-group and pipe behaviour vary with the /bin/sh, and getting it
+		// wrong makes the fixture silently test nothing.
+		if len(args) != 4 {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(args[1], []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+			os.Exit(2)
+		}
+		// Close the streams the runner reads. From here on the pipe has no
+		// writer, so the runner sees EOF while this process keeps running.
+		_ = os.Stdout.Close()
+		_ = os.Stderr.Close()
+		if err := os.WriteFile(args[2], []byte("working"), 0o644); err != nil {
+			os.Exit(2)
+		}
+		deadline := time.Now().Add(120 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(args[3]); err == nil {
+				os.Exit(0)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		os.Exit(7)
+	case "quiet-stubborn":
+		// quiet-stubborn <pidfile>: record the PID, close both output streams so
+		// the runner's log pipe reaches EOF immediately, then ignore SIGTERM and
+		// keep working. Only a group-wide SIGKILL can end it.
+		//
+		// This is the combination that broke the old design: end-of-stream made
+		// the runner withdraw signalling authority while the service was still
+		// running, so the escalation could no longer reach it.
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(args[1], []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+			os.Exit(2)
+		}
+		_ = os.Stdout.Close()
+		_ = os.Stderr.Close()
+		signal.Ignore(syscall.SIGTERM)
+		signal.Ignore(syscall.SIGINT)
+		signal.Ignore(syscall.SIGHUP)
+		deadline := time.Now().Add(120 * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		os.Exit(7)
+	case "spawn-job-child":
+		// spawn-job-child <pidfile>: start a detached long-lived child, record the
+		// CHILD's pid, then exit immediately.
+		//
+		// The child stays inside the command's Job Object, so terminating the job
+		// has to reach it even though the leader that started it has already been
+		// collected. That is the property Windows has and Unix does not.
+		//
+		// The recorded pid must be the child's, not this process's. This process is
+		// the job leader and it exits at once, so a test that read its own pid would
+		// assert against an already-dead parent and prove nothing about whether the
+		// job reached a surviving descendant.
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		child := exec.Command(os.Args[0], "-test.run=^TestRunnerHelperProcess$",
+			"--", helperSentinel, encodeHelperArgs("sleep", "120s"))
+		// Detach from this process's streams so the runner's log reader cannot
+		// be kept alive by a descendant that was never meant to be waited on.
+		devnull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err != nil {
+			os.Exit(2)
+		}
+		child.Stdin, child.Stdout, child.Stderr = devnull, devnull, devnull
+		if err := child.Start(); err != nil {
+			os.Exit(2)
+		}
+		// Record only after a successful start, so the file never names a pid that
+		// was never created.
+		if err := os.WriteFile(args[1], []byte(strconv.Itoa(child.Process.Pid)), 0o644); err != nil {
+			os.Exit(2)
+		}
+		// The child is deliberately not waited on: this process exits at once and
+		// the child is left running inside the job.
+		os.Exit(0)
+	case "record-and-exit":
+		// record-and-exit <pidfile>: record this PID and exit 0 immediately.
+		// A shutdown that arrives afterwards must treat it as a non-event
+		// rather than an error, and must not signal anything on its behalf.
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(args[1], []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+			os.Exit(2)
+		}
+		os.Exit(0)
 	default:
 		os.Exit(2)
 	}
+}
+
+// Fixture scripts are written to disk rather than inlined into the config.
+// Every fixture self-expires after a fixed lifetime, so no test path — including
+// one where the code under test is deliberately broken and never returns — can
+// leak a helper. The lifetime is far longer than any legitimate assertion
+// window (the slowest shutdown test resolves in seconds), so it never affects a
+// passing test; it only bounds the damage of a failing one. It relies on
+// date(1), which is why these fixtures are Unix-only anyway.
+//
+// A Go program cannot model a SIGTERM-ignoring service: the Go runtime installs
+// its own SIGTERM/SIGINT handlers at startup, overriding a SIG_IGN disposition
+// inherited across exec. A `trap` in a wrapper shell therefore does not make a
+// test-binary descendant stubborn — it still dies on the first SIGTERM, which
+// would make a shutdown test pass for the wrong reason. Real shell scripts
+// ignore SIGTERM reliably, so the fixtures use them.
+//
+// Scripts also mirror how a config refers to a service that is a script, and
+// they avoid nesting `sh -c` inside the command proc-compose already runs
+// through `sh -c`.
+const (
+	// stubbornScript records its PID and then blocks, ignoring every catchable
+	// termination signal. Usage: stubborn.sh <pidfile>
+	stubbornScript = `#!/bin/sh
+trap '' TERM INT HUP
+echo $$ > "$1"
+FIXTURE_TTL_SECONDS=90
+deadline=$(($(date +%s) + FIXTURE_TTL_SECONDS))
+while [ "$(date +%s)" -lt "$deadline" ]; do sleep 1; done
+`
+	// stayScript is the "leader and descendant both ignore SIGTERM" shape:
+	// neither the group leader nor its descendant can be stopped politely, so
+	// the whole group needs a forced kill.
+	// Usage: stay.sh <stubbornScriptPath> <pidfile>
+	stayScript = `#!/bin/sh
+trap '' TERM INT HUP
+sh "$1" "$2" >/dev/null 2>&1 &
+trap '' TERM INT HUP
+FIXTURE_TTL_SECONDS=90
+deadline=$(($(date +%s) + FIXTURE_TTL_SECONDS))
+while [ "$(date +%s)" -lt "$deadline" ]; do sleep 1; done
+`
+	// incarnationScript models one run of a restarting command. The first
+	// incarnation backgrounds a SIGTERM-ignoring descendant and exits; every
+	// later incarnation blocks. A state file is what distinguishes them, so a
+	// test can tell the replacement process apart from the original
+	// incarnation's surviving descendant.
+	//
+	// The descendant's output is detached so the runner's log scanner reaches
+	// EOF when the leader exits — otherwise the descendant would hold the pipe
+	// open and the test would be exercising the escaped-pipe path instead of the
+	// restart path.
+	// Usage: incarnation.sh <leaderPidFile> <stateFile> <stubbornScript> <descendantPidFile>
+	incarnationScript = `#!/bin/sh
+echo $$ > "$1"
+if [ -e "$2" ]; then
+  FIXTURE_TTL_SECONDS=90
+  deadline=$(($(date +%s) + FIXTURE_TTL_SECONDS))
+  while [ "$(date +%s)" -lt "$deadline" ]; do sleep 1; done
+  exit 0
+fi
+: > "$2"
+sh "$3" "$4" >/dev/null 2>&1 &
+# Wait for the descendant to record its pid before exiting. A natural exit now
+# initiates teardown immediately, so exiting as soon as the fork returned could
+# have the whole group killed before the descendant started, and the restart test
+# would then wait on a pidfile nothing was going to write.
+i=0
+while [ "$i" -lt 400 ]; do
+  [ -s "$4" ] && break
+  sleep 0.05
+  i=$((i + 1))
+done
+exit 0
+`
+
+	// escapeScript starts a descendant in a brand-new session, so it leaves the
+	// process group entirely and can no longer be reached by any group-wide
+	// signal. It deliberately keeps the inherited stdout: that is what makes the
+	// runner have to bound its log read and report the escape as unverified.
+	//
+	// The leader waits for the descendant to record its PID before exiting. That
+	// is not incidental: a descendant is only out of the group once setsid has
+	// run, and between fork and setsid it is still a member, so a leader that
+	// exited sooner would let the runner's teardown legitimately catch and kill
+	// it. Waiting makes the escape provably complete first, so the test measures
+	// a descendant that really escaped containment rather than one that was
+	// merely caught mid-escape.
+	// Usage: escape.sh <stubbornScriptPath> <pidfile>
+	escapeScript = `#!/bin/sh
+setsid sh "$1" "$2" &
+i=0
+while [ "$i" -lt 400 ]; do
+  [ -s "$2" ] && break
+  sleep 0.05
+  i=$((i + 1))
+done
+exit 0
+`
+
+	// spawnScript is the "parent exits first" shape: the group leader starts a
+	// descendant that ignores SIGTERM and then exits immediately. The
+	// descendant holds no pipe on stdout, so the runner's log scanner reaches
+	// EOF and cmd.Wait returns while the descendant is still running — which is
+	// exactly when a leader-only shutdown stops caring.
+	//
+	// The descendant is a fresh `sh` rather than a shell subshell on purpose:
+	// POSIX `$$` keeps the parent's PID inside a subshell, so a subshell would
+	// record the leader's already-exited PID and the test would assert on the
+	// wrong process.
+	//
+	// The leader waits for the descendant to record its pid before exiting. A
+	// natural exit now initiates teardown immediately, so a leader that exited as
+	// soon as it forked could have its whole group killed before the descendant
+	// had even started — and the test would then fail waiting for a pidfile that
+	// nothing was ever going to write. Waiting makes the survivor provably
+	// established before the leader goes, which is the situation these tests claim
+	// to be exercising.
+	// Usage: spawn.sh <stubbornScriptPath> <pidfile>
+	spawnScript = `#!/bin/sh
+trap '' TERM INT HUP
+sh "$1" "$2" >/dev/null 2>&1 &
+i=0
+while [ "$i" -lt 400 ]; do
+  [ -s "$2" ] && break
+  sleep 0.05
+  i=$((i + 1))
+done
+exit 0
+`
+)
+
+// ignoresTermination reports whether this platform can model a
+// SIGTERM-ignoring process. Windows has no SIGTERM for console apps started in
+// a new process group, so the signal-shaped shutdown tests are Unix-only;
+// Windows termination is Job Object based and covered by the shared
+// survivors/State contract in processgroup.go.
+func ignoresTermination() bool { return runtime.GOOS != "windows" }
+
+// writeScript writes a fixture script into dir and returns its path.
+func writeScript(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+		t.Fatalf("write fixture script %s: %v", name, err)
+	}
+	return path
 }
 
 func makeRunner(processes map[string]config.Process) *Runner {
@@ -991,3 +1251,1363 @@ func TestReload_SkipsCompletedTaskRestart(t *testing.T) {
 		// OK - no restart was requested
 	}
 }
+
+// ── process-tree shutdown ───────────────────────────────────────────────────
+//
+// Every test below asserts on the managed *process*, never on the runner having
+// returned, a state field having been cleared, or a port having been released.
+// All of those are consistent with a managed child still running.
+
+const shutdownGraceForTest = 1 // seconds; keeps the escalation path quick
+
+// pidIsRunning reports whether pid is still executing. A terminated but
+// unreaped process counts as gone: it cannot run code, hold a port or hold a
+// file, so treating it as alive would make these assertions flaky wherever init
+// reaps slowly.
+func pidIsRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if !daemon.IsAlive(pid) {
+		return false
+	}
+	return !pidIsTerminatedUnreaped(pid)
+}
+
+// pidIsTerminatedUnreaped reports whether pid is a zombie or already dead.
+// Linux only; elsewhere the /proc read fails and plain liveness is used.
+func pidIsTerminatedUnreaped(pid int) bool {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	closeIdx := strings.LastIndexByte(string(data), ')')
+	if closeIdx < 0 || closeIdx+2 > len(data) {
+		return false
+	}
+	fields := strings.Fields(string(data[closeIdx+2:]))
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "Z", "X", "x":
+		return true
+	}
+	return false
+}
+
+// trackProcessForCleanup guarantees the fixture is gone even when an assertion
+// fails. It signals only this exact PID — never a name pattern or a whole
+// process group — so a failing test cannot take down unrelated processes.
+//
+// The kill is attempted unconditionally rather than behind a liveness check:
+// while a failing test is unwinding, the fixture can be in any state between
+// "running" and "reaped", and a check that misreads it would leak the process.
+func trackProcessForCleanup(t *testing.T, pid int, what string) {
+	t.Helper()
+	if pid <= 0 {
+		return
+	}
+	t.Cleanup(func() {
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			t.Logf("cleanup: cannot find %s (PID %d): %v", what, pid, err)
+			return
+		}
+		if err := proc.Kill(); err != nil {
+			// Already gone: the assertion under test terminated it, which is the
+			// expected outcome and not worth reporting as a cleanup problem.
+			if !errors.Is(err, os.ErrProcessDone) {
+				t.Logf("cleanup: could not kill %s (PID %d): %v", what, pid, err)
+			}
+			return
+		}
+		t.Logf("cleanup: killed leftover %s (PID %d)", what, pid)
+	})
+}
+
+// waitForPIDFile blocks until the fixture has written its PID file, then
+// returns the recorded PID. Polling a file the fixture writes is deterministic
+// synchronisation: a fixed sleep would race on a loaded machine.
+func waitForPIDFile(t *testing.T, path string, timeout time.Duration) (int, bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
+				return pid, true
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return 0, false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// assertTerminated fails unless pid has stopped executing within timeout.
+func assertTerminated(t *testing.T, pid int, what string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for pidIsRunning(pid) {
+		if !time.Now().Before(deadline) {
+			t.Fatalf("%s (PID %d) is still running %s after shutdown", what, pid, timeout)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRun_ShutdownKillsGroupWhenDescendantIgnoresSIGTERM covers the escalation
+// path: neither the group leader nor its descendant can be stopped politely, so
+// the shutdown_timeout escalation has to reach the whole group. exec.Cmd's
+// WaitDelay only ever kills the leader, which is the bug this pins.
+func TestRun_ShutdownKillsGroupWhenDescendantIgnoresSIGTERM(t *testing.T) {
+	if !ignoresTermination() {
+		t.Skip("Windows has no SIGTERM for console apps; termination is Job Object based")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "descendant.pid")
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	stay := writeScript(t, dir, "stay.sh", stayScript)
+
+	r := makeRunner(map[string]config.Process{
+		"api": {
+			Cmd:             stay + " " + stubborn + " " + pidFile,
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	descendant, ok := waitForPIDFile(t, pidFile, 20*time.Second)
+	if !ok {
+		t.Fatal("descendant never recorded its PID")
+	}
+	trackProcessForCleanup(t, descendant, "descendant")
+
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.PID > 0 }, 20*time.Second) {
+		t.Fatal("api never reported a leader PID")
+	}
+	leader := snapshotOf(r, "api").PID
+	trackProcessForCleanup(t, leader, "group leader")
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown reported failure: %v", err)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatal("runner did not finish shutting down")
+	}
+
+	assertTerminated(t, descendant, "descendant that ignored SIGTERM", 15*time.Second)
+	assertTerminated(t, leader, "group leader that ignored SIGTERM", 15*time.Second)
+}
+
+// TestRun_RestartAccountsForPreviousIncarnation covers the restart contract: a
+// restart must not forget the previous incarnation's group, whose descendants can
+// still be running. Asserting only on the new incarnation would pass while the
+// original's child leaked.
+func TestRun_RestartAccountsForPreviousIncarnation(t *testing.T) {
+	if !ignoresTermination() {
+		t.Skip("Windows has no SIGTERM for console apps; termination is Job Object based")
+	}
+	dir := t.TempDir()
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	incarnation := writeScript(t, dir, "incarnation.sh", incarnationScript)
+
+	leaderFile := filepath.Join(dir, "leader.pid")
+	state := filepath.Join(dir, "restarted")
+	descendant := filepath.Join(dir, "descendant.pid")
+
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			// First incarnation backgrounds a stubborn descendant and exits; the
+			// replacement then blocks, so the two can be told apart.
+			Cmd:             incarnation + " " + leaderFile + " " + state + " " + stubborn + " " + descendant,
+			Restart:         "always",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+		"keeper": {
+			Cmd:             helperCmd("sleep", "120s"),
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	firstLeader, ok := waitForPIDFile(t, leaderFile, 20*time.Second)
+	if !ok {
+		t.Fatal("first incarnation never recorded its leader PID")
+	}
+	trackProcessForCleanup(t, firstLeader, "first incarnation leader")
+
+	original, ok := waitForPIDFile(t, descendant, 20*time.Second)
+	if !ok {
+		t.Fatal("first incarnation never recorded its descendant PID")
+	}
+	trackProcessForCleanup(t, original, "first incarnation descendant")
+
+	// Wait for the replacement incarnation to be running, so the restart path is
+	// definitely exercised rather than merely possible. Each incarnation rewrites
+	// the same leader file, so a changed PID is the signal that a new one started.
+	var replacement int
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		replacement, _ = waitForPIDFile(t, leaderFile, time.Second)
+		if replacement != 0 && replacement != firstLeader && pidIsRunning(replacement) {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("replacement incarnation never started (restarts=%d, leader=%d, first=%d)",
+				snapshotOf(r, "worker").Restarts, replacement, firstLeader)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	trackProcessForCleanup(t, replacement, "replacement incarnation leader")
+	if replacement == original {
+		t.Fatalf("replacement leader (%d) collided with the original descendant PID", replacement)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(40 * time.Second):
+		t.Fatal("runner did not finish shutting down")
+	}
+
+	// The first incarnation's descendant ignored SIGTERM and its leader had
+	// already exited, so only the group SIGKILL proves the restart did not lose
+	// it. This is the acceptance condition that reporting a survivor used to
+	// satisfy instead of terminating it.
+	assertTerminated(t, original, "first incarnation's descendant across a restart", 15*time.Second)
+	if verdict := r.ShutdownResult(); verdict != nil {
+		t.Fatalf("restart and stop reported %v although the first incarnation's descendant "+
+			"(PID %d) was terminated", verdict, original)
+	}
+}
+
+// TestRun_ShutdownReportsNoSurvivorWhenProcessesExitCleanly guards the opposite
+// direction: a clean stack must not be reported as a failed termination.
+func TestRun_ShutdownReportsNoSurvivorWhenProcessesExitCleanly(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"svc": {
+			Cmd:             helperCmd("sleep", "120s"),
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	if !waitForProcState(t, r, "svc", func(s ipc.ProcState) bool { return s.PID > 0 }, 20*time.Second) {
+		t.Fatal("svc never started")
+	}
+	pid := snapshotOf(r, "svc").PID
+	trackProcessForCleanup(t, pid, "svc")
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("clean shutdown reported failure: %v", err)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatal("runner did not finish shutting down")
+	}
+	assertTerminated(t, pid, "svc", 15*time.Second)
+}
+
+// TestRun_ShutdownWithAlreadyExitedProcess pins already-exited handling: a
+// process that finished before the shutdown arrives is a non-event. It must not
+// turn the stop into a failure, and it must not cause anything to be signalled
+// on its behalf.
+func TestRun_ShutdownWithAlreadyExitedProcess(t *testing.T) {
+	dir := t.TempDir()
+	gonePIDFile := filepath.Join(dir, "gone.pid")
+
+	r := makeRunner(map[string]config.Process{
+		"gone": {
+			Cmd:     helperCmd("record-and-exit", gonePIDFile),
+			Restart: "never",
+		},
+		"keeper": {
+			Cmd:             helperCmd("sleep", "120s"),
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	gonePID, ok := waitForPIDFile(t, gonePIDFile, 20*time.Second)
+	if !ok {
+		t.Fatal("process never recorded its PID")
+	}
+	if !waitForProcState(t, r, "gone", func(s ipc.ProcState) bool { return s.State == "exited" }, 20*time.Second) {
+		t.Fatal("gone never reported itself exited")
+	}
+	if !waitForProcState(t, r, "keeper", func(s ipc.ProcState) bool { return s.PID > 0 }, 20*time.Second) {
+		t.Fatal("keeper never started")
+	}
+	keeperPID := snapshotOf(r, "keeper").PID
+	trackProcessForCleanup(t, keeperPID, "keeper")
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown of an already-exited process reported failure: %v", err)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatal("runner did not finish shutting down")
+	}
+	assertTerminated(t, keeperPID, "keeper", 15*time.Second)
+	t.Logf("already-exited PID %d handled without error or stray signals", gonePID)
+}
+
+// TestProcessGroup_ClosedGroupIsNeverSignalled pins the identity discipline for
+// the zero-handle cases. On Unix a zero or negative PID is not "no group", it
+// means "my own process group" or "every process" to kill(2), so a handle that
+// was never claimed — or has been closed — must refuse to signal rather than
+// fall back to a stale identifier.
+func TestProcessGroup_ClosedGroupIsNeverSignalled(t *testing.T) {
+	// What a closed group reports differs by platform, and both answers are
+	// honest. Unix still holds a numeric identifier it can consult and finds
+	// nothing; Windows has released its only handle, so nothing can be queried
+	// and it says so rather than claiming a verification it cannot make.
+	closedGroupState := GroupEmpty
+	if runtime.GOOS == "windows" {
+		closedGroupState = GroupUnavailable
+	}
+
+	t.Run("never tracked", func(t *testing.T) {
+		pg := newProcessGroup()
+		if got := pg.State(); got != GroupEmpty {
+			t.Fatalf("State() on an untracked group = %v, want %v", got, GroupEmpty)
+		}
+		if err := pg.Terminate(); !errors.Is(err, os.ErrProcessDone) {
+			t.Fatalf("Terminate() on an untracked group = %v, want os.ErrProcessDone", err)
+		}
+		if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
+			t.Fatalf("Kill() on an untracked group = %v, want os.ErrProcessDone", err)
+		}
+		// Nothing to report: with no identifier there is nothing that could
+		// still be running under our management.
+		if err := survivorsError(groupResult("untracked", pg, GroupEmpty)); err != nil {
+			t.Fatalf("survivorsError() on an untracked group = %v, want nil", err)
+		}
+	})
+
+	t.Run("after close", func(t *testing.T) {
+		// A command that exits immediately: by the time the group is closed,
+		// the group it identified is genuinely gone. CommandContext is required
+		// because Setup assigns cmd.Cancel.
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRunnerHelperProcess$")
+		cmd.Args = strings.Split(helperCmd("exit", "0"), " ")
+		pg := newProcessGroup()
+		pg.Setup(cmd)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		if err := pg.Track(cmd); err != nil {
+			t.Fatalf("track: %v", err)
+		}
+		_ = cmd.Wait()
+
+		if err := pg.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		// Close is idempotent so a double teardown cannot fail a stop.
+		if err := pg.Close(); err != nil {
+			t.Fatalf("second Close: %v", err)
+		}
+
+		if got := pg.State(); got != closedGroupState {
+			t.Fatalf("State() after Close = %v, want %v", got, closedGroupState)
+		}
+		if err := pg.Terminate(); !errors.Is(err, os.ErrProcessDone) {
+			t.Fatalf("Terminate() after Close = %v, want os.ErrProcessDone", err)
+		}
+		if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
+			t.Fatalf("Kill() after Close = %v, want os.ErrProcessDone", err)
+		}
+		// What survivorsError makes of a closed group differs too, and both are
+		// honest. Unix has no identifier left, so there is nothing to report.
+		// Windows released its only handle, so it cannot verify anything and says
+		// so — which is the point of the design: never claim a verification that
+		// cannot be made.
+		switch closedGroupState {
+		case GroupUnavailable:
+			err := survivorsError(groupResult("closed", pg, closedGroupState))
+			if err == nil || !strings.Contains(err.Error(), "unavailable") {
+				t.Fatalf("survivorsError() after Close = %v, want an unverifiable error", err)
+			}
+		default:
+			if err := survivorsError(groupResult("closed", pg, closedGroupState)); err != nil {
+				t.Fatalf("survivorsError() after Close = %v, want nil", err)
+			}
+		}
+	})
+}
+
+// TestSurvivorsError_UnavailableContainmentIsNotSuccess covers the Windows-shaped
+// failure on any platform: when no containment handle exists, nothing can be
+// verified, and that must never read as "everything terminated".
+func TestSurvivorsError_UnavailableContainmentIsNotSuccess(t *testing.T) {
+	pg := &uncontainedProcessGroup{}
+
+	if got := pg.State(); got != GroupUnavailable {
+		t.Fatalf("State() = %v, want %v", got, GroupUnavailable)
+	}
+	err := survivorsError(groupResult("wedged", pg, pg.State()))
+	if err == nil {
+		t.Fatal("survivorsError() with no containment = nil, want an unverifiable error")
+	}
+	if !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("error = %q, want it to say containment was unavailable", err)
+	}
+}
+
+type uncontainedProcessGroup struct{}
+
+func (g *uncontainedProcessGroup) Setup(_ *exec.Cmd)       {}
+func (g *uncontainedProcessGroup) Track(_ *exec.Cmd) error { return nil }
+func (g *uncontainedProcessGroup) Terminate() error        { return os.ErrProcessDone }
+func (g *uncontainedProcessGroup) Kill() error             { return os.ErrProcessDone }
+func (g *uncontainedProcessGroup) State() GroupState       { return GroupUnavailable }
+func (g *uncontainedProcessGroup) Identify() string        { return "unavailable" }
+func (g *uncontainedProcessGroup) Withdraw()               {}
+func (g *uncontainedProcessGroup) Close() error            { return nil }
+
+// startTrackedGroup starts cmdStr in its own process group and returns the
+// concrete group plus the Cmd, so a test can drive the group's own mutex. The
+// Cmd's process is registered for cleanup immediately after creation, before any
+// assertion, so no path leaks it.
+func startTrackedGroup(t *testing.T, cmdStr string) (ProcessGroup, *exec.Cmd) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
+	pg := newProcessGroup()
+	pg.Setup(cmd)
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start: %v", err)
+	}
+	if err := pg.Track(cmd); err != nil {
+		cancel()
+		t.Fatalf("track: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			// Reap it. A zombie leader keeps its process-group ID allocated,
+			// which both leaks the fixture and makes the group probe keep
+			// succeeding for a group nothing is running in.
+			_, _ = cmd.Process.Wait()
+		}
+		cancel()
+		_ = pg.Close()
+	})
+	return pg, cmd
+}
+
+// startGroupWithSurvivor starts cmdStr in its own process group and returns the
+// group, the Cmd, and the descendant's PID. It blocks until the descendant has
+// recorded its PID, so the caller never observes the group mid-fork.
+//
+// The Cmd's process is registered for cleanup immediately after creation, before
+// the wait, so no path leaks it.
+func startGroupWithSurvivor(t *testing.T, cmdStr, pidFile string) (ProcessGroup, *exec.Cmd, int) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
+	pg := newProcessGroup()
+	pg.Setup(cmd)
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start: %v", err)
+	}
+	if err := pg.Track(cmd); err != nil {
+		cancel()
+		t.Fatalf("track: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		cancel()
+		_ = pg.Close()
+	})
+
+	descendant, ok := waitForPIDFile(t, pidFile, 20*time.Second)
+	if !ok {
+		t.Fatal("descendant never recorded its PID; the fixture proves nothing")
+	}
+	return pg, cmd, descendant
+}
+
+// TestShutdown_ForceKillsManagedProcessGroupWithoutGrace proves the forced path
+// skips the graceful wait and still verifies termination: the group is killed up
+// front, but it stays registered so the final sweep can confirm the kill.
+func TestShutdown_ForceKillsManagedProcessGroupWithoutGrace(t *testing.T) {
+	if !ignoresTermination() {
+		t.Skip("Windows has no SIGTERM for console apps; termination is Job Object based")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "descendant.pid")
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	stay := writeScript(t, dir, "stay.sh", stayScript)
+
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd: stay + " " + stubborn + " " + pidFile,
+			// Long enough that only the forced kill can end this in time.
+			ShutdownTimeout: 60,
+			Restart:         "never",
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	descendant, ok := waitForPIDFile(t, pidFile, 20*time.Second)
+	if !ok {
+		t.Fatal("descendant never recorded its PID")
+	}
+	trackProcessForCleanup(t, descendant, "descendant")
+	if !waitForProcState(t, r, "worker", func(s ipc.ProcState) bool { return s.PID > 0 }, 20*time.Second) {
+		t.Fatal("worker never reported a leader PID")
+	}
+	leader := snapshotOf(r, "worker").PID
+	trackProcessForCleanup(t, leader, "group leader")
+
+	stopped, _, err := r.Shutdown(true)
+	if err != nil {
+		t.Fatalf("Shutdown(force): %v", err)
+	}
+	select {
+	case <-stopped:
+	case <-time.After(40 * time.Second):
+		t.Fatal("forced shutdown did not complete")
+	}
+
+	if err := r.ShutdownResult(); err != nil {
+		t.Fatalf("forced shutdown reported survivors: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Run reported failure after a forced shutdown: %v", err)
+	}
+
+	assertTerminated(t, descendant, "descendant", 15*time.Second)
+	assertTerminated(t, leader, "group leader", 15*time.Second)
+}
+
+// publishSweepVerdict stands in for the tail of Runner.Run: on cancellation it
+// sweeps the still-tracked groups and then publishes the verdict, which is the
+// ordering the IPC shutdown handler depends on. It lets the survivor-reporting
+// tests drive the real code path without starting real processes. The order
+// matters and matches endRun: verdict first, then the completion signal.
+func publishSweepVerdict(r *Runner, runCtx context.Context) {
+	<-runCtx.Done()
+	r.sweepGroups(runCtx)
+	verdict := r.ShutdownResult()
+
+	r.stopMu.Lock()
+	stopped := r.stopped
+	stopVerdict := r.stopVerdict
+	r.stopped = nil
+	r.stopVerdict = nil
+	r.stopMu.Unlock()
+
+	if stopVerdict != nil {
+		select {
+		case stopVerdict <- verdict:
+		default:
+		}
+	}
+	if stopped != nil {
+		close(stopped)
+	}
+}
+
+// unstoppableProcessGroup always reports itself as alive, modelling a managed
+// process that survives both the graceful signal and the forced kill.
+type unstoppableProcessGroup struct{}
+
+func (g *unstoppableProcessGroup) Setup(_ *exec.Cmd)       {}
+func (g *unstoppableProcessGroup) Track(_ *exec.Cmd) error { return nil }
+func (g *unstoppableProcessGroup) Terminate() error        { return nil }
+func (g *unstoppableProcessGroup) Kill() error             { return nil }
+func (g *unstoppableProcessGroup) State() GroupState       { return GroupOwned }
+func (g *unstoppableProcessGroup) Identify() string        { return "41234" }
+func (g *unstoppableProcessGroup) Withdraw()               {}
+func (g *unstoppableProcessGroup) Close() error            { return nil }
+
+// TestShutdown_ReportsSurvivorItCannotTerminate covers the reporting
+// requirement from the daemon's side: a managed process that provably cannot be
+// killed must be named in the verdict rather than silently reported as a clean
+// stop.
+func TestShutdown_ReportsSurvivorItCannotTerminate(t *testing.T) {
+	r := &Runner{}
+	r.trackGroup("wedged", &unstoppableProcessGroup{}, shutdownGraceForTest)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.beginRun(ctx, cancel)
+	go publishSweepVerdict(r, ctx)
+
+	stopped, _, err := r.Shutdown(false)
+	if err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	<-stopped
+
+	if got := r.ShutdownResult(); got == nil {
+		t.Fatal("ShutdownResult() = nil, want an error naming the survivor")
+	} else if !strings.Contains(got.Error(), "wedged") {
+		t.Fatalf("ShutdownResult() = %q, want it to name the surviving process", got)
+	}
+}
+
+// TestHandleShutdown_ReportsPartialWithSurvivors proves the "stopped, but not
+// everything died" verdict is distinct from both ok and error, so a caller
+// cannot mistake it for a clean stop.
+func TestHandleShutdown_ReportsPartialWithSurvivors(t *testing.T) {
+	r := &Runner{}
+	r.trackGroup("wedged", &unstoppableProcessGroup{}, shutdownGraceForTest)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.beginRun(ctx, cancel)
+	go publishSweepVerdict(r, ctx)
+
+	res := r.handleShutdown(ipc.Command{Action: "shutdown"})
+	if res.Status != "partial" {
+		t.Fatalf("handleShutdown status = %q (%s), want partial", res.Status, res.Message)
+	}
+	if !strings.Contains(res.Message, "wedged") {
+		t.Fatalf("handleShutdown message = %q, want it to name the survivor", res.Message)
+	}
+}
+
+// TestHandleShutdown_ReportsOKAfterCleanStop drives the IPC-facing handler that
+// `proc-compose stop` and `stop --force` both depend on.
+func TestHandleShutdown_ReportsOKAfterCleanStop(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"svc": {
+			Cmd:             helperCmd("sleep", "120s"),
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	if !waitForProcState(t, r, "svc", func(s ipc.ProcState) bool { return s.PID > 0 }, 20*time.Second) {
+		t.Fatal("svc never started")
+	}
+	pid := snapshotOf(r, "svc").PID
+	trackProcessForCleanup(t, pid, "svc")
+
+	res := r.handleShutdown(ipc.Command{Action: "shutdown"})
+	if res.Status != "ok" {
+		t.Fatalf("handleShutdown status = %q (%s), want ok", res.Status, res.Message)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Run reported failure: %v", err)
+	}
+	assertTerminated(t, pid, "svc", 15*time.Second)
+}
+
+// TestHandleShutdown_RejectsWhenNothingIsRunning keeps a stale `stop` from
+// reporting a clean shutdown for a stack that is not there.
+func TestHandleShutdown_RejectsWhenNothingIsRunning(t *testing.T) {
+	r := &Runner{}
+	res := r.handleShutdown(ipc.Command{Action: "shutdown"})
+	if res.Status != "error" {
+		t.Fatalf("handleShutdown status = %q, want error", res.Status)
+	}
+	if !strings.Contains(res.Message, "no stack is running") {
+		t.Fatalf("handleShutdown message = %q, want 'no stack is running'", res.Message)
+	}
+}
+
+// TestRun_EscapedDescendantIsReportedAsUnverified covers the review's setsid
+// case. A descendant that calls setsid leaves the process group, so no group-wide
+// signal can reach it. Closing the inherited log pipe lets the runner finish, but
+// that is not evidence the descendant is gone — so the shutdown must be reported
+// as unverified rather than clean.
+//
+// Without this, the group is legitimately empty, the sweep finds nothing, and the
+// stop would report success over a process that is still running.
+func TestRun_EscapedDescendantIsReportedAsUnverified(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("setsid is a Unix facility")
+	}
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid(1) not available on this host")
+	}
+	if !ignoresTermination() {
+		t.Skip("Windows has no SIGTERM for console apps; termination is Job Object based")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "escapee.pid")
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	escape := writeScript(t, dir, "escape.sh", escapeScript)
+
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:             escape + " " + stubborn + " " + pidFile,
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+		"keeper": {
+			Cmd:             helperCmd("sleep", "120s"),
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	escapee, ok := waitForPIDFile(t, pidFile, 20*time.Second)
+	if !ok {
+		t.Fatal("escaped descendant never recorded its PID")
+	}
+	// Registered immediately, before any assertion, so a failure cannot leak it.
+	trackProcessForCleanup(t, escapee, "escaped descendant")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("runner did not finish shutting down")
+	}
+
+	verdict := r.ShutdownResult()
+	if verdict == nil {
+		t.Fatalf("shutdown reported success while descendant (PID %d) had escaped the process group", escapee)
+	}
+	// The message must distinguish "left the group, could not be verified" from
+	// "survived inside the group", because the two need different responses.
+	if !strings.Contains(verdict.Error(), "left the group") &&
+		!strings.Contains(verdict.Error(), "could not be verified") {
+		t.Fatalf("verdict = %q, want it to report that the descendant left the group", verdict)
+	}
+	if !pidIsRunning(escapee) {
+		t.Logf("escaped descendant %d also terminated; verdict was still reported as unverified", escapee)
+	}
+}
+
+// TestShutdown_VerdictIsDeliveredBeforeRunReturns covers the review's ack-flush
+// barrier. It pauses the point at which the verdict would reach the client and
+// asserts that Run cannot finish first: without the barrier, main would tear down
+// the IPC server and exit while the caller was still waiting to be told what
+// happened.
+func TestShutdown_VerdictIsDeliveredBeforeRunReturns(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses Unix sockets for the IPC server")
+	}
+
+	r := makeRunner(map[string]config.Process{
+		"svc": {
+			Cmd:             helperCmd("sleep", "120s"),
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+
+	socketPath, server, stopServer := ipcServerForTest(t)
+	defer stopServer()
+	r.IPC = server
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- r.Run(ctx) }()
+
+	if !waitForProcState(t, r, "svc", func(s ipc.ProcState) bool { return s.PID > 0 }, 20*time.Second) {
+		t.Fatal("svc never started")
+	}
+	pid := snapshotOf(r, "svc").PID
+	trackProcessForCleanup(t, pid, "svc")
+
+	client, err := ipc.Dial(socketPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.Send(ipc.Command{Action: "shutdown", Force: true}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	// Consume events until the ack arrives; this is what a real `stop` does.
+	var ack ipc.Event
+	for {
+		ev, recvErr := client.Recv()
+		if recvErr != nil {
+			t.Fatalf("recv: %v", recvErr)
+		}
+		if ev.Type == ipc.TypeAck {
+			ack = ev
+			break
+		}
+	}
+
+	// The verdict must be in the ack, not merely inferred from Run returning.
+	if ack.Ack == "ok" {
+		if msg := ack.AckDetail; msg != "" {
+			t.Fatalf("ack ok carries a complaint: %q", msg)
+		}
+	}
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("runner did not exit after a verified shutdown")
+	}
+}
+
+// TestAckBarrier_SealStopsLateHolders proves the barrier cannot be entered after
+// it is sealed. This is what removes the WaitGroup misuse: a WaitGroup's Wait may
+// return before a concurrent Add, so a late shutdown command could have held up
+// — or raced past — an already-finishing run.
+func TestAckBarrier_SealStopsLateHolders(t *testing.T) {
+	var b ackBarrier
+
+	if !b.enter() {
+		t.Fatal("enter() on an open barrier = false, want true")
+	}
+	// A holder is present, so sealing must wait for it.
+	sealed := make(chan struct{})
+	go func() {
+		b.sealAndWait(2 * time.Second)
+		close(sealed)
+	}()
+
+	// Once sealed, no new holder may enter.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if !b.enter() {
+			break
+		}
+		b.leave()
+		if time.Now().After(deadline) {
+			t.Fatal("barrier never sealed while a holder was present")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Releasing the last holder must satisfy the seal.
+	b.leave()
+	select {
+	case <-sealed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sealAndWait did not return after the last holder left")
+	}
+
+	// And it must be idempotent.
+	b.sealAndWait(time.Millisecond)
+}
+
+// TestEndRun_CannotOvertakeAnInFlightVerdict is the deterministic half of the
+// ack-flush proof. A real client cannot be made to pause mid-write, so the
+// barrier is exercised directly: while a holder is still inside its flush window,
+// endRun must not complete. If it did, main would tear the IPC server down while
+// the caller was still waiting to be told what happened — the exact ordering bug
+// the review describes.
+func TestEndRun_CannotOvertakeAnInFlightVerdict(t *testing.T) {
+	r := &Runner{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.beginRun(ctx, cancel)
+
+	if !r.stopAck.enter() {
+		t.Fatal("could not enter the ack barrier")
+	}
+
+	endDone := make(chan struct{})
+	go func() {
+		r.endRun()
+		close(endDone)
+	}()
+
+	// The holder is still "delivering"; teardown must block on it.
+	select {
+	case <-endDone:
+		t.Fatal("endRun completed while a shutdown verdict was still undelivered")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	// Once the holder reports delivery, teardown proceeds.
+	r.stopAck.leave()
+	select {
+	case <-endDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("endRun did not complete after the verdict was delivered")
+	}
+}
+
+// TestEndRun_PublishesVerdictBeforeSignallingCompletion pins the ordering the
+// shutdown handler depends on: the verdict must be available on the channel
+// before the completion signal fires, otherwise a waiting handler would deadlock
+// or fall back to "no verdict".
+func TestEndRun_PublishesVerdictBeforeSignallingCompletion(t *testing.T) {
+	r := &Runner{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.beginRun(ctx, cancel)
+
+	stopped, verdictCh, err := r.Shutdown(false)
+	if err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// Shutdown cancelled the run context, so endRun runs on its own.
+	endDone := make(chan struct{})
+	go func() {
+		r.endRun()
+		close(endDone)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown never signalled completion")
+	}
+
+	// Reading the verdict must not block: it is published with the completion
+	// signal, never after it.
+	select {
+	case verdict := <-verdictCh:
+		if verdict != nil {
+			t.Fatalf("clean stack published verdict %v, want nil", verdict)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("verdict was not available when completion was signalled")
+	}
+
+	select {
+	case <-endDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("endRun did not complete")
+	}
+}
+
+// TestShutdown_IPCPathReleasesTheAckBarrier pins barrier ownership on the path
+// that actually holds it. Only handleCommands can see both the reply and the
+// flush, so it — not handleShutdown — must acquire and release the barrier. If
+// the release is left to the wrong frame, Run's exit stalls for the whole flush
+// timeout after every stop.
+//
+// The command therefore has to travel through a real IPC server: a direct
+// handleShutdown call cannot reach the defect. The bound is on elapsed time,
+// which is what distinguishes a stall from a prompt exit; a fixed sleep would
+// not.
+func TestShutdown_IPCPathReleasesTheAckBarrier(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses Unix sockets for the IPC server")
+	}
+
+	r := makeRunner(map[string]config.Process{
+		"svc": {
+			Cmd:             helperCmd("sleep", "120s"),
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+	socketPath, server, stopServer := ipcServerForTest(t)
+	defer stopServer()
+	r.IPC = server
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- r.Run(ctx) }()
+
+	if !waitForProcState(t, r, "svc", func(s ipc.ProcState) bool { return s.PID > 0 }, 20*time.Second) {
+		t.Fatal("svc never started")
+	}
+	pid := snapshotOf(r, "svc").PID
+	trackProcessForCleanup(t, pid, "svc")
+
+	client, err := ipc.Dial(socketPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	if err := client.Send(ipc.Command{Action: "shutdown", Force: true}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	for {
+		ev, recvErr := client.Recv()
+		if recvErr != nil {
+			t.Fatalf("recv: %v", recvErr)
+		}
+		if ev.Type == ipc.TypeAck {
+			if ev.Ack != "ok" {
+				t.Fatalf("ack = %q (%s), want ok", ev.Ack, ev.AckDetail)
+			}
+			break
+		}
+	}
+
+	start := time.Now()
+	select {
+	case <-runDone:
+	case <-time.After(shutdownFlushTimeout + 5*time.Second):
+		t.Fatal("Run did not exit after a shutdown delivered over IPC")
+	}
+	if elapsed := time.Since(start); elapsed > shutdownFlushTimeout/2 {
+		t.Fatalf("Run took %s to exit after the verdict was delivered; the ack barrier looks "+
+			"held (flush timeout is %s)", elapsed, shutdownFlushTimeout)
+	}
+	assertTerminated(t, pid, "svc", 15*time.Second)
+}
+
+// ── output EOF is not command exit ───────────────────────────────────────────
+//
+// A managed command's log stream can finish long before the command does: a
+// config that redirects or closes its own output leaves the runner's pipe with
+// no writer at all. Reaching the end of the stream is therefore not evidence of
+// exit, and must never terminate anything.
+
+// TestRun_EOFDoesNotTerminateAHealthyService is the finding-1 regression.
+//
+// The helper closes both output streams immediately, so the runner's log pipe
+// reaches EOF while the service is still working. It then proves continued work
+// on a deterministic non-output channel (the ready file) and exits only when
+// released. Reaching the end of the output stream must not terminate it.
+func TestRun_EOFDoesNotTerminateAHealthyService(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "svc.pid")
+	working := filepath.Join(dir, "working")
+	release := filepath.Join(dir, "release")
+
+	// The leading "exec >/dev/null 2>&1" is applied by the leader shell to itself,
+	// which is what makes EOF arrive while the service is still running. Merely
+	// appending a redirect to the command would not: the shell forks, and the
+	// forked leader keeps holding the log pipe, so EOF would only arrive once the
+	// command had already finished.
+	cmd := "exec >/dev/null 2>&1; " + helperCmd("quiet-loop", pidFile, working, release)
+
+	r := makeRunner(map[string]config.Process{
+		"svc": {
+			Cmd:             cmd,
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	pid, ok := waitForPIDFile(t, pidFile, 20*time.Second)
+	if !ok {
+		t.Fatal("service never recorded its PID")
+	}
+	trackProcessForCleanup(t, pid, "service")
+
+	// The ready file is the non-output channel: it exists only once the streams
+	// are closed, so the service is provably past EOF by the time it appears.
+	waitForFilePresent(t, working, 20*time.Second)
+
+	// Give any (incorrect) EOF-driven teardown ample time to act.
+	time.Sleep(2 * time.Second)
+
+	if !pidIsRunning(pid) {
+		t.Fatalf("service (PID %d) was terminated after its output ended; EOF is not "+
+			"evidence that the command exited", pid)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("runner returned (%v) while the service was still running", err)
+	default:
+	}
+
+	// Now actually stop it, and require that this — not EOF — is what ends it.
+	if err := os.WriteFile(release, []byte("go"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown reported failure: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("runner did not stop after the service was released")
+	}
+	assertTerminated(t, pid, "service", 15*time.Second)
+	if err := r.ShutdownResult(); err != nil {
+		t.Fatalf("a cleanly stopped service was reported as a problem: %v", err)
+	}
+}
+
+// TestRun_StopTerminatesAHealthyServiceThatClosedItsOutput is the other half of
+// the end-of-stream contract.
+//
+// The companion test proves that EOF does not terminate a healthy service. This
+// one proves the converse, which is what the old design got wrong: reaching EOF
+// must not withdraw shutdown authority, so an ordinary stop still escalates all
+// the way to the group SIGKILL and the service really dies.
+//
+// The fixture closes its streams and then ignores SIGTERM, so the only thing
+// that can end it is a group-wide kill after the grace period.
+func TestRun_StopTerminatesAHealthyServiceThatClosedItsOutput(t *testing.T) {
+	if !ignoresTermination() {
+		t.Skip("Windows terminates through the Job Object; there is no SIGTERM to ignore")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "svc.pid")
+
+	// The redirect is applied by the leader shell to itself, which is what makes
+	// the runner's log pipe reach EOF while the command is still running.
+	cmd := "exec >/dev/null 2>&1; " + helperCmd("quiet-stubborn", pidFile)
+
+	r := makeRunner(map[string]config.Process{
+		"svc": {
+			Cmd:             cmd,
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	pid, ok := waitForPIDFile(t, pidFile, 20*time.Second)
+	if !ok {
+		t.Fatal("service never recorded its PID")
+	}
+	trackProcessForCleanup(t, pid, "service")
+
+	// Give the log reader time to see EOF, so the stop below provably happens
+	// after the output has already ended.
+	time.Sleep(2 * time.Second)
+	if !pidIsRunning(pid) {
+		t.Fatalf("service (PID %d) was terminated before any stop was requested", pid)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown reported failure: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("runner did not stop")
+	}
+
+	assertTerminated(t, pid, "service that closed its output and ignored SIGTERM", 15*time.Second)
+	if verdict := r.ShutdownResult(); verdict != nil {
+		t.Fatalf("shutdown reported %v although the service was terminated", verdict)
+	}
+}
+
+// TestSurvivorsError_AlwaysNamesTheGroup guards the diagnostic contract// TestSurvivorsError_AlwaysNamesTheGroup guards the diagnostic contract: a
+// survivor report has to identify what could not be terminated even when the
+// members could not be enumerated.
+func TestSurvivorsError_AlwaysNamesTheGroup(t *testing.T) {
+	err := survivorsError([]GroupResult{{
+		Name:  "api",
+		PGID:  41234,
+		State: GroupOwned,
+	}})
+	if err == nil {
+		t.Fatal("survivorsError() on an owned group with no enumerated members = nil, want an error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"api", "41234", "could not terminate"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error = %q, want it to contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "<nil>") {
+		t.Fatalf("error = %q, want no unrendered member list", msg)
+	}
+}
+
+// TestSignallingEstablished_UnsupportedObservationRevokesAuthority pins the
+// other-Unix fallback: an exit seen only by reaping is not authority, because
+// reaping is what releases the leader's process-table slot.
+func TestSignallingEstablished_UnsupportedObservationRevokesAuthority(t *testing.T) {
+	if durableContainment {
+		t.Skip("this platform's containment survives the leader's exit")
+	}
+	if signallingEstablished(exitUnsupported, false) {
+		t.Fatal("signallingEstablished(exitUnsupported, running) = true, want false: " +
+			"reaping released the reservation the identifier depended on")
+	}
+	if !signallingEstablished(exitUnsupported, true) {
+		t.Fatal("signallingEstablished(exitUnsupported, cancelled) = false, want true: " +
+			"a cancelled command's unreaped group is still ours to signal")
+	}
+}
+
+// TestSurvivorsError_UnavailableContainmentNamesTheGroup keeps the unavailable
+// case informative.
+func TestSurvivorsError_UnavailableContainmentNamesTheGroup(t *testing.T) {
+	err := survivorsError([]GroupResult{{Name: "svc", State: GroupUnavailable}})
+	if err == nil {
+		t.Fatal("survivorsError() on an unavailable group = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("error = %q, want it to say containment was unavailable", err.Error())
+	}
+	if strings.Contains(err.Error(), "<nil>") {
+		t.Fatalf("error = %q, want no unrendered member list", err.Error())
+	}
+}
+
+func waitForFilePresent(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("timed out after %s waiting for %s", timeout, path)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRun_NaturalExitWithLiveDescendantIsTerminated is the acceptance test for
+// the whole design: a command that backgrounds work and then exits naturally
+// still owns that work, and proc-compose must terminate it rather than merely
+// report it.
+//
+// The descendant ignores SIGTERM, so this also proves the escalation reaches the
+// whole group after the leader has already gone. That is only sound because the
+// leader is reaped last: while it is an unreaped zombie it keeps its
+// process-table slot, and its PID — the process-group ID — cannot have been
+// handed to anything else.
+func TestRun_NaturalExitWithLiveDescendantIsTerminated(t *testing.T) {
+	if !ignoresTermination() {
+		t.Skip("Windows has no SIGTERM for console apps; termination is Job Object based")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "descendant.pid")
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	spawn := writeScript(t, dir, "spawn.sh", spawnScript)
+
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:             spawn + " " + stubborn + " " + pidFile,
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+		"keeper": {
+			Cmd:             helperCmd("sleep", "120s"),
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	descendant, ok := waitForPIDFile(t, pidFile, 20*time.Second)
+	if !ok {
+		t.Fatal("worker descendant never recorded its PID")
+	}
+	trackProcessForCleanup(t, descendant, "worker descendant")
+
+	if !waitForProcState(t, r, "worker", func(s ipc.ProcState) bool { return s.State == "exited" }, 20*time.Second) {
+		t.Fatal("worker never reported its leader as exited")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown reported failure: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("runner did not finish shutting down")
+	}
+
+	// The descendant ignored SIGTERM, so only the group SIGKILL after the leader
+	// had already exited can have ended it.
+	assertTerminated(t, descendant, "same-group descendant of a naturally exited leader", 15*time.Second)
+	if verdict := r.ShutdownResult(); verdict != nil {
+		t.Fatalf("shutdown reported %v although descendant (PID %d) was terminated", verdict, descendant)
+	}
+}
+
+// TestRun_CleanServiceExitIsNotReportedAsSurvivor guards the opposite direction:
+// the ordinary exit path must not manufacture a survivor. This is the case that
+// would break if the group were judged before the reap, where a
+// terminated-but-unreaped leader still makes the group look populated.
+func TestRun_CleanServiceExitIsNotReportedAsSurvivor(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "svc.pid")
+	script := writeScript(t, dir, "quick.sh", quickExitScript)
+
+	r := makeRunner(map[string]config.Process{
+		"svc": {Cmd: script + " " + pidFile, Restart: "never"},
+	})
+
+	start := time.Now()
+	err := r.Run(context.Background())
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("clean exit reported failure: %v", err)
+	}
+	if err := r.ShutdownResult(); err != nil {
+		t.Fatalf("clean exit produced a shutdown verdict: %v", err)
+	}
+	// A false survivor would have to burn the whole grace and kill-settle budget
+	// before being reported, so the elapsed time proves the group was judged
+	// immediately rather than after a stall.
+	if elapsed > 2*time.Second {
+		t.Fatalf("clean exit took %s; the group was probably judged before the leader was reaped", elapsed)
+	}
+	pid, _ := waitForPIDFile(t, pidFile, 2*time.Second)
+	if pid > 0 && pidIsRunning(pid) {
+		t.Fatalf("service (PID %d) outlived its own exit", pid)
+	}
+}
+
+// quickExitScript records its PID and exits immediately, leaving nothing behind.
+const quickExitScript = `#!/bin/sh
+echo $$ > "$1"
+exit 0
+`

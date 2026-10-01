@@ -41,7 +41,16 @@ func sanitizeSocketPath(path string) string {
 
 // Dial connects to the daemon at socketPath.
 func Dial(socketPath string) (*Client, error) {
-	conn, err := dialAddr(socketPath, 2*time.Second)
+	return DialTimeout(socketPath, 2*time.Second)
+}
+
+// DialTimeout connects to the daemon at socketPath, giving up after d.
+//
+// Callers that share one overall budget across several phases need the
+// connection attempt to draw from it rather than impose a fixed cost of their
+// own; that is the difference between a bounded stop and an unbounded one.
+func DialTimeout(socketPath string, d time.Duration) (*Client, error) {
+	conn, err := dialAddr(socketPath, d)
 	if err != nil {
 		return nil, fmt.Errorf("no proc-compose daemon running (socket: %s)", sanitizeSocketPath(socketPath))
 	}
@@ -99,14 +108,55 @@ func (c *Client) RecvTimeout(d time.Duration) (Event, error) {
 
 // Send sends a command to the daemon.
 func (c *Client) Send(cmd Command) error {
+	_, err := c.send(cmd, 0)
+	return err
+}
+
+// SendTimeout sends a command, giving up if the write has not completed within d.
+//
+// A plain conn.Write on a Unix socket can block indefinitely once the peer's
+// receive buffer is full and it has stopped reading — a daemon that is wedged
+// mid-shutdown, for instance. A caller that has given itself an overall budget
+// needs the request itself to draw from it, which is the difference between a
+// bounded command and one that hangs.
+//
+// As with RecvTimeout, a zero d means no deadline, so Send's behaviour is
+// unchanged for existing callers.
+// SendTimeout writes one command under a write deadline.
+//
+// A non-positive budget is rejected rather than treated as "no deadline": a
+// caller that computed a budget from an overall stop deadline must not be able
+// to spend an exhausted budget on an unbounded write. Callers that genuinely
+// want no deadline use Send.
+func (c *Client) SendTimeout(cmd Command, d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("send: write budget of %s is exhausted; refusing to write without a deadline", d)
+	}
+	_, err := c.send(cmd, d)
+	return err
+}
+
+// send writes one command. d <= 0 leaves the connection's write deadline unset,
+// which is only reachable through Send.
+func (c *Client) send(cmd Command, d time.Duration) (int, error) {
 	ev := Event{Type: TypeCommand, Cmd: &cmd}
 	data, err := json.Marshal(ev)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	data = append(data, '\n')
-	_, err = c.conn.Write(data)
-	return err
+	if d > 0 {
+		if err := c.conn.SetWriteDeadline(time.Now().Add(d)); err != nil {
+			return 0, fmt.Errorf("set write deadline: %w", err)
+		}
+	}
+	n, err := c.conn.Write(data)
+	if d > 0 {
+		if derr := c.conn.SetWriteDeadline(time.Time{}); derr != nil && err == nil {
+			err = fmt.Errorf("clear write deadline: %w", derr)
+		}
+	}
+	return n, err
 }
 
 // Close closes the connection.

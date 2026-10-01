@@ -195,9 +195,9 @@ func checkOptionalBinaries(cfg *config.Config) error {
 	if cfg.Merge != nil {
 		if !mergePortInPath() {
 			return fmt.Errorf(
-				"merge-port is required for merge: config but was not found in PATH. "+
-					"Install it with brokit install merge-port, "+
-					"install from https://github.com/anivaryam/merge-port, "+
+				"merge-port is required for merge: config but was not found in PATH. " +
+					"Install it with brokit install merge-port, " +
+					"install from https://github.com/anivaryam/merge-port, " +
 					"or remove the merge: section.",
 			)
 		}
@@ -274,6 +274,227 @@ func waitForDaemonReady(pid int, socketPath, logPath string, timeout time.Durati
 			)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// stopOutcome is what the daemon told us about its own shutdown.
+type stopOutcome int
+
+const (
+	// stopVerified means the daemon confirmed every managed process group was
+	// emptied and nothing escaped verification.
+	stopVerified stopOutcome = iota
+	// stopUnverified means the daemon reported that termination could not be
+	// fully established, or that it never reported at all.
+	stopUnverified
+	// stopUnavailable means the daemon could not be asked over IPC, so nothing
+	// is known about its managed processes.
+	stopUnavailable
+)
+
+// stopResult carries the outcome plus the daemon's own explanation, which is the
+// only account of what could not be terminated.
+type stopResult struct {
+	outcome stopOutcome
+	detail  string
+}
+
+// stopBudget fractions. The whole stop shares one deadline; these decide how
+// much of it each phase may consume so no single phase can starve the others.
+const (
+	// connectBudget caps Dial, which has its own internal bound but would
+	// otherwise be unbounded from the caller's point of view.
+	connectBudget = 2 * time.Second
+	// exitBudget is reserved for confirming the daemon process itself is gone
+	// after a successful verdict.
+	exitBudget = 2 * time.Second
+)
+
+// stopDaemon stops the daemon for this config and returns a verified result.
+//
+// force asks the daemon to force-terminate its managed process groups instead of
+// signalling them first. Both variants go through the daemon's own shutdown so
+// the verdict comes from the only process that knows which groups it manages;
+// observing the daemon merely disappearing would prove nothing about them.
+//
+// The whole operation shares one deadline. Connecting, waiting for the verdict
+// and confirming the daemon exited all draw from it, so `stop` cannot block
+// past --timeout even against a connected but unresponsive daemon.
+func stopDaemon(socketPath, pidPath string, pid int, proc *os.Process, force bool, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	res := requestShutdown(socketPath, force, deadline)
+	switch res.outcome {
+	case stopVerified:
+		// A verified verdict still requires the daemon to actually finish
+		// exiting, within whatever is left of the budget.
+		if waitProcessGone(pid, remainingUntil(deadline, exitBudget)) {
+			daemon.Cleanup(pidPath, socketPath)
+			fmt.Printf("stopped proc-compose daemon (PID %d)\n", pid)
+			return nil
+		}
+		return fmt.Errorf("daemon (PID %d) reported a clean shutdown but is still running %s "+
+			"after its verdict; managed processes were not re-checked", pid, timeout)
+
+	case stopUnverified:
+		// Finish the job, but never claim the tree is gone. The verdict detail is
+		// the only account of what could not be terminated, so it leads the
+		// message rather than being buried in it.
+		if waitProcessGone(pid, remainingUntil(deadline, exitBudget)) {
+			daemon.Cleanup(pidPath, socketPath)
+			return fmt.Errorf("stopped daemon (PID %d), but termination was NOT fully verified:\n  %s", pid, res.detail)
+		}
+		return fmt.Errorf("daemon (PID %d) is still running %s after reporting that termination was "+
+			"NOT fully verified:\n  %s", pid, timeout, res.detail)
+
+	default:
+		// No usable verdict. Signal the daemon directly so the user still gets
+		// a stopped daemon, and label the outcome for what it is.
+		fmt.Fprintf(os.Stderr,
+			"warning: could not obtain a shutdown verdict from the daemon (%s);\n"+
+				"         signalling the daemon directly — its managed processes are NOT verified.\n", res.detail)
+		return signalDaemonUnverified(pidPath, socketPath, pid, proc, force, deadline)
+	}
+}
+
+// requestShutdown asks the daemon to stop itself and waits, under deadline, for
+// the verdict.
+//
+// RecvTimeout bounds the read and is terminal on timeout (bufio.Scanner latches
+// the error), so the client is closed on every non-clean exit and no read is
+// left blocking on a connection that has gone quiet.
+func requestShutdown(socketPath string, force bool, deadline time.Time) stopResult {
+	connectBy := remainingUntil(deadline, connectBudget)
+	if connectBy <= 0 {
+		return stopResult{outcome: stopUnavailable, detail: "no time left in the stop budget to reach the daemon"}
+	}
+	client, err := ipc.DialTimeout(socketPath, connectBy)
+	if err != nil {
+		return stopResult{outcome: stopUnavailable, detail: err.Error()}
+	}
+	// Closed exactly once on every path; RecvTimeout leaves the stream
+	// unusable, so the caller must not keep reading it.
+	defer client.Close()
+
+	// The write shares the overall deadline. Without this a wedged daemon whose
+	// receive buffer is full would block the request past --timeout.
+	//
+	// The budget is checked before the write, because remainingUntil reports
+	// zero once the deadline has passed and a zero budget would otherwise be
+	// spent on an unbounded write.
+	writeBy := remainingUntil(deadline, connectBudget)
+	if writeBy <= 0 {
+		return stopResult{outcome: stopUnavailable,
+			detail: "no time left in the stop budget to send the shutdown request"}
+	}
+	if err := client.SendTimeout(ipc.Command{Action: "shutdown", Force: force}, writeBy); err != nil {
+		return stopResult{outcome: stopUnavailable, detail: err.Error()}
+	}
+
+	for {
+		budget := time.Until(deadline)
+		if budget <= 0 {
+			return stopResult{outcome: stopUnverified,
+				detail: "no verdict arrived within the stop budget"}
+		}
+		ev, recvErr := client.RecvTimeout(budget)
+		if recvErr != nil {
+			// A connected but silent daemon, or a dropped connection, must not
+			// be read as success.
+			return stopResult{outcome: stopUnverified,
+				detail: fmt.Sprintf("daemon did not report a shutdown verdict (%v)", recvErr)}
+		}
+		if ev.Type != ipc.TypeAck {
+			continue
+		}
+		switch ev.Ack {
+		case "ok":
+			return stopResult{outcome: stopVerified}
+		case "partial":
+			return stopResult{outcome: stopUnverified, detail: ev.AckDetail}
+		case "busy":
+			return stopResult{outcome: stopUnavailable, detail: "daemon is busy: " + ev.AckDetail}
+		default:
+			// Includes an older daemon rejecting the unknown action, and any
+			// daemon-side error. Either way there is no verdict to rely on.
+			return stopResult{outcome: stopUnavailable,
+				detail: fmt.Sprintf("daemon rejected the shutdown request: %s", ev.AckDetail)}
+		}
+	}
+}
+
+// signalDaemonUnverified is the compatibility fallback for daemons that cannot
+// be asked to stop themselves — an older proc-compose, or a dead socket. It gets
+// the daemon down and says plainly that its managed processes are unknown.
+//
+// force is preserved here rather than collapsed into the graceful path: `--force`
+// means "terminate now", and silently degrading it into SIGTERM-then-wait would
+// make an unresponsive daemon take the full timeout to stop even though the user
+// asked for it to be killed.
+func signalDaemonUnverified(pidPath, socketPath string, pid int, proc *os.Process, force bool, deadline time.Time) error {
+	if force {
+		if err := daemon.KillProcess(proc); err != nil {
+			return fmt.Errorf("failed to SIGKILL %d: %w", pid, err)
+		}
+		if waitProcessGone(pid, remainingUntil(deadline, exitBudget)) {
+			daemon.Cleanup(pidPath, socketPath)
+			return fmt.Errorf("killed daemon (PID %d) without asking it to stop, but its managed "+
+				"processes were NOT verified as terminated;\n  inspect for leftovers: ps -eo pid,ppid,pgid,args", pid)
+		}
+		return fmt.Errorf("daemon (PID %d) survived SIGKILL", pid)
+	}
+
+	if err := daemon.StopProcess(proc); err != nil {
+		return fmt.Errorf("failed to stop process %d: %w", pid, err)
+	}
+	if waitProcessGone(pid, time.Until(deadline)) {
+		daemon.Cleanup(pidPath, socketPath)
+		return fmt.Errorf("stopped daemon (PID %d) by signalling it directly, but its managed "+
+			"processes were NOT verified as terminated;\n  inspect for leftovers: ps -eo pid,ppid,pgid,args", pid)
+	}
+
+	if err := daemon.KillProcess(proc); err != nil {
+		return fmt.Errorf("failed to SIGKILL %d after the graceful period: %w", pid, err)
+	}
+	if waitProcessGone(pid, killSettleTimeout) {
+		daemon.Cleanup(pidPath, socketPath)
+		return fmt.Errorf("killed daemon (PID %d) after it ignored the graceful stop, but its managed "+
+			"processes were NOT verified as terminated;\n  inspect for leftovers: ps -eo pid,ppid,pgid,args", pid)
+	}
+	return fmt.Errorf("daemon (PID %d) survived SIGKILL", pid)
+}
+
+// killSettleTimeout bounds the wait for a SIGKILL to be observed. SIGKILL is
+// not catchable, so this only ever covers scheduling delay. It is deliberately
+// outside the caller's deadline: a SIGKILL cannot be declined, so waiting for it
+// to land is bounded bookkeeping rather than an unbounded request.
+const killSettleTimeout = 5 * time.Second
+
+// remainingUntil returns the time left before deadline, capped at cap and
+// floored at zero. Every phase of a stop draws from one deadline through this,
+// so no single phase can consume the whole budget.
+func remainingUntil(deadline time.Time, cap time.Duration) time.Duration {
+	left := time.Until(deadline)
+	if left <= 0 {
+		return 0
+	}
+	if left > cap {
+		return cap
+	}
+	return left
+}
+
+// waitProcessGone polls until pid is no longer running or timeout elapses.
+func waitProcessGone(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !daemon.IsAlive(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

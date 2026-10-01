@@ -201,41 +201,7 @@ func (s *Server) handle(conn net.Conn) {
 			continue
 		}
 		if ev.Type == TypeCommand && ev.Cmd != nil {
-			cmd := *ev.Cmd
-			// Attach a buffered reply channel so the runner can hand back
-			// a real verdict (ok / partial / error) instead of the client
-			// having to assume the command succeeded the moment it was
-			// queued. Buffer size 1 means the runner never blocks even if
-			// the client disconnects before reading the ack.
-			cmd.Reply = make(chan CommandResult, 1)
-
-			ack := Event{Type: TypeAck, Ack: "ok"}
-			select {
-			case s.cmdCh <- cmd:
-				// Wait for the runner's verdict. Bound the wait so a
-				// runaway runner can't pin a connection forever — 30s is
-				// well over the typical reload time.
-				select {
-				case res := <-cmd.Reply:
-					ack.Ack = res.Status
-					ack.AckDetail = res.Message
-				case <-time.After(30 * time.Second):
-					ack.Ack = "error"
-					ack.AckDetail = "timed out waiting for runner reply"
-				}
-			default:
-				// Channel full — surface the drop so callers can retry.
-				ack.Ack = "busy"
-			}
-
-			data, err := json.Marshal(ack)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "WARN: failed to marshal ack: %v\n", err)
-				continue
-			}
-			conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			conn.Write(append(data, '\n'))
-			conn.SetWriteDeadline(time.Time{})
+			s.handleCommand(conn, ev.Cmd)
 		}
 	}
 
@@ -244,6 +210,52 @@ func (s *Server) handle(conn net.Conn) {
 	delete(s.clients, c)
 	s.mu.Unlock()
 	c.shutdown()
+}
+
+// handleCommand forwards one command to the runner and writes its
+// acknowledgment. cmd.flushed is closed once that ack is on the wire so a
+// handler that must not be orphaned by a server shutdown (the "shutdown"
+// command, whose verdict is the only report of what could not be terminated)
+// can wait for its own answer to be delivered.
+func (s *Server) handleCommand(conn net.Conn, in *Command) {
+	// Attach a buffered reply channel so the runner can hand back a real
+	// verdict (ok / partial / error) instead of the client having to assume
+	// the command succeeded the moment it was queued. Buffer size 1 means the
+	// runner never blocks even if the client disconnects before reading the
+	// ack.
+	cmd := *in
+	cmd.Reply = make(chan CommandResult, 1)
+	cmd.flushed = make(chan struct{})
+	defer close(cmd.flushed)
+
+	ack := Event{Type: TypeAck, Ack: "ok"}
+	select {
+	case s.cmdCh <- cmd:
+		// Wait for the runner's verdict. Bound the wait so a runaway runner
+		// can't pin a connection forever — 30s is well over the typical
+		// reload time, and comfortably over a shutdown (per-process
+		// shutdown_timeout plus the final sweep).
+		select {
+		case res := <-cmd.Reply:
+			ack.Ack = res.Status
+			ack.AckDetail = res.Message
+		case <-time.After(30 * time.Second):
+			ack.Ack = "error"
+			ack.AckDetail = "timed out waiting for runner reply"
+		}
+	default:
+		// Channel full — surface the drop so callers can retry.
+		ack.Ack = "busy"
+	}
+
+	data, err := json.Marshal(ack)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: failed to marshal ack: %v\n", err)
+		return
+	}
+	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	conn.Write(append(data, '\n'))
+	conn.SetWriteDeadline(time.Time{})
 }
 
 func (c *serverClient) writeLoop() {

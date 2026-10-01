@@ -2,9 +2,11 @@ package ipc
 
 import (
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -173,5 +175,100 @@ func TestServer_AckOkWhenAccepted(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+// TestClient_SendTimeoutBoundsABlockedWrite is the finding-4 regression. It uses
+// net.Pipe, which is unbuffered and synchronous: a write only completes when the
+// other end reads, so with nobody reading the write blocks. That makes the block
+// deterministic rather than relying on a Unix socket's buffer happening to fill.
+//
+// The point is that a caller with an overall budget must be able to bound its
+// request, not just the reply it waits for afterwards.
+func TestClient_SendTimeoutBoundsABlockedWrite(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+	c := &Client{conn: clientConn}
+
+	start := time.Now()
+	err := c.SendTimeout(Command{Action: "shutdown", Force: true}, 200*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("SendTimeout() = nil, want a deadline error: nothing was reading the pipe")
+	}
+	var nerr net.Error
+	if !errors.As(err, &nerr) || !nerr.Timeout() {
+		t.Fatalf("SendTimeout() = %v, want a timeout error", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("SendTimeout took %s; the write deadline was not applied", elapsed)
+	}
+}
+
+// TestClient_SendTimeoutRejectsAnExhaustedBudget pins the other half of the
+// finding-4 fix. A caller that derives its write budget from an overall deadline
+// computes zero once that deadline has passed, and a zero used to mean "no
+// deadline" — so an exhausted budget silently became an unbounded write against
+// exactly the wedged daemon the budget exists to bound.
+//
+// The write must be refused before anything is sent.
+func TestClient_SendTimeoutRejectsAnExhaustedBudget(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+	c := &Client{conn: clientConn}
+
+	for _, budget := range []time.Duration{0, -time.Second} {
+		err := c.SendTimeout(Command{Action: "shutdown"}, budget)
+		if err == nil {
+			t.Fatalf("SendTimeout(%s) = nil, want the exhausted budget to be refused", budget)
+		}
+		if !strings.Contains(err.Error(), "exhausted") {
+			t.Fatalf("SendTimeout(%s) = %v, want it to say the budget is exhausted", budget, err)
+		}
+	}
+}
+
+// TestClient_SendWithoutDeadlineIsUnchanged guards the shared path: ordinary
+// Send must keep its previous behaviour for every other consumer, i.e. no
+// deadline is imposed and a reader on the other end receives the command.
+func TestClient_SendWithoutDeadlineIsUnchanged(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+	c := &Client{conn: clientConn}
+
+	got := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 512)
+		n, err := serverConn.Read(buf)
+		if err != nil {
+			got <- nil
+			return
+		}
+		got <- buf[:n]
+	}()
+
+	if err := c.Send(Command{Action: "restart", Process: "api"}); err != nil {
+		t.Fatalf("Send() = %v", err)
+	}
+	select {
+	case data := <-got:
+		if len(data) == 0 {
+			t.Fatal("Send() delivered nothing")
+		}
+		if !strings.Contains(string(data), `"restart"`) {
+			t.Fatalf("Send() delivered %q, want it to contain the action", string(data))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Send() never reached the reader")
 	}
 }

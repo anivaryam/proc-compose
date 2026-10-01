@@ -57,11 +57,35 @@ type CommandResult struct {
 // channel is in-memory only (the JSON tag suppresses it on the wire); the
 // server attaches it before pushing to the runner so that the runner can
 // surface a real verdict back to the waiting client instead of forcing the
-// client to assume success the moment the command was queued.
+// client to assume success the moment the command is queued.
 type Command struct {
-	Action  string             `json:"action"`            // "restart", "reload"
+	Action  string             `json:"action"`            // "restart", "reload", "shutdown"
 	Process string             `json:"process,omitempty"` // target process name (for restart)
+	Force   bool               `json:"force,omitempty"`   // "shutdown": kill managed processes instead of asking them to exit
 	Reply   chan CommandResult `json:"-"`
+	// flushed is closed by the server once the acknowledgment carrying Reply
+	// has been written to the client. A "shutdown" handler waits on it so the
+	// daemon does not start tearing its IPC server down while the caller is
+	// still reading the verdict — which is the only place that reports what
+	// could not be terminated. Like Reply it never goes on the wire.
+	flushed chan struct{}
+}
+
+// WaitFlushed blocks until the acknowledgment carrying this command's Reply
+// has been written to the client, or until timeout elapses. It returns
+// immediately for a command that did not come from a Server.
+//
+// Use it only for a verdict that must survive the server going away. A
+// "shutdown" verdict qualifies: it is the caller's only report of which
+// managed processes could not be terminated.
+func (c *Command) WaitFlushed(timeout time.Duration) {
+	if c.flushed == nil {
+		return
+	}
+	select {
+	case <-c.flushed:
+	case <-time.After(timeout):
+	}
 }
 
 // Event is the envelope for all messages sent over the socket.

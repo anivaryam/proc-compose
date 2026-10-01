@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -1257,5 +1259,792 @@ func TestUninstallAllowedOnLinux(t *testing.T) {
 	err := validateUninstallPlatform("linux")
 	if err != nil {
 		t.Errorf("validateUninstallPlatform(%q) = %v; want nil", "linux", err)
+	}
+}
+
+// ── stop: proving managed processes are actually terminated ──────────────────
+//
+// The reported failure is a stop that reports success while managed processes
+// keep running, so every assertion below is made against a process PID — never
+// against the daemon having exited, the socket having closed, or a released
+// port. All of those are consistent with a managed child still running.
+
+const testShutdownGrace = 1 // seconds; keeps the forced-escalation path quick
+
+// pidIsRunning reports whether pid is still executing. A terminated but unreaped
+// process counts as gone: it cannot run code, hold a port or hold a file, so
+// counting it as alive would make these assertions flaky wherever init reaps
+// slowly.
+func pidIsRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if !daemon.IsAlive(pid) {
+		return false
+	}
+	return !pidIsTerminatedUnreaped(pid)
+}
+
+// pidIsTerminatedUnreaped reports whether pid is a zombie or already dead.
+// Linux only; elsewhere the /proc read fails and plain liveness is used.
+func pidIsTerminatedUnreaped(pid int) bool {
+	data, err := os.ReadFile("/proc/" + fmt.Sprint(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	closeIdx := strings.LastIndexByte(string(data), ')')
+	if closeIdx < 0 || closeIdx+2 > len(data) {
+		return false
+	}
+	fields := strings.Fields(string(data[closeIdx+2:]))
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "Z", "X", "x":
+		return true
+	}
+	return false
+}
+
+// Fixture scripts are written to disk rather than inlined into the config as
+// nested `sh -c` strings. Two reasons, both learned the hard way:
+//
+//   - A SIG_IGN disposition set by an inline `trap` with an empty operand is
+//     not reliable across every /bin/sh, so the "ignores SIGTERM" fixtures
+//     could silently stop modelling what they claim to model.
+//   - Nesting `sh -c` inside the command proc-compose already runs through
+//     `sh -c` adds a shell layer whose PID is not the one the runner tracks,
+//     which is exactly the confusion these tests exist to rule out.
+//
+// Scripts also mirror how a real config refers to its services.
+const (
+	// blockerScript records its PID and then blocks until killed.
+	// Usage: blocker.sh <pidfile>
+	blockerScript = `#!/bin/sh
+echo $$ > "$1"
+FIXTURE_TTL_SECONDS=90
+deadline=$(($(date +%s) + FIXTURE_TTL_SECONDS))
+while [ "$(date +%s)" -lt "$deadline" ]; do sleep 1; done
+`
+	// stubbornScript also ignores every catchable termination signal, in
+	// itself and in anything it starts, so it can only be removed by a forced
+	// kill. This is the case where terminating just the command leader is not
+	// enough.
+	// Usage: stubborn.sh <pidfile>
+	stubbornScript = `#!/bin/sh
+trap '' TERM INT HUP
+echo $$ > "$1"
+FIXTURE_TTL_SECONDS=90
+deadline=$(($(date +%s) + FIXTURE_TTL_SECONDS))
+while [ "$(date +%s)" -lt "$deadline" ]; do sleep 1; done
+`
+	// spawnerScript is the "parent exits first" shape: its group leader starts
+	// a descendant that ignores SIGTERM and then exits immediately. The
+	// descendant holds no pipe on stdout, so the runner's log scanner reaches
+	// EOF and cmd.Wait returns while the descendant is still running.
+	//
+	// The descendant is a fresh `sh` rather than a shell subshell on purpose:
+	// POSIX `$$` keeps the parent's PID inside a subshell, so a subshell would
+	// record the leader's already-exited PID and the test would assert on the
+	// wrong process.
+	// Usage: spawner.sh <stubbornScriptPath> <pidfile>
+	spawnerScript = `#!/bin/sh
+trap '' TERM INT HUP
+sh "$1" "$2" >/dev/null 2>&1 &
+exit 0
+`
+)
+
+// writeFixtureScript writes one of the fixture scripts into dir and returns
+// its path.
+func writeFixtureScript(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+		t.Fatalf("write fixture script %s: %v", name, err)
+	}
+	return path
+}
+
+// stackFixture is a running daemon plus the PIDs of everything it manages.
+type stackFixture struct {
+	bin        string
+	configPath string
+	env        []string // the environment `up` used; `stop` must resolve the same PID file
+	pids       map[string]int
+}
+
+// Process roles in the fixture stack. Each one breaks a different assumption
+// that "the daemon exited" would otherwise appear to satisfy.
+const (
+	rolePortless = "portless-worker" // no port declaration, no readiness probe
+	roleDetached = "detached-child"  // leader already exited; descendant alive
+	roleStubborn = "stubborn"        // ignores SIGTERM; needs a forced kill
+	roleDaemon   = "daemon"
+)
+
+// startStack brings up a daemonized stack and waits until every fixture has
+// recorded its PID. Waiting on the PID files is deterministic; a fixed sleep
+// would race on a loaded machine.
+//
+// withDetached adds a role whose group leader exits immediately while a
+// descendant that ignores SIGTERM keeps running. Such a process is
+// reportable-but-not-signallable — see TestStop_ReportsUnsignalledSurvivor — so
+// it is opt-in, because it changes the verdict a stop must produce.
+func startStack(t *testing.T, bin, dir string, withDetached bool) stackFixture {
+	t.Helper()
+
+	blocker := writeFixtureScript(t, dir, "blocker.sh", blockerScript)
+	stubborn := writeFixtureScript(t, dir, "stubborn.sh", stubbornScript)
+
+	portlessPIDFile := filepath.Join(dir, "portless.pid")
+	stubbornPIDFile := filepath.Join(dir, "stubborn.pid")
+	detachedPIDFile := filepath.Join(dir, "detached.pid")
+	configPath := filepath.Join(dir, "proc-compose.yml")
+
+	entry := func(name, cmd string) string {
+		return fmt.Sprintf("  %s:\n    cmd: %s\n    restart: never\n    shutdown_timeout: %d\n",
+			name, cmd, testShutdownGrace)
+	}
+	body := "processes:\n" +
+		// A portless worker: no port declaration and no readiness probe, so
+		// nothing short of process liveness can detect it surviving.
+		entry(rolePortless, blocker+" "+portlessPIDFile) +
+		// Ignores SIGTERM, so it can only be removed by a forced kill.
+		entry(roleStubborn, stubborn+" "+stubbornPIDFile)
+	if withDetached {
+		spawner := writeFixtureScript(t, dir, "spawner.sh", spawnerScript)
+		body += entry(roleDetached, spawner+" "+stubborn+" "+detachedPIDFile)
+	}
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	// A short runtime dir keeps the Unix socket path inside macOS's 104-byte
+	// limit, matching the established socketDirForTest pattern.
+	runtimeDir := socketDirForTest(t)
+	env := append(os.Environ(), "XDG_RUNTIME_DIR="+runtimeDir, "NO_COLOR=1")
+
+	up := exec.Command(bin, "up", "--silent", "--file", configPath)
+	up.Env = env
+	if out, err := up.CombinedOutput(); err != nil {
+		t.Fatalf("up --silent failed: %v\n%s", err, out)
+	}
+
+	fixture := stackFixture{bin: bin, configPath: configPath, env: env, pids: map[string]int{}}
+
+	pidPath := ""
+	entries, err := os.ReadDir(runtimeDir)
+	if err != nil {
+		t.Fatalf("read runtime dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".pid") {
+			pidPath = filepath.Join(runtimeDir, e.Name())
+		}
+	}
+	if pidPath == "" {
+		t.Fatalf("daemon wrote no PID file in %s", runtimeDir)
+	}
+	fixture.pids[roleDaemon] = readDaemonPID(t, pidPath)
+
+	fixture.pids[rolePortless] = waitForRecordedPID(t, portlessPIDFile)
+	fixture.pids[roleStubborn] = waitForRecordedPID(t, stubbornPIDFile)
+	if withDetached {
+		fixture.pids[roleDetached] = waitForRecordedPID(t, detachedPIDFile)
+	}
+
+	// Register cleanup before any assertion so a failing run cannot leak the
+	// daemon or its managed processes.
+	t.Cleanup(func() { fixture.forceCleanup(t) })
+
+	for role, pid := range fixture.pids {
+		if pid <= 0 {
+			t.Fatalf("fixture %q never recorded a PID; the test would prove nothing", role)
+		}
+		if !pidIsRunning(pid) {
+			t.Fatalf("%s (PID %d) was not running before the stop; the fixture proves nothing", role, pid)
+		}
+	}
+	return fixture
+}
+
+// forceCleanup terminates anything this test started that is still running.
+// It signals exact PIDs only — never a name pattern or a process group — so a
+// failing assertion cannot take down unrelated processes.
+func (f stackFixture) forceCleanup(t *testing.T) {
+	t.Helper()
+	for role, pid := range f.pids {
+		if pid <= 0 || !pidIsRunning(pid) {
+			continue
+		}
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			t.Logf("cleanup: cannot find leftover %s (PID %d): %v", role, pid, err)
+			continue
+		}
+		if err := proc.Kill(); err != nil {
+			t.Logf("cleanup: could not kill leftover %s (PID %d): %v", role, pid, err)
+			continue
+		}
+		t.Logf("cleanup: killed leftover %s (PID %d)", role, pid)
+	}
+}
+
+// readDaemonPID pulls the PID out of the daemon's JSON PID file.
+func readDaemonPID(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read pid file: %v", err)
+	}
+	var pf struct {
+		PID int `json:"pid"`
+	}
+	if err := json.Unmarshal(data, &pf); err != nil {
+		t.Fatalf("parse pid file %q: %v", string(data), err)
+	}
+	return pf.PID
+}
+
+// waitForRecordedPID blocks until a fixture has written its PID file.
+func waitForRecordedPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if data, err := os.ReadFile(path); err == nil {
+			if pid := atoiOrZero(strings.TrimSpace(string(data))); pid > 0 {
+				return pid
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return 0
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func atoiOrZero(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := 0
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
+}
+
+// assertAllTerminated fails unless every tracked PID has stopped executing.
+func (f stackFixture) assertAllTerminated(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		alive := ""
+		for role, pid := range f.pids {
+			if pidIsRunning(pid) {
+				alive += fmt.Sprintf(" %s(PID %d)", role, pid)
+			}
+		}
+		if alive == "" {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("still running%s after %s — the stop reported success but the processes survived", alive, timeout)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func (f stackFixture) stop(t *testing.T, extraArgs ...string) (string, error) {
+	t.Helper()
+	args := append([]string{"stop"}, extraArgs...)
+	args = append(args, "--file", f.configPath)
+	c := exec.Command(f.bin, args...)
+	c.Env = f.env
+	out, err := c.CombinedOutput()
+	return string(out), err
+}
+
+// TestStop_TerminatesDetachedDescendantOfAnExitedLeader is the CLI-level
+// acceptance test for the ownership redesign.
+//
+// A command whose leader exits on its own while a descendant keeps running used
+// to be the one case proc-compose could not resolve: by the time it was
+// observable the group had been reaped, the descendant could not safely be
+// signalled, and `stop` therefore failed while a process was still alive.
+//
+// The leader is now reaped last, so its process-table slot — and the process-group
+// ID equal to its PID — stays reserved through the whole teardown. The descendant
+// is therefore terminated like any other managed process and `stop` succeeds.
+func TestStop_TerminatesDetachedDescendantOfAnExitedLeader(t *testing.T) {
+	requireSignalStopFixture(t)
+	bin := buildTestBinary(t)
+	fixture := startStack(t, bin, t.TempDir(), true)
+
+	out, err := fixture.stop(t)
+	if err != nil {
+		t.Fatalf("stop failed: %v\n%s", err, out)
+	}
+	// The whole point: a same-group descendant whose parent already exited is
+	// terminated, not reported. It ignores SIGTERM, so only the group SIGKILL
+	// after the leader is gone can have ended it.
+	fixture.assertAllTerminated(t, 20*time.Second)
+	if pid := fixture.pids[roleDetached]; pidIsRunning(pid) {
+		t.Fatalf("detached descendant (PID %d) survived the stop: its leader had already "+
+			"exited, so this is the parent-exits-first case", pid)
+	}
+}
+
+// TestRequestShutdown_ExhaustedBudgetIsNotAnUnboundedWrite pins the caller-side
+// half of the exhausted-budget fix.
+//
+// requestShutdown derives the write budget from the overall stop deadline.
+// remainingUntil reports zero once that deadline has passed, and a zero budget
+// must be refused rather than spent on a write with no deadline. This uses an
+// already-absent socket so the connect phase cannot consume the budget first,
+// which isolates the write guard itself.
+func TestRequestShutdown_ExhaustedBudgetIsNotAnUnboundedWrite(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "absent.sock")
+
+	start := time.Now()
+	res := requestShutdown(socket, false, time.Now().Add(-time.Second))
+	elapsed := time.Since(start)
+
+	if res.outcome == stopVerified {
+		t.Fatal("requestShutdown() reported success with an already-expired budget")
+	}
+	if res.detail == "" {
+		t.Fatal("requestShutdown() gave no detail for an exhausted budget")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("requestShutdown took %s on an expired budget; the deadline was not respected", elapsed)
+	}
+}
+
+// requireSignalStopFixture skips platforms whose termination model these
+// fixtures cannot express. Windows terminates through a Job Object and has no
+// SIGTERM for console apps, so the "ignores SIGTERM" fixtures are Unix-only.
+func requireSignalStopFixture(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fixtures rely on SIGTERM being ignorable; Windows uses Job Object termination")
+	}
+}
+
+// TestStop_TerminatesManagedProcesses is the headline regression: a plain
+// `stop` must not report success while a portless worker, a detached
+// descendant, or a SIGTERM-ignoring process is still running.
+func TestStop_TerminatesManagedProcesses(t *testing.T) {
+	requireSignalStopFixture(t)
+	bin := buildTestBinary(t)
+	fixture := startStack(t, bin, t.TempDir(), false)
+
+	out, err := fixture.stop(t)
+	if err != nil {
+		t.Fatalf("stop failed: %v\n%s", err, out)
+	}
+	// Assert on the processes before the wording: a stop that reported success
+	// while leaving managed processes running is the defect being pinned, so
+	// that must be the failure a regression produces.
+	fixture.assertAllTerminated(t, 30*time.Second)
+	if !strings.Contains(out, "stopped proc-compose daemon") {
+		t.Fatalf("stop output = %q, want it to report a stopped daemon", out)
+	}
+}
+
+// TestStopForce_TerminatesManagedProcesses covers the same guarantee for the
+// forced path. Signalling the daemon directly used to kill the daemon and
+// orphan every managed process while still printing success.
+func TestStopForce_TerminatesManagedProcesses(t *testing.T) {
+	requireSignalStopFixture(t)
+	bin := buildTestBinary(t)
+	fixture := startStack(t, bin, t.TempDir(), false)
+
+	out, err := fixture.stop(t, "--force")
+	if err != nil {
+		t.Fatalf("stop --force failed: %v\n%s", err, out)
+	}
+	// Assert on the processes before the wording: a stop that reported success
+	// while leaving managed processes running is the defect being pinned.
+	fixture.assertAllTerminated(t, 30*time.Second)
+	if !strings.Contains(out, "stopped proc-compose daemon") {
+		t.Fatalf("stop --force output = %q, want it to report a stopped daemon", out)
+	}
+}
+
+// ── stop: bounded, verified, and honest about what it could not prove ────────
+
+// fakeDaemon drives stopDaemon against a scripted IPC peer plus a real process
+// standing in for the daemon, so both halves of the contract can be exercised
+// independently: what the daemon reports, and whether it actually goes away.
+type fakeDaemon struct {
+	t          *testing.T
+	socketPath string
+	proc       *exec.Cmd
+	pid        int
+}
+
+// startFakeDaemon starts a long-lived process to represent the daemon and an IPC
+// peer that answers with script (nil means no peer, i.e. an unreachable daemon).
+//
+// The process is registered for cleanup immediately after creation, before any
+// assertion, so no path leaks it.
+func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn)) *fakeDaemon {
+	t.Helper()
+
+	proc := sleepCommand(t, 30)
+	if err := proc.Start(); err != nil {
+		t.Fatalf("start daemon stand-in: %v", err)
+	}
+	fd := &fakeDaemon{t: t, proc: proc, pid: proc.Process.Pid}
+	// Reap promptly: an unreaped zombie still answers signal 0, which
+	// daemon.IsAlive counts as alive and would make every exit check hang.
+	reaped := make(chan struct{})
+	go func() {
+		_, _ = proc.Process.Wait()
+		close(reaped)
+	}()
+	t.Cleanup(func() {
+		if pidIsRunning(fd.pid) {
+			_ = proc.Process.Kill()
+		}
+		select {
+		case <-reaped:
+		case <-time.After(5 * time.Second):
+			t.Logf("cleanup: daemon stand-in %d was not reaped", fd.pid)
+		}
+	})
+
+	// A short directory keeps the socket path inside macOS's 104-byte limit.
+	dir, err := os.MkdirTemp("/tmp", "pc-test-*")
+	if err != nil {
+		t.Fatalf("temp socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	fd.socketPath = filepath.Join(dir, "d.sock")
+
+	if script == nil {
+		// No peer: leave the path unused so connecting fails, modelling an
+		// older daemon or a dead socket.
+		return fd
+	}
+	ln, err := net.Listen("unix", fd.socketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go script(fd, c)
+		}
+	}()
+	return fd
+}
+
+// serveAck answers the first command with a fixed ack, then runs onAck and holds
+// the connection open — which is what a daemon does while it tears itself down.
+// onAck lets a test make its stand-in actually exit, so the exit checks
+// downstream are exercised rather than short-circuited by a still-running peer.
+func serveAck(ack, detail string, onAck func()) func(*fakeDaemon, net.Conn) {
+	return func(_ *fakeDaemon, conn net.Conn) {
+		defer conn.Close()
+		sc := bufio.NewScanner(conn)
+		sc.Buffer(make([]byte, 1<<16), 1<<16)
+		for sc.Scan() {
+			var ev ipc.Event
+			if err := json.Unmarshal(sc.Bytes(), &ev); err != nil || ev.Type != ipc.TypeCommand {
+				continue
+			}
+			_ = json.NewEncoder(conn).Encode(ipc.Event{Type: ipc.TypeAck, Ack: ack, AckDetail: detail})
+			if onAck != nil {
+				onAck()
+			}
+			buf := make([]byte, 1)
+			for {
+				if _, err := conn.Read(buf); err != nil {
+					return
+				}
+			}
+		}
+	}
+}
+
+// serveSilent accepts the connection and never answers, modelling a daemon that
+// is connected but wedged.
+func serveSilent(_ *fakeDaemon, conn net.Conn) {
+	buf := make([]byte, 1)
+	for {
+		if _, err := conn.Read(buf); err != nil {
+			return
+		}
+	}
+}
+
+// TestStopDaemon_SurvivorVerdictMakesStopFail is the CLI-boundary proof the
+// review asks for. The daemon reports that it could not verify termination, and
+// `stop` must fail. Observing the daemon disappear is not enough: on this path
+// the daemon is fully stopped and only the ack distinguishes success from a
+// surviving managed process.
+func TestStopDaemon_SurvivorVerdictMakesStopFail(t *testing.T) {
+	const detail = "could not terminate worker: process group 41234 survived forced termination"
+	fd := startFakeDaemon(t, nil)
+	scriptedInto(fd, serveAck("partial", detail, func() {
+		// The daemon really does finish shutting down; only the managed
+		// process is unaccounted for.
+		_ = fd.proc.Process.Kill()
+	}))
+	dir := socketDirForTest(t)
+
+	err := stopDaemon(fd.socketPath, filepath.Join(dir, "x.pid"), fd.pid, fd.proc.Process, true, 5*time.Second)
+	if err == nil {
+		t.Fatal("stopDaemon = nil, want a failure: the daemon reported a survivor")
+	}
+	if !strings.Contains(err.Error(), "NOT fully verified") {
+		t.Fatalf("error = %q, want it to report that termination was not fully verified", err)
+	}
+	if !strings.Contains(err.Error(), "41234") {
+		t.Fatalf("error = %q, want it to name the surviving process group", err)
+	}
+}
+
+// scriptedInto attaches a scripted IPC peer to a stand-in created without one,
+// so a closure that needs the stand-in (to kill it, say) can be built after the
+// fact.
+func scriptedInto(fd *fakeDaemon, script func(*fakeDaemon, net.Conn)) {
+	fd.t.Helper()
+	ln, err := net.Listen("unix", fd.socketPath)
+	if err != nil {
+		fd.t.Fatalf("listen: %v", err)
+	}
+	fd.t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go script(fd, c)
+		}
+	}()
+}
+
+// TestStopDaemon_VerifiedVerdictButDaemonStillRunningFails covers the review's
+// second requirement: after a successful verdict the daemon must actually be
+// gone within the remaining budget. An "ok" ack alone is not proof.
+func TestStopDaemon_VerifiedVerdictButDaemonStillRunningFails(t *testing.T) {
+	fd := startFakeDaemon(t, serveAck("ok", "", nil))
+	dir := socketDirForTest(t)
+
+	// A short budget leaves no room to wait the stand-in out.
+	err := stopDaemon(fd.socketPath, filepath.Join(dir, "x.pid"), fd.pid, fd.proc.Process, true, 600*time.Millisecond)
+	if err == nil {
+		t.Fatal("stopDaemon = nil, want a failure: the daemon reported ok but is still running")
+	}
+	if !strings.Contains(err.Error(), "still running") {
+		t.Fatalf("error = %q, want it to report the daemon is still running", err)
+	}
+}
+
+// TestStopDaemon_SilentPeerIsBoundedAndNotSuccess proves a connected but silent
+// daemon cannot pin the caller and cannot be read as success. The elapsed time is
+// asserted against the budget rather than a fixed sleep, so the check is about
+// the bound itself.
+func TestStopDaemon_SilentPeerIsBoundedAndNotSuccess(t *testing.T) {
+	fd := startFakeDaemon(t, serveSilent)
+	dir := socketDirForTest(t)
+
+	const budget = 700 * time.Millisecond
+	start := time.Now()
+	err := stopDaemon(fd.socketPath, filepath.Join(dir, "x.pid"), fd.pid, fd.proc.Process, false, budget)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("stopDaemon = nil, want a failure: no verdict was received")
+	}
+	if !strings.Contains(err.Error(), "did not report a shutdown verdict") {
+		t.Fatalf("error = %q, want it to say no verdict was received", err)
+	}
+	if !strings.Contains(err.Error(), "NOT") {
+		t.Fatalf("error = %q, want it to label the outcome as unverified", err)
+	}
+	// The verdict wait must respect the shared deadline, leaving only the
+	// fallback's own bounded signalling on top.
+	if elapsed > budget+5*time.Second {
+		t.Fatalf("stopDaemon took %s against a %s budget; the deadline is not enforced", elapsed, budget)
+	}
+}
+
+// TestStopDaemon_UnreachableDaemonIsLabelledUnverified pins the compatibility
+// fallback: an older daemon that cannot be asked to stop itself still gets
+// stopped, but the result is labelled as unverified rather than as a clean stop.
+func TestStopDaemon_UnreachableDaemonIsLabelledUnverified(t *testing.T) {
+	fd := startFakeDaemon(t, nil) // no IPC peer: the socket does not exist
+	dir := socketDirForTest(t)
+
+	err := stopDaemon(fd.socketPath, filepath.Join(dir, "x.pid"), fd.pid, fd.proc.Process, false, 5*time.Second)
+	if err == nil {
+		t.Fatal("stopDaemon = nil, want a failure: managed processes could not be verified")
+	}
+	if !strings.Contains(err.Error(), "NOT verified") {
+		t.Fatalf("error = %q, want it to state managed processes were not verified", err)
+	}
+	if pidIsRunning(fd.pid) {
+		t.Fatal("the daemon stand-in was signalled but is still running; the fallback did not stop it")
+	}
+}
+
+// quoteForScript makes a value safe to embed in a single-quoted sh script.
+func quoteForScript(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// signalWitness records which termination signal actually reached a process, so
+// a test can prove which operation a fallback chose rather than inferring it
+// from timing. It works by trapping the signals it cares about and recording
+// them, then exiting, so a graceful stop and a forced stop are distinguishable.
+func signalWitness(t *testing.T, marker string) *exec.Cmd {
+	t.Helper()
+	var cmd *exec.Cmd
+	// The witness must survive SIGTERM in order to record that a graceful signal
+	// was delivered, so it traps TERM instead of dying from it.
+	dir := t.TempDir()
+	script := filepath.Join(dir, "witness.sh")
+	ready := filepath.Join(dir, "ready")
+	// Records a signal only when one is actually delivered, so an empty marker
+	// after a forced stop is real evidence that no graceful signal was attempted.
+	body := "#!/bin/sh\n" +
+		"trap 'echo term >> " + quoteForScript(marker) + "; exit 0' TERM\n" +
+		": > " + quoteForScript(ready) + "\n" +
+		"while :; do sleep 1; done\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatalf("write witness: %v", err)
+	}
+	cmd = exec.Command(script)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start witness: %v", err)
+	}
+	// Deterministic gate: the trap is installed before the ready file appears, so
+	// a SIGTERM after this point is guaranteed to be recorded.
+	waitForFile(t, ready, 20*time.Second)
+	// Reap promptly: an unreaped zombie still answers signal 0, which
+	// daemon.IsAlive counts as alive and would make every exit check hang.
+	reaped := make(chan struct{})
+	go func() {
+		_, _ = cmd.Process.Wait()
+		close(reaped)
+	}()
+	t.Cleanup(func() {
+		if pidIsRunning(cmd.Process.Pid) {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case <-reaped:
+		case <-time.After(5 * time.Second):
+			t.Logf("cleanup: witness %d was not reaped", cmd.Process.Pid)
+		}
+	})
+	return cmd
+}
+
+// waitForFile blocks until path exists, so a fixture is only used once it is
+// genuinely ready.
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("timed out after %s waiting for %s", timeout, path)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// signalsSeen reads the witness marker, returning the signals recorded so far.
+func signalsSeen(t *testing.T, marker string) string {
+	t.Helper()
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// TestStopDaemon_FallbackPreservesGracefulIntent covers finding 5's graceful
+// half: with no usable verdict, `stop` must still try a graceful stop first.
+func TestStopDaemon_FallbackPreservesGracefulIntent(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "signals")
+	cmd := signalWitness(t, marker)
+	dir := socketDirForTest(t)
+	absent := filepath.Join(dir, "absent.sock")
+
+	err := stopDaemon(absent, filepath.Join(dir, "x.pid"), cmd.Process.Pid, cmd.Process, false, 5*time.Second)
+	if err == nil {
+		t.Fatal("stopDaemon = nil, want an unverified failure")
+	}
+	if !strings.Contains(err.Error(), "NOT verified") {
+		t.Fatalf("error = %q, want it to state managed processes were not verified", err)
+	}
+	// The witness must have been asked to stop before anything was killed: it
+	// records a term and exits, which is observable in its marker file.
+	if got := signalsSeen(t, marker); !strings.Contains(got, "term") {
+		t.Fatalf("witness recorded %q, want a SIGTERM; the graceful fallback did not signal", got)
+	}
+}
+
+// TestStopDaemon_FallbackPreservesForceIntent covers finding 5's forced half:
+// `stop --force` against a daemon that cannot be asked must go straight to a kill
+// and must NOT first wait out a graceful stop. The witness ignores SIGTERM, so a
+// graceful attempt would be recorded in its marker; a forced kill would not.
+func TestStopDaemon_FallbackPreservesForceIntent(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "signals")
+	cmd := signalWitness(t, marker)
+	dir := socketDirForTest(t)
+	absent := filepath.Join(dir, "absent.sock")
+
+	err := stopDaemon(absent, filepath.Join(dir, "x.pid"), cmd.Process.Pid, cmd.Process, true, 5*time.Second)
+	if err == nil {
+		t.Fatal("stopDaemon = nil, want an unverified failure")
+	}
+	if !strings.Contains(err.Error(), "NOT verified") {
+		t.Fatalf("error = %q, want it to state managed processes were not verified", err)
+	}
+	if got := signalsSeen(t, marker); strings.Contains(got, "term") {
+		t.Fatalf("witness recorded %q: --force degraded into a graceful stop before killing", got)
+	}
+	if pidIsRunning(cmd.Process.Pid) {
+		t.Fatal("witness is still running: the forced fallback did not kill the daemon")
+	}
+}
+
+// TestStopDaemon_DeadlineIsSharedAcrossPhases proves the budget is one overall
+// deadline rather than a per-phase allowance: a slow connect plus a silent peer
+// must still finish within it.
+func TestStopDaemon_DeadlineIsSharedAcrossPhases(t *testing.T) {
+	fd := startFakeDaemon(t, serveSilent)
+	dir := socketDirForTest(t)
+
+	const budget = 700 * time.Millisecond
+	start := time.Now()
+	// A sub-millisecond connect allowance leaves the verdict wait almost nothing.
+	err := stopDaemon(fd.socketPath, filepath.Join(dir, "x.pid"), fd.pid, fd.proc.Process, true, budget)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("stopDaemon = nil, want a failure")
+	}
+	if elapsed > budget+5*time.Second {
+		t.Fatalf("stopDaemon took %s against a %s budget; phases are not sharing one deadline", elapsed, budget)
 	}
 }
