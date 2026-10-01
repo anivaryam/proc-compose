@@ -694,7 +694,7 @@ func TestWaitForProcessesReady_SilentPeerHitsTimeout(t *testing.T) {
 	}
 	timeout := 400 * time.Millisecond
 
-	dir := t.TempDir()
+	dir := socketDirForTest(t)
 	socketPath := filepath.Join(dir, "silent.sock")
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -741,11 +741,7 @@ func TestWaitForProcessesReady_SilentPeerHitsTimeout(t *testing.T) {
 
 func ipcServerForTest(t *testing.T) (socketPath string, server *ipc.Server, stop func()) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "pc-test-*")
-	if err != nil {
-		t.Fatalf("temp socket dir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := socketDirForTest(t)
 	socketPath = filepath.Join(dir, "pc.sock")
 
 	server = ipc.NewServer(socketPath)
@@ -754,6 +750,18 @@ func ipcServerForTest(t *testing.T) (socketPath string, server *ipc.Server, stop
 	}
 	stop = func() { server.Shutdown() }
 	return
+}
+
+// socketDirForTest avoids test-name-prefixed paths that exceed macOS's Unix
+// socket path limit.
+func socketDirForTest(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "pc-test-*")
+	if err != nil {
+		t.Fatalf("temp socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 // scriptedPeer is a minimal stand-in for the daemon that hands the waiter a
@@ -772,7 +780,7 @@ type scriptedPeer struct {
 // snapshot, then relays ProcStates from send in order. It stops with the test.
 func newScriptedPeer(t *testing.T, initial []ipc.ProcState) *scriptedPeer {
 	t.Helper()
-	dir := t.TempDir()
+	dir := socketDirForTest(t)
 	p := &scriptedPeer{
 		socketPath: filepath.Join(dir, "pc.sock"),
 		connected:  make(chan struct{}),
