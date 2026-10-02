@@ -1686,6 +1686,82 @@ type fakeDaemon struct {
 	pid        int
 }
 
+// daemonStandinSentinel marks this test binary as the long-lived daemon stand-in.
+const daemonStandinSentinel = "__PROC_COMPOSE_DAEMON_STANDIN__"
+
+// TestDaemonStandinHelper is the long-lived process the daemon stand-in runs.
+//
+// It replaces a shell "sleep" for two reasons. Windows has no `sleep`, and its
+// substitute — `timeout /t 30 /nobreak` — exits immediately when stdin is not a
+// console, which is exactly the case for a test subprocess with redirected
+// streams. A stand-in that had already died made taskkill fail with exit status
+// 128, and made a "daemon is still running" check succeed without ever having
+// run; both looked like production defects and were not.
+//
+// The helper gives a deterministic ready signal and then stays alive until the
+// test releases it or a bounded idle lifetime expires, so a stand-in can never
+// quietly die underneath an assertion.
+func TestDaemonStandinHelper(t *testing.T) {
+	if len(os.Args) < 4 || os.Args[len(os.Args)-4] != daemonStandinSentinel {
+		return
+	}
+	ready, release := os.Args[len(os.Args)-3], os.Args[len(os.Args)-2]
+
+	if err := os.WriteFile(ready, []byte("ready"), 0o644); err != nil {
+		os.Exit(2)
+	}
+	// A bounded idle lifetime keeps a failing test from leaking the process even
+	// if the release file never appears.
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(release); err == nil {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// daemonStandin starts a long-lived stand-in process for a test, and blocks until
+// it is provably running.
+//
+// Liveness is proven, not assumed: the helper writes a ready file only after its
+// main loop is entered, and the caller asserts the process is alive after that.
+func daemonStandin(t *testing.T) *exec.Cmd {
+	t.Helper()
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	release := filepath.Join(dir, "release")
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDaemonStandinHelper$",
+		"--", daemonStandinSentinel, ready, release, "idle")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start daemon stand-in: %v", err)
+	}
+	waitForFile(t, ready, 30*time.Second)
+	if !pidIsRunning(cmd.Process.Pid) {
+		t.Fatalf("daemon stand-in (PID %d) reported ready but is not running; "+
+			"the fixture would prove nothing", cmd.Process.Pid)
+	}
+
+	reaped := make(chan struct{})
+	go func() {
+		_, _ = cmd.Process.Wait()
+		close(reaped)
+	}()
+	t.Cleanup(func() {
+		_ = os.WriteFile(release, []byte("go"), 0o644)
+		if pidIsRunning(cmd.Process.Pid) {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case <-reaped:
+		case <-time.After(5 * time.Second):
+			t.Logf("cleanup: daemon stand-in %d was not reaped", cmd.Process.Pid)
+		}
+	})
+	return cmd
+}
+
 // startFakeDaemon starts a long-lived process to represent the daemon and an IPC
 // peer that answers with script (nil means no peer, i.e. an unreachable daemon).
 //
@@ -1694,10 +1770,7 @@ type fakeDaemon struct {
 func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn)) *fakeDaemon {
 	t.Helper()
 
-	proc := sleepCommand(t, 30)
-	if err := proc.Start(); err != nil {
-		t.Fatalf("start daemon stand-in: %v", err)
-	}
+	proc := daemonStandin(t)
 	fd := &fakeDaemon{t: t, proc: proc, pid: proc.Process.Pid}
 	// Reap promptly: an unreaped zombie still answers signal 0, which
 	// daemon.IsAlive counts as alive and would make every exit check hang.

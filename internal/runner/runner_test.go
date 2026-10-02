@@ -40,18 +40,43 @@ func helperCmd(args ...string) string {
 	return posixQuote(os.Args[0]) + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel + " " + payload
 }
 
-// discardOwnOutput redirects the leader shell's own standard streams to the null
-// device, so the runner's log pipe reaches end-of-stream while the command is
-// still running.
+// discardOutputScript wraps a command so that the shell running it does not keep
+// the runner's log pipe open, while the command inside keeps running. The runner's
+// log reader then reaches end-of-stream against a service that is still working,
+// which is the shape these tests exist to pin.
 //
-// The device and the syntax are platform-specific: POSIX shells take /dev/null and
-// an exec redirect, while cmd.exe takes NUL. Without this the fixture would be a
-// shell syntax error on Windows rather than the shape under test.
-var discardOwnOutput = func() string {
+// The redirect has to apply to the shell itself, not just to the command appended
+// to it: the shell forks, so a redirect attached only to the child leaves the
+// forked shell holding the pipe and EOF would not arrive until the command had
+// already finished.
+//
+// It is also placed inside a script rather than inline in the command string.
+// Windows shell selection routes any command containing a redirection operator to
+// PowerShell, where a null redirect is not the same syntax at all; keeping the
+// operators out of the configured command means the shell decision is made on the
+// command alone, which is what the product does for real configurations.
+func discardOutputScript(t *testing.T, command string) string {
+	t.Helper()
+	dir := t.TempDir()
 	if runtime.GOOS == "windows" {
-		return "2>nul >nul"
+		script := filepath.Join(dir, "quiet.cmd")
+		// The redirection applies to the command the script runs, so the script
+		// itself never hands the log pipe to anything it starts.
+		body := "@echo off\r\n" + command + " 2>nul >nul\r\n"
+		if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+			t.Fatalf("write quiet script: %v", err)
+		}
+		return script
 	}
-	return "exec >/dev/null 2>&1;"
+	script := filepath.Join(dir, "quiet.sh")
+	// exec re-points the script's own streams before the command runs, so the
+	// shell stops holding the log pipe. The command then runs in the foreground:
+	// it is the thing that has to stay alive.
+	body := "#!/bin/sh\nexec >/dev/null 2>&1\n" + command + "\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatalf("write quiet script: %v", err)
+	}
+	return script
 }
 
 func posixQuote(s string) string {
@@ -2327,12 +2352,7 @@ func TestRun_EOFDoesNotTerminateAHealthyService(t *testing.T) {
 	working := filepath.Join(dir, "working")
 	release := filepath.Join(dir, "release")
 
-	// The leading self-redirect is applied by the leader shell to itself, which is
-	// what makes EOF arrive while the service is still running. Merely appending a
-	// redirect to the command would not: the shell forks, and the forked leader
-	// keeps holding the log pipe, so EOF would only arrive once the command had
-	// already finished.
-	cmd := discardOwnOutput() + " " + helperCmd("quiet-loop", pidFile, working, release)
+	cmd := discardOutputScript(t, helperCmd("quiet-loop", pidFile, working, release))
 
 	r := makeRunner(map[string]config.Process{
 		"svc": {
@@ -2405,9 +2425,7 @@ func TestRun_StopTerminatesAHealthyServiceThatClosedItsOutput(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "svc.pid")
 
-	// The redirect is applied by the leader shell to itself, which is what makes
-	// the runner's log pipe reach EOF while the command is still running.
-	cmd := discardOwnOutput() + " " + helperCmd("quiet-stubborn", pidFile)
+	cmd := discardOutputScript(t, helperCmd("quiet-stubborn", pidFile))
 
 	r := makeRunner(map[string]config.Process{
 		"svc": {
