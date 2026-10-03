@@ -2250,7 +2250,13 @@ func TestPrintUpdateNotice_AnnouncesFromCache(t *testing.T) {
 	buf.ReadFrom(pr)
 
 	got := buf.String()
-	for _, want := range []string{"v1.2.0", "v1.3.0", update.InstallScriptURL} {
+	wants := []string{"v1.2.0", "v1.3.0"}
+	if runtime.GOOS == "windows" {
+		wants = append(wants, "$env:BROKIT_BIN", "brokit install --force proc-compose")
+	} else {
+		wants = append(wants, update.InstallScriptURL, "PROC_COMPOSE_INSTALL_DIR=")
+	}
+	for _, want := range wants {
 		if !strings.Contains(got, want) {
 			t.Errorf("notice missing %q:\n%s", want, got)
 		}
