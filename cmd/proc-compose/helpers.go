@@ -15,10 +15,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anivaryam/proc-compose/internal/ansi"
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/paths"
+	"github.com/anivaryam/proc-compose/internal/update"
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 // unitNameRe restricts --name to characters safe for both a systemd unit
@@ -1029,4 +1033,94 @@ func resolveLiveDaemonPaths(configFile string) (absConfig, hash, socketPath, pid
 	}
 	pidPath, socketPath = liveDaemonPaths(hash)
 	return absConfig, hash, socketPath, pidPath, nil
+}
+
+// ── update notice ────────────────────────────────────────────────────────────
+//
+// A "new release available" hint is guidance for a person watching a terminal,
+// so it is limited to commands whose output is human-facing. Cobra returns for
+// --help and --version before running any hook, so those never get here; the
+// rest of the machine-readable surfaces are listed in updateNoticeSkip.
+
+var updateNoticeSkip = map[string]bool{
+	"help":             true,
+	"completion":       true,
+	"__complete":       true,
+	"__completeNoDesc": true,
+	"man":              true,
+}
+
+// topLevelName returns the name of the command's direct child of the root.
+// "completion bash" is executed as the `bash` subcommand, so matching on the
+// executed command's own name would miss the excluded `completion` parent.
+func topLevelName(cmd *cobra.Command) string {
+	if cmd.HasParent() && cmd.Parent().HasParent() {
+		return topLevelName(cmd.Parent())
+	}
+	return cmd.Name()
+}
+
+// updateNoticeEligible reports whether this invocation may print an update
+// notice.
+//
+// interactive must report whether stderr is a terminal: the notice is
+// diagnostics, so stderr decides. A command whose stdout is redirected to a
+// file or a pipe still belongs to someone watching the screen, while a cron
+// job or CI step writing stderr to a log gets nothing.
+func updateNoticeEligible(cmd *cobra.Command, interactive bool) bool {
+	if cmd == nil || !interactive {
+		return false
+	}
+	name := topLevelName(cmd)
+	if updateNoticeSkip[name] {
+		return false
+	}
+	// --json is this CLI's marker for "this output is for a machine".
+	if f := cmd.Flags().Lookup("json"); f != nil {
+		if machine, err := cmd.Flags().GetBool("json"); err == nil && machine {
+			return false
+		}
+	}
+	// "up --survive" prints a systemd unit that callers write to a file, and
+	// "up --silent" hands off to a daemon that re-runs this same binary
+	// detached from the terminal (so the daemon child never sees a terminal
+	// either). Neither is a person watching output.
+	if name == "up" {
+		for _, flag := range []string{"silent", "survive"} {
+			if v, err := cmd.Flags().GetBool(flag); err == nil && v {
+				return false
+			}
+		}
+		// The runner streams machine-readable log lines in JSON mode.
+		if v, err := cmd.Flags().GetString("log-format"); err == nil && v == "json" {
+			return false
+		}
+	}
+	return true
+}
+
+// printUpdateNotice shows the release notice when the shared cache proves a
+// newer release exists, and otherwise schedules a background refresh so a
+// later invocation can announce it.
+//
+// Nothing here can change a command's output or exit status: the notice is
+// built only from a cached release tag, and the refresh it may start writes
+// only to the user cache directory.
+func printUpdateNotice(cmd *cobra.Command, currentVersion string, interactive bool) {
+	if !updateNoticeEligible(cmd, interactive) {
+		return
+	}
+	latest := update.Default().Notice(currentVersion)
+	if latest == "" {
+		return
+	}
+	if noColor, err := cmd.Flags().GetBool("no-color"); err == nil && noColor {
+		ansi.SetDisabled(true)
+	}
+	fmt.Fprint(os.Stderr, update.Message(currentVersion, latest))
+}
+
+// stderrIsTerminal reports whether diagnostics are going to a person.
+func stderrIsTerminal() bool {
+	return term.IsTerminal(int(os.Stderr.Fd()))
 }

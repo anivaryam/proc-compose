@@ -901,6 +901,15 @@ See: https://github.com/anivaryam/proc-compose#diagnose-or-generate-config`,
 	}
 	rootCmd.AddCommand(upCmd, monitorCmd, stopCmd, listCmd, initCmd, restartCmd, reloadCmd, uninstallCmd, logsCmd, manCmd, statusCmd, validateCmd, bootstrapCmd, doctorCmd)
 
+	// The update notice runs before every command's own work, so it is
+	// printed above the output it refers to and never after a TUI has taken
+	// over the screen. Cobra returns for --help and --version before any run
+	// hook, so those never reach it.
+	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		printUpdateNotice(cmd, version, stderrIsTerminal())
+		return nil
+	}
+
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}

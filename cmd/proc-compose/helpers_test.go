@@ -21,6 +21,8 @@ import (
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/paths"
+	"github.com/anivaryam/proc-compose/internal/update"
+	"github.com/spf13/cobra"
 )
 
 func TestValidateUnitName(t *testing.T) {
@@ -2144,4 +2146,253 @@ func TestStopDaemon_DeadlineIsSharedAcrossPhases(t *testing.T) {
 	if elapsed > budget+5*time.Second {
 		t.Fatalf("stopDaemon took %s against a %s budget; phases are not sharing one deadline", elapsed, budget)
 	}
+}
+
+// ── update notice ────────────────────────────────────────────────────────────
+
+// noticeCommand builds a stand-in with the same name and the same flags the
+// real command carries, so the eligibility gate is exercised against the shape
+// it actually sees at runtime.
+func noticeCommand(t *testing.T, name string, args ...string) *cobra.Command {
+	t.Helper()
+	cmd := &cobra.Command{Use: name, Run: func(*cobra.Command, []string) {}}
+	if name == "up" {
+		cmd.Flags().BoolP("silent", "s", false, "")
+		cmd.Flags().Bool("survive", false, "")
+		cmd.Flags().String("name", "", "")
+		cmd.Flags().String("log-format", "text", "")
+	}
+	if name == "status" || name == "doctor" || name == "bootstrap" {
+		cmd.Flags().Bool("json", false, "")
+	}
+	if err := cmd.ParseFlags(args); err != nil {
+		t.Fatalf("parse flags for %s %v: %v", name, args, err)
+	}
+	return cmd
+}
+
+// TestUpdateNoticeEligible_HumanFacingCommands is the positive case: a person
+// watching a terminal gets the hint.
+func TestUpdateNoticeEligible_HumanFacingCommands(t *testing.T) {
+	for _, name := range []string{"up", "list", "status", "logs", "stop", "validate", "doctor", "bootstrap", "monitor"} {
+		if !updateNoticeEligible(noticeCommand(t, name), true) {
+			t.Errorf("%q was denied the update notice; it is a human-facing command", name)
+		}
+	}
+}
+
+// TestUpdateNoticeEligible_ExcludedCommands covers every case where extra
+// output is noise at best and corrupting at worst: generated documentation and
+// completion scripts, machine-readable output, and the daemon handoff.
+func TestUpdateNoticeEligible_ExcludedCommands(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		why  string
+	}{
+		{"help", nil, "help output is generated for reading"},
+		{"completion", nil, "completion scripts are piped to a file"},
+		{"__complete", nil, "shell completion consumes this output"},
+		{"__completeNoDesc", nil, "shell completion consumes this output"},
+		{"man", nil, "man pages are written to a file or a pager"},
+		{"status", []string{"--json"}, "machine-readable output"},
+		{"doctor", []string{"--json"}, "machine-readable output"},
+		{"bootstrap", []string{"--json"}, "machine-readable output"},
+		{"up", []string{"--silent"}, "daemonize hands off to a detached child"},
+		{"up", []string{"-s"}, "daemonize hands off to a detached child"},
+		{"up", []string{"--survive", "--name", "app"}, "a systemd unit is written to a file"},
+		{"up", []string{"--log-format", "json"}, "machine-readable log output"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if updateNoticeEligible(noticeCommand(t, tt.name, tt.args...), true) {
+				t.Errorf("%s %v was allowed the update notice; %s", tt.name, tt.args, tt.why)
+			}
+		})
+	}
+}
+
+// TestUpdateNoticeEligible_NonInteractiveIsDenied is the cron/CI case: with no
+// terminal on stderr there is nobody to tell.
+func TestUpdateNoticeEligible_NonInteractiveIsDenied(t *testing.T) {
+	for _, name := range []string{"up", "list", "status", "logs", "doctor"} {
+		if updateNoticeEligible(noticeCommand(t, name), false) {
+			t.Errorf("%q was allowed the update notice without a terminal", name)
+		}
+	}
+}
+
+func TestUpdateNoticeEligible_NilCommandIsDenied(t *testing.T) {
+	if updateNoticeEligible(nil, true) {
+		t.Error("a nil command was allowed the update notice")
+	}
+}
+
+// TestPrintUpdateNotice_AnnouncesFromCache seeds the shared user cache with a
+// newer release and asserts the notice names both versions and the upgrade
+// command, on stderr only.
+func TestPrintUpdateNotice_AnnouncesFromCache(t *testing.T) {
+	cacheDir := isolateCacheDir(t)
+	seedUpdateCache(t, cacheDir, "v1.3.0", time.Now())
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	oldStderr := os.Stderr
+	os.Stderr = pw
+	printUpdateNotice(noticeCommand(t, "list"), "v1.2.0", true)
+	pw.Close()
+	os.Stderr = oldStderr
+	var buf bytes.Buffer
+	buf.ReadFrom(pr)
+
+	got := buf.String()
+	for _, want := range []string{"v1.2.0", "v1.3.0", "brokit update proc-compose"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("notice missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestPrintUpdateNotice_SilentForDevelopmentBuild is the guard for a locally
+// built binary: "dev" is not a release, so there is nothing to offer.
+func TestPrintUpdateNotice_SilentForDevelopmentBuild(t *testing.T) {
+	cacheDir := isolateCacheDir(t)
+	seedUpdateCache(t, cacheDir, "v1.3.0", time.Now())
+
+	got := captureStderr(t, func() {
+		printUpdateNotice(noticeCommand(t, "list"), "dev", true)
+	})
+	if got != "" {
+		t.Errorf("a development build was told to update:\n%s", got)
+	}
+}
+
+// TestPrintUpdateNotice_SilentForExcludedCommand is the structured-output
+// guarantee at the boundary the user actually sees: nothing is added to stderr
+// for a --json invocation even when a newer release is cached.
+func TestPrintUpdateNotice_SilentForExcludedCommand(t *testing.T) {
+	cacheDir := isolateCacheDir(t)
+	seedUpdateCache(t, cacheDir, "v1.3.0", time.Now())
+
+	got := captureStderr(t, func() {
+		printUpdateNotice(noticeCommand(t, "status", "--json"), "v1.2.0", true)
+	})
+	if got != "" {
+		t.Errorf("structured output was interleaved with a notice:\n%s", got)
+	}
+}
+
+// TestUpdateNotice_EndToEndLeavesStructuredOutputIntact runs the built binary
+// against a cache that already knows about a newer release. `doctor --json`
+// must emit exactly one JSON document on stdout with nothing appended, and a
+// non-interactive `list` must stay silent — the two ways a stray notice would
+// break a script.
+func TestUpdateNotice_EndToEndLeavesStructuredOutputIntact(t *testing.T) {
+	bin := buildTestBinaryVersion(t, "v1.2.0")
+	cacheDir := isolateCacheDir(t)
+	seedUpdateCache(t, cacheDir, "v9.9.9", time.Now())
+
+	// A redirected HOME/XDG_CACHE_HOME points the child at the seeded cache.
+	env := append(os.Environ(),
+		"HOME="+t.TempDir(),
+		"XDG_CACHE_HOME="+filepath.Dir(cacheDir),
+		"NO_COLOR=1",
+	)
+	work := t.TempDir()
+
+	jsonCmd := exec.Command(bin, "doctor", "--json")
+	jsonCmd.Dir = work
+	jsonCmd.Env = env
+	var stdout, stderr bytes.Buffer
+	jsonCmd.Stdout = &stdout
+	jsonCmd.Stderr = &stderr
+	if err := jsonCmd.Run(); err != nil {
+		t.Fatalf("doctor --json failed: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "new proc-compose release") {
+		t.Errorf("structured output was polluted by the notice:\n%s", stdout.String())
+	}
+	if strings.Contains(stderr.String(), "new proc-compose release") {
+		t.Errorf("doctor --json printed a notice despite being machine-readable:\n%s", stderr.String())
+	}
+	var report map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Errorf("doctor --json stdout is not a single JSON document: %v\n%s", err, stdout.String())
+	}
+
+	// exec gives the child a pipe, not a terminal: nobody is watching.
+	listCmd := exec.Command(bin, "list")
+	listCmd.Dir = work
+	listCmd.Env = env
+	listOut, listErr := listCmd.CombinedOutput()
+	_ = listErr // list without a config fails; that is not what this asserts
+	if strings.Contains(string(listOut), "new proc-compose release") {
+		t.Errorf("a non-interactive run printed a notice:\n%s", listOut)
+	}
+
+	// util-linux script supplies a real terminal without a new PTY dependency.
+	// A positive control prevents a dev build or terminal-detection failure
+	// from making the exclusion assertions pass vacuously.
+	if runtime.GOOS != "linux" {
+		return
+	}
+	script, err := exec.LookPath("script")
+	if err != nil {
+		t.Skip("interactive assertions require util-linux script")
+	}
+	runInteractive := func(args string, noColor bool) string {
+		t.Helper()
+		cmd := exec.Command(script, "-q", "-e", "-c", `exec "$PC_UPDATE_TEST_BIN" `+args, "/dev/null")
+		cmd.Dir = work
+		cmd.Env = append(env, "PC_UPDATE_TEST_BIN="+bin)
+		if !noColor {
+			cmd.Env = append(cmd.Env, "NO_COLOR=")
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("interactive %s failed: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	if out := runInteractive("doctor", true); !strings.Contains(out, "new proc-compose release") {
+		t.Fatalf("positive control did not print a notice:\n%s", out)
+	}
+	out := runInteractive("doctor --json", true)
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("interactive doctor --json is not a single JSON document: %v\n%s", err, out)
+	}
+	writeCLIFile(t, filepath.Join(work, "proc-compose.yml"), "processes: {app: {cmd: echo hello}}\n")
+	out = runInteractive("up --no-color --dry-run", false)
+	if !strings.Contains(out, "new proc-compose release") || strings.Contains(out, "\x1b[") {
+		t.Fatalf("--no-color must print a notice without ANSI escapes:\n%s", out)
+	}
+}
+
+// seedUpdateCache writes a cache entry standing in for a lookup that already
+// happened, at the location update.Default() reads.
+func seedUpdateCache(t *testing.T, cacheDir, latest string, checkedAt time.Time) {
+	t.Helper()
+	entry := `{"latest":"` + latest + `","checked_at":"` + checkedAt.Format(time.RFC3339Nano) + `"}`
+	if err := os.WriteFile(filepath.Join(cacheDir, update.CacheFileName), []byte(entry), 0600); err != nil {
+		t.Fatalf("seed update cache: %v", err)
+	}
+}
+
+// captureStderr runs fn with os.Stderr redirected and returns what it wrote.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	old := os.Stderr
+	os.Stderr = pw
+	fn()
+	pw.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	buf.ReadFrom(pr)
+	return buf.String()
 }

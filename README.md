@@ -46,6 +46,25 @@ brokit remove proc-compose          # uninstall
 
 `brokit` reads the GitHub releases for this repo, verifies the binary, and drops it into `/usr/local/bin`. It also installs the optional companions (`merge-port`, `tunnel`, `env-vault`, `proxy-relay`) the same way, which is the easiest way to unlock proc-compose's `merge:` and tunnel features.
 
+### Update notifications
+
+Interactive runs tell you when a newer stable release is available:
+
+```
+A new proc-compose release is available: v1.2.0 → v1.3.0
+Run: brokit update proc-compose
+```
+
+The check is notification-only. proc-compose never downloads, installs, or replaces anything — updating stays with `brokit update proc-compose`.
+
+**When you see it:** only when stderr is a terminal *and* the command's output is meant for a person. Help, `--version`, `completion`, `man`, `--json` output, `up --silent`, `up --survive`, and `up --log-format json` never print it — and neither does a cron job or a CI step, whose stderr is a log file.
+
+**Network policy:** lookups use `https://api.github.com/repos/anivaryam/proc-compose/releases/latest`, with a 3-second timeout and a bounded response read. Recorded attempts suppress further lookups for 24 hours; simultaneous invocations with a missing or stale cache may each make a request. Draft and prerelease releases are ignored. Development builds (`dev`, a bare commit hash, or a `-dirty` / describe-suffixed version) skip checks entirely.
+
+**Cache:** the last result is recorded in `$XDG_CACHE_HOME/proc-compose/update-check.json` (normally `~/.cache/proc-compose/` on Linux, or `~/Library/Caches/proc-compose/` on macOS). The file is shared by every project for the same user and never written into a project directory. Failed attempts are recorded for the same 24 hours, so an offline or rate-limited machine does not retry on every command. If the user cache directory cannot be created, update checks are skipped.
+
+The check never blocks a command. The notice is printed from the cache alone; when that cache is missing or stale the lookup runs in the background, so a fresh result shows up on the *next* invocation instead of delaying the current one. Because the cache is shared and long-lived, one `proc-compose up` or `proc-compose monitor` session is enough to arm it for the next 24 hours — a short command such as `list` finishes long before a background request could land, so it never waits and never blocks, it just may be the invocation that does not arm the cache.
+
 **From release binary (Linux/macOS, single-tool install):**
 
 ```sh

@@ -9,12 +9,16 @@ import (
 )
 
 func buildTestBinary(t *testing.T) string {
+	return buildTestBinaryVersion(t, "dev")
+}
+
+func buildTestBinaryVersion(t *testing.T, version string) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "proc-compose_test")
 	if runtime.GOOS == "windows" {
 		bin += ".exe"
 	}
-	buildCmd := exec.Command("go", "build", "-o", bin, ".")
+	buildCmd := exec.Command("go", "build", "-ldflags", "-X main.version="+version, "-o", bin, ".")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to build proc-compose: %v\n%s", err, out)
 	}

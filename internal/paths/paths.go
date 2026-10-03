@@ -45,6 +45,34 @@ func runtimeDir() string {
 	return os.TempDir()
 }
 
+// Cache returns the shared per-user cache directory: state that must outlive
+// a single command but is safe to lose, unlike runtimeDir which holds live
+// socket and PID files. It is the same directory for every project on the
+// machine, so anything cached here (the release check) is shared rather than
+// duplicated per working directory.
+//
+// Returns an empty path when unavailable; optional caches must not fall back
+// to a shared temporary directory or the current project directory.
+func Cache() string {
+	if cache, err := os.UserCacheDir(); err == nil {
+		dir := filepath.Join(cache, "proc-compose")
+		if err := os.MkdirAll(dir, 0700); err == nil {
+			return dir
+		}
+	}
+	return ""
+}
+
+// CacheFile returns the path of a cached file inside the per-user cache
+// directory, or an empty path when that directory is unavailable.
+func CacheFile(name string) string {
+	dir := Cache()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, name)
+}
+
 // Socket returns the socket path for the daemon.
 // On Windows, named pipes are used (\\.\pipe\pc-<hash>).
 // On Unix, a Unix socket is placed in the per-user runtime dir.
