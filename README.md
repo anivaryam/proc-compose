@@ -48,14 +48,68 @@ brokit remove proc-compose          # uninstall
 
 ### Update notifications
 
-Interactive runs tell you when a newer stable release is available:
+Interactive runs tell you when a newer stable release is available. The notice is
+aimed at the copy you are actually running — it names the directory that copy
+lives in, so the command it prints replaces that file rather than adding a second
+one your shell would keep shadowing.
 
 ```
 A new proc-compose release is available: v1.2.0 → v1.3.0
-Run: brokit update proc-compose
+This copy is in /home/you/.local/bin. Update this exact file with:
+  curl -sSfL https://raw.githubusercontent.com/anivaryam/proc-compose/main/install.sh | PROC_COMPOSE_INSTALL_DIR='/home/you/.local/bin' bash
+If you installed with brokit, use 'brokit update proc-compose'.
+If brokit is not managing it yet, that command explains how to hand it over.
 ```
 
-The check is notification-only. proc-compose never downloads, installs, or replaces anything — updating stays with `brokit update proc-compose`.
+That first command works whether or not brokit manages this copy, and it does not
+assume anything about how the copy got there — `install.sh`, `make install`, and
+`go install` all put files in the same directories. The assignment sits on the
+installer, after the pipe, because `PROC_COMPOSE_INSTALL_DIR=x curl … | bash`
+would set it for `curl` and leave the installer to write to its own default.
+
+`brokit update proc-compose` is worth knowing about, but the notice deliberately
+does not claim brokit manages your copy. brokit only ever installs into one
+directory, and so do the other installers here, so the directory alone proves
+nothing. What settles it is brokit's own output: for a copy it manages it
+updates it, and for one it does not it prints the one-time command that takes
+that exact file over. Either way it ends in an answer.
+
+**Windows:** there is no `install.ps1` for proc-compose — this repository's
+standalone installer is `install.sh`, for Linux and macOS. On Windows the flow
+that can be aimed at one directory is brokit's own installer, so the notice
+prints that in PowerShell syntax:
+
+```
+This copy is in C:\tools. Update this exact file with:
+  $env:BROKIT_BIN = 'C:\tools'; brokit install --force proc-compose
+That works whether or not brokit already manages this copy.
+Keep BROKIT_BIN set to 'C:\tools' for later updates. The assignment above only lasts
+as long as this terminal. Run this once to keep it in new terminals:
+  [Environment]::SetEnvironmentVariable("BROKIT_BIN", 'C:\tools', "User")
+Then keep it current with:
+  brokit update proc-compose
+```
+
+`--force` is what lets one command cover both cases: brokit refuses a plain
+`install` once a record exists, and the notice cannot tell a copy brokit already
+manages from one it has never seen.
+
+You do not have to wait for a notification to do any of this. To check and
+migrate at any time:
+
+```sh
+brokit list                          # STATUS shows "unmanaged: <path>" for copies brokit does not own
+brokit update proc-compose           # explains what it found and prints the command to take over
+```
+
+**If you take a copy over with `BROKIT_BIN` set to a custom directory, make that
+setting permanent.** brokit records the version it installed but not the path, so
+a later plain `brokit update proc-compose` would otherwise install into
+`~/.local/bin` and leave the copy your shell runs untouched. brokit's diagnostic
+reminds you and prints the command; add the export to your shell profile to make
+it stick.
+
+The check is notification-only. proc-compose never downloads, installs, or replaces anything, and never runs brokit or any other command to work out how it was installed.
 
 **When you see it:** only when stderr is a terminal *and* the command's output is meant for a person. Help, `--version`, `completion`, `man`, `--json` output, `up --silent`, `up --survive`, and `up --log-format json` never print it — and neither does a cron job or a CI step, whose stderr is a log file.
 

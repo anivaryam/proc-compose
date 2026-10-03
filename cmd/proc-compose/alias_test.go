@@ -14,7 +14,15 @@ func buildTestBinary(t *testing.T) string {
 
 func buildTestBinaryVersion(t *testing.T, version string) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "proc-compose_test")
+	return buildTestBinaryVersionAt(t, t.TempDir(), version)
+}
+
+// buildTestBinaryVersionAt builds the binary into dir instead of a throwaway
+// directory, so a test can decide what the running copy's directory means —
+// brokit's bin directory, or somewhere brokit does not manage.
+func buildTestBinaryVersionAt(t *testing.T, dir, version string) string {
+	t.Helper()
+	bin := filepath.Join(dir, "proc-compose_test")
 	if runtime.GOOS == "windows" {
 		bin += ".exe"
 	}

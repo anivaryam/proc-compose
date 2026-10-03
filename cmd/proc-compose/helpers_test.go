@@ -2229,8 +2229,10 @@ func TestUpdateNoticeEligible_NilCommandIsDenied(t *testing.T) {
 }
 
 // TestPrintUpdateNotice_AnnouncesFromCache seeds the shared user cache with a
-// newer release and asserts the notice names both versions and the upgrade
-// command, on stderr only.
+// newer release and asserts the notice names both versions and a command that
+// updates this copy, on stderr only.
+//
+// The copy under test is the test binary itself, in a temporary directory.
 func TestPrintUpdateNotice_AnnouncesFromCache(t *testing.T) {
 	cacheDir := isolateCacheDir(t)
 	seedUpdateCache(t, cacheDir, "v1.3.0", time.Now())
@@ -2248,10 +2250,86 @@ func TestPrintUpdateNotice_AnnouncesFromCache(t *testing.T) {
 	buf.ReadFrom(pr)
 
 	got := buf.String()
-	for _, want := range []string{"v1.2.0", "v1.3.0", "brokit update proc-compose"} {
+	for _, want := range []string{"v1.2.0", "v1.3.0", update.InstallScriptURL} {
 		if !strings.Contains(got, want) {
 			t.Errorf("notice missing %q:\n%s", want, got)
 		}
+	}
+}
+
+// TestPrintUpdateNotice_DefaultDirectoryStillOffersAnInPlaceUpdate is the
+// originally reported case: the binary sits in ~/.local/bin, which is also
+// brokit's own default directory. Nothing about the directory proves brokit
+// installed it — this repository's install.sh and Makefile use the same one —
+// so the notice must not fall back to the bare `brokit update` line that fails
+// for an unregistered copy.
+func TestPrintUpdateNotice_DefaultDirectoryStillOffersAnInPlaceUpdate(t *testing.T) {
+	defaultDir := filepath.Join(t.TempDir(), ".local", "bin")
+	requireDir(t, defaultDir)
+	bin := buildTestBinaryVersionAt(t, defaultDir, "v1.2.0")
+	cacheDir := isolateCacheDir(t)
+	seedUpdateCache(t, cacheDir, "v1.3.0", time.Now())
+
+	env := append(os.Environ(), "HOME="+t.TempDir(), "XDG_CACHE_HOME="+filepath.Dir(cacheDir), "NO_COLOR=1")
+	// BROKIT_BIN deliberately matches the binary's own directory: from in here
+	// that is indistinguishable from a brokit-managed copy, and must be treated
+	// as unknown rather than as proof.
+	env = append(env, "BROKIT_BIN="+defaultDir)
+
+	got := runInteractive(t, bin, t.TempDir(), env, true, "doctor")
+	if !strings.Contains(got, "new proc-compose release") {
+		t.Fatalf("positive control printed no notice at all:\n%s", got)
+	}
+	if want := "Run: " + update.UpdateCommand + "\n"; strings.Contains(got, want) {
+		t.Errorf("a copy in brokit's default directory was told only to run brokit update:\n%s", got)
+	}
+	for _, want := range []string{
+		defaultDir,
+		"PROC_COMPOSE_INSTALL_DIR=" + defaultDir,
+		update.InstallScriptURL,
+		update.UpdateCommand,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("notice missing %q:\n%s", want, got)
+		}
+	}
+	for _, forbidden := range []string{"which brokit manages", "is managed by brokit", "brokit-managed"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("notice asserted ownership with %q:\n%s", forbidden, got)
+		}
+	}
+}
+
+// TestPrintUpdateNotice_PointsAtTheRunningBinaryDirectory proves the notice is
+// aimed at the file being executed, wherever that is.
+func TestPrintUpdateNotice_PointsAtTheRunningBinaryDirectory(t *testing.T) {
+	binDir := t.TempDir()
+	bin := buildTestBinaryVersionAt(t, binDir, "v1.2.0")
+	cacheDir := isolateCacheDir(t)
+	seedUpdateCache(t, cacheDir, "v1.3.0", time.Now())
+
+	env := append(os.Environ(), "HOME="+t.TempDir(), "XDG_CACHE_HOME="+filepath.Dir(cacheDir),
+		"BROKIT_BIN="+t.TempDir(), "NO_COLOR=1")
+
+	got := runInteractive(t, bin, t.TempDir(), env, true, "doctor")
+	if !strings.Contains(got, "new proc-compose release") {
+		t.Fatalf("positive control printed no notice at all:\n%s", got)
+	}
+	for _, want := range []string{
+		binDir,
+		"PROC_COMPOSE_INSTALL_DIR=" + binDir,
+		update.InstallScriptURL,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("notice missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func requireDir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", path, err)
 	}
 }
 
@@ -2338,36 +2416,48 @@ func TestUpdateNotice_EndToEndLeavesStructuredOutputIntact(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		return
 	}
-	script, err := exec.LookPath("script")
-	if err != nil {
-		t.Skip("interactive assertions require util-linux script")
-	}
-	runInteractive := func(args string, noColor bool) string {
-		t.Helper()
-		cmd := exec.Command(script, "-q", "-e", "-c", `exec "$PC_UPDATE_TEST_BIN" `+args, "/dev/null")
-		cmd.Dir = work
-		cmd.Env = append(env, "PC_UPDATE_TEST_BIN="+bin)
-		if !noColor {
-			cmd.Env = append(cmd.Env, "NO_COLOR=")
-		}
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("interactive %s failed: %v\n%s", args, err, out)
-		}
-		return string(out)
-	}
-	if out := runInteractive("doctor", true); !strings.Contains(out, "new proc-compose release") {
+	if out := runInteractive(t, bin, work, env, true, "doctor"); !strings.Contains(out, "new proc-compose release") {
 		t.Fatalf("positive control did not print a notice:\n%s", out)
 	}
-	out := runInteractive("doctor --json", true)
+	out := runInteractive(t, bin, work, env, true, "doctor", "--json")
 	if err := json.Unmarshal([]byte(out), &report); err != nil {
 		t.Fatalf("interactive doctor --json is not a single JSON document: %v\n%s", err, out)
 	}
 	writeCLIFile(t, filepath.Join(work, "proc-compose.yml"), "processes: {app: {cmd: echo hello}}\n")
-	out = runInteractive("up --no-color --dry-run", false)
+	out = runInteractive(t, bin, work, env, false, "up", "--no-color", "--dry-run")
 	if !strings.Contains(out, "new proc-compose release") || strings.Contains(out, "\x1b[") {
 		t.Fatalf("--no-color must print a notice without ANSI escapes:\n%s", out)
 	}
+}
+
+// runInteractive runs bin with a terminal on stderr, which is what the notice's
+// eligibility gate requires: exec gives a child a pipe, so an ordinary run
+// proves nothing about interactive behaviour.
+//
+// util-linux `script` supplies a real terminal without a new PTY dependency, so
+// callers get the platform's own terminal detection exercised rather than a
+// stand-in. noColor is passed explicitly instead of relying on an inherited
+// NO_COLOR.
+func runInteractive(t *testing.T, bin, dir string, env []string, noColor bool, args ...string) string {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("interactive assertions require util-linux script")
+	}
+	script, err := exec.LookPath("script")
+	if err != nil {
+		t.Skip("interactive assertions require util-linux script")
+	}
+	cmd := exec.Command(script, "-q", "-e", "-c", `exec "$PC_UPDATE_TEST_BIN" `+strings.Join(args, " "), "/dev/null")
+	cmd.Dir = dir
+	cmd.Env = append(env, "PC_UPDATE_TEST_BIN="+bin)
+	if !noColor {
+		cmd.Env = append(cmd.Env, "NO_COLOR=")
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("interactive %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
 }
 
 // seedUpdateCache writes a cache entry standing in for a lookup that already

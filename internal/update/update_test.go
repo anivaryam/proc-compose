@@ -2,10 +2,13 @@ package update
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -159,21 +162,99 @@ func TestParseVersion_RejectsNonNumericComponents(t *testing.T) {
 
 // ── message rendering ────────────────────────────────────────────────────────
 
-func TestMessage_NamesBothVersionsAndUpdateCommand(t *testing.T) {
-	// SetDisabled is the same switch --no-color flips; the ansi package reads
-	// NO_COLOR once at init, so setting it here would not take effect.
-	ansi.SetDisabled(true)
-	t.Cleanup(func() { ansi.SetDisabled(false) })
+// TestMessageFor_DefaultInstallDirectoryIsNotAssumedToBeBrokitManaged is the
+// originally reported case. The binary sits in the default install directory,
+// which is also brokit's own default — the two are indistinguishable from in
+// here, because this repository's install.sh and Makefile use the same one.
+//
+// Directory membership is therefore not evidence, and a copy there must still be
+// given a command that works. Asserting the bare `brokit update` line for that
+// directory is exactly the dead end this notice exists to remove.
+func TestMessageFor_DefaultInstallDirectoryIsNotAssumedToBeBrokitManaged(t *testing.T) {
+	noColour(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // os.UserHomeDir reads this on Windows
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	dir := defaultBinDir(home)
 
-	got := Message("v1.2.0", "v1.3.0")
+	got := MessageFor("v1.2.0", "v1.3.0", Location{Dir: dir})
 
-	for _, want := range []string{"v1.2.0", "v1.3.0", UpdateCommand, "brokit update proc-compose"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("message missing %q:\n%s", want, got)
+	if want := "Run: " + UpdateCommand + "\n"; strings.Contains(got, want) {
+		t.Errorf("a copy in the default install directory (%s) was given only the brokit command:\n%s", dir, got)
+	}
+	assertInPlaceCommand(t, got, dir)
+}
+
+// TestMessageFor_AlwaysOffersAnInPlaceUpdate: wherever the copy lives, the
+// notice has to carry a command that writes to that directory.
+func TestMessageFor_AlwaysOffersAnInPlaceUpdate(t *testing.T) {
+	noColour(t)
+
+	for _, dir := range []string{
+		filepath.Join(t.TempDir(), ".local", "bin"),
+		filepath.Join(t.TempDir(), "go", "bin"),
+		filepath.Join(t.TempDir(), "usr", "local", "bin"),
+	} {
+		got := MessageFor("v1.2.0", "v1.3.0", Location{Dir: dir})
+
+		if !strings.Contains(got, dir) {
+			t.Errorf("notice does not name the running copy's directory %q:\n%s", dir, got)
+		}
+		if strings.Contains(got, "Run: "+UpdateCommand+"\n") {
+			t.Errorf("notice in %q leads with a command that may not apply:\n%s", dir, got)
+		}
+		assertInPlaceCommand(t, got, dir)
+	}
+}
+
+// defaultBinDir is brokit's documented default, computed here independently of
+// the package so the test pins the behaviour rather than the implementation.
+func defaultBinDir(home string) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(home, "AppData", "Local", "brokit", "bin")
+	}
+	return filepath.Join(home, ".local", "bin")
+}
+
+// TestMessageFor_NeverClaimsBrokitOwnership: the word "manage" may only appear
+// as a condition brokit itself resolves, never as a statement about this copy.
+func TestMessageFor_NeverClaimsBrokitOwnership(t *testing.T) {
+	noColour(t)
+
+	got := MessageFor("v1.2.0", "v1.3.0", Location{Dir: filepath.Join(t.TempDir(), ".local", "bin")})
+
+	for _, forbidden := range []string{"which brokit manages", "is managed by brokit", "brokit-managed"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("notice asserts ownership with %q:\n%s", forbidden, got)
 		}
 	}
-	if strings.Contains(got, "\033") {
-		t.Errorf("message contains ANSI escapes with colour disabled:\n%q", got)
+}
+
+// TestMessageFor_PathWithSpacesIsQuoted: the commands are meant to be pasted, and
+// an unquoted path silently targets the wrong directory.
+func TestMessageFor_PathWithSpacesIsQuoted(t *testing.T) {
+	noColour(t)
+	dir := filepath.Join(t.TempDir(), "my tools")
+
+	got := MessageFor("v1.2.0", "v1.3.0", Location{Dir: dir})
+
+	assertInPlaceCommand(t, got, dir)
+}
+
+// TestMessageFor_UnknownLocationKeepsEstablishedGuidance: when the directory
+// cannot be determined there is nothing to point a command at, so the notice
+// stays as it was rather than inventing a path.
+func TestMessageFor_UnknownLocationKeepsEstablishedGuidance(t *testing.T) {
+	noColour(t)
+
+	got := MessageFor("v1.2.0", "v1.3.0", Location{})
+
+	if want := "Run: " + UpdateCommand; !strings.Contains(got, want) {
+		t.Errorf("unknown location is missing %q:\n%s", want, got)
+	}
+	if strings.Contains(got, "PROC_COMPOSE_INSTALL_DIR") || strings.Contains(got, "BROKIT_BIN") {
+		t.Errorf("unknown location must not print a directory it does not know:\n%s", got)
 	}
 }
 
@@ -184,6 +265,278 @@ func TestMessage_UsesColourWhenEnabled(t *testing.T) {
 	if !strings.Contains(Message("v1.2.0", "v1.3.0"), ansi.Bold) {
 		t.Error("message carries no bold styling when colour is enabled")
 	}
+}
+
+// TestMessageFor_KeepsColour is the same guarantee on the branch that carries
+// the most text.
+func TestMessageFor_KeepsColour(t *testing.T) {
+	ansi.SetDisabled(false)
+	t.Cleanup(func() { ansi.SetDisabled(true) })
+
+	got := MessageFor("v1.2.0", "v1.3.0", Location{Dir: "/opt/proc compose"})
+
+	if !strings.Contains(got, ansi.Bold) {
+		t.Errorf("notice carries no bold styling when colour is enabled:\n%q", got)
+	}
+}
+
+// TestMessage_DetectsTheRunningTestBinary proves the entry point is wired to a
+// real location rather than a placeholder.
+func TestMessage_DetectsTheRunningTestBinary(t *testing.T) {
+	noColour(t)
+
+	loc := Detect()
+	if loc.Dir == "" {
+		t.Fatal("Detect returned no directory for the running test binary")
+	}
+	if !strings.Contains(Message("v1.2.0", "v1.3.0"), loc.Dir) {
+		t.Errorf("notice does not name the directory of the running binary (%q)", loc.Dir)
+	}
+}
+
+// assertInPlaceCommand checks that the notice carries a command which writes to
+// dir, in this platform's shell syntax.
+func assertInPlaceCommand(t *testing.T, got, dir string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(got, `$env:BROKIT_BIN = '`+dir+`'; brokit install --force proc-compose`) {
+			t.Errorf("notice lacks a PowerShell in-place command for %q:\n%s", dir, got)
+		}
+		if !strings.Contains(got, `[Environment]::SetEnvironmentVariable("BROKIT_BIN", '`+dir+`', "User")`) {
+			t.Errorf("notice does not make the Windows override reach new terminals:\n%s", got)
+		}
+		return
+	}
+	if !strings.Contains(got, "PROC_COMPOSE_INSTALL_DIR=") {
+		t.Errorf("notice does not aim the installer at the running copy's directory:\n%s", got)
+	}
+	if strings.Contains(got, "PROC_COMPOSE_INSTALL_DIR="+posixQuoteArg(dir)+" curl") {
+		t.Errorf("the override is set for curl instead of the installer:\n%s", got)
+	}
+}
+
+// ── platform rendering ───────────────────────────────────────────────────────
+
+// TestPosixUpdateAdvice_AssignmentIsOnTheReceivingCommand: `VAR=x curl … | bash`
+// sets the variable for curl. The installer on the other end of the pipe would
+// fall back to its own default and update a different file than the one in use.
+func TestPosixUpdateAdvice_AssignmentIsOnTheReceivingCommand(t *testing.T) {
+	command, _ := posixUpdateAdvice("/opt/my tools")
+
+	if !strings.Contains(command, "curl -sSfL "+InstallScriptURL+" | ") {
+		t.Fatalf("command does not pipe the installer from the documented URL: %s", command)
+	}
+	if !strings.Contains(command, "| PROC_COMPOSE_INSTALL_DIR='/opt/my tools' bash") {
+		t.Errorf("the assignment is not on the command that reads it: %s", command)
+	}
+}
+
+func TestPosixUpdateAdvice_NamesBrokitWithoutAssertingOwnership(t *testing.T) {
+	_, note := posixUpdateAdvice("/opt/bin")
+
+	if !strings.Contains(note, UpdateCommand) {
+		t.Errorf("note does not mention the brokit route: %s", note)
+	}
+	if !strings.Contains(note, "If brokit is not managing it yet") {
+		t.Errorf("note must present brokit as a condition, not a fact: %s", note)
+	}
+}
+
+// TestWindowsUpdateAdvice_UsesForceSoItWorksForBothCases: brokit refuses a
+// plain `install` once a record exists, so a notice that only knew how to say
+// "install" would be useless for a copy brokit already manages — which is
+// exactly the case this notice cannot rule out. `--force` installs and records
+// either way, so one command covers both.
+func TestWindowsUpdateAdvice_UsesForceSoItWorksForBothCases(t *testing.T) {
+	command, note := windowsUpdateAdvice(`C:\my tools`)
+
+	if command != `$env:BROKIT_BIN = 'C:\my tools'; brokit install --force proc-compose` {
+		t.Errorf("windows command is not PowerShell, or cannot upgrade a managed copy: %s", command)
+	}
+	for _, forbidden := range []string{"BROKIT_BIN=", "bash", "curl"} {
+		if strings.Contains(command, forbidden) {
+			t.Errorf("windows command contains %q: %s", forbidden, command)
+		}
+	}
+	if !strings.Contains(note, `[Environment]::SetEnvironmentVariable("BROKIT_BIN", 'C:\my tools', "User")`) {
+		t.Errorf("windows advice does not make the override reach new terminals: %s", note)
+	}
+	if !strings.Contains(note, "brokit update proc-compose") {
+		t.Errorf("windows advice does not name the follow-up update: %s", note)
+	}
+}
+
+func TestWindowsQuoteArg_DoublesSingleQuotes(t *testing.T) {
+	// PowerShell treats single-quoted text as literal and escapes a quote by
+	// doubling it, unlike the POSIX '\'' form.
+	if got := windowsQuoteArg(`C:\O'Brien\tools`); got != `'C:\O''Brien\tools'` {
+		t.Errorf("windowsQuoteArg = %s", got)
+	}
+}
+
+func TestQuoteArg_FollowsThePlatform(t *testing.T) {
+	dir := filepath.Join("opt", "my tools")
+	if runtime.GOOS == "windows" {
+		if got := quoteArg(dir); got != windowsQuoteArg(dir) {
+			t.Errorf("quoteArg on windows = %s", got)
+		}
+		return
+	}
+	if got := quoteArg(dir); got != posixQuoteArg(dir) {
+		t.Errorf("quoteArg on posix = %s", got)
+	}
+}
+
+func TestUpdateAdvice_FollowsThePlatform(t *testing.T) {
+	command, note := updateAdvice("/opt/bin")
+	if runtime.GOOS == "windows" {
+		if command != mustWindowsAdvice(t, "/opt/bin") {
+			t.Error("updateAdvice did not use the windows rendering")
+		}
+		return
+	}
+	if !strings.Contains(command, InstallScriptURL) || strings.Contains(command, "brokit install") {
+		t.Errorf("updateAdvice on posix did not use the installer: %s", command)
+	}
+	if len(note) == 0 {
+		t.Error("updateAdvice returned no follow-up advice")
+	}
+}
+
+func mustWindowsAdvice(t *testing.T, dir string) string {
+	t.Helper()
+	command, _ := windowsUpdateAdvice(dir)
+	return command
+}
+
+func TestQuoteArg(t *testing.T) {
+	tests := map[string]string{
+		"/opt/bin":            "/opt/bin",
+		"/opt/my tools":       `'/opt/my tools'`,
+		"/opt/o'brien":        `'/opt/o'\''brien'`,
+		"/opt/$HOME/bin":      `'/opt/$HOME/bin'`,
+		"":                    "''",
+		"/opt/bin;rm -rf /":   `'/opt/bin;rm -rf /'`,
+		"/usr/local/my tools": `'/usr/local/my tools'`,
+	}
+	for in, want := range tests {
+		if got := posixQuoteArg(in); got != want {
+			t.Errorf("posixQuoteArg(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestDocumentedCommandsMatchTheNotice pins the README to the commands the
+// notice prints. They are maintained in separate files, so the agreement
+// between them needs a test rather than a promise.
+func TestDocumentedCommandsMatchTheNotice(t *testing.T) {
+	readme := readReadme(t)
+
+	for _, want := range []string{
+		InstallScriptURL,
+		"PROC_COMPOSE_INSTALL_DIR",
+		"BROKIT_BIN",
+		"brokit install proc-compose",
+		UpdateCommand,
+	} {
+		if !strings.Contains(readme, want) {
+			t.Errorf("README does not document %q, which the update notice prints", want)
+		}
+	}
+	if strings.Contains(readme, "PROC_COMPOSE_INSTALL_DIR=<dir> curl") {
+		t.Error("README sets PROC_COMPOSE_INSTALL_DIR for curl, not for the installer")
+	}
+	// The positive form is the real parity check: with the assignment after the
+	// pipe it is present, and flipping it back would make this fail.
+	if runtime.GOOS != "windows" && !strings.Contains(readme, "| PROC_COMPOSE_INSTALL_DIR=") {
+		t.Error("README does not show PROC_COMPOSE_INSTALL_DIR on the installer side of the pipe")
+	}
+}
+
+// TestPosixUpdateAdvice_CommandRunsAndReachesTheInstaller executes the command
+// the notice prints, against a local installer stub standing in for GitHub.
+//
+// Reading the rendered string cannot catch a shell-wiring mistake, and that is
+// exactly the kind of bug this command had: the assignment has to reach the
+// installer on the receiving end of the pipe. The control case runs the same
+// command with the assignment before curl and asserts it delivers nothing, so
+// this test cannot pass by accident.
+func TestPosixUpdateAdvice_CommandRunsAndReachesTheInstaller(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the posix rendering is not runnable on Windows")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("executing the rendered command needs bash")
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("executing the rendered command needs curl")
+	}
+
+	dir := t.TempDir()
+	record := filepath.Join(dir, "received")
+	// The stub records the directory it was told to install into and writes a
+	// binary there, which is what the real installer does.
+	stub := "#!/bin/sh\n" +
+		"printf '%s' \"${PROC_COMPOSE_INSTALL_DIR:-}\" > '" + record + "'\n" +
+		"if [ -z \"${PROC_COMPOSE_INSTALL_DIR:-}\" ]; then exit 0; fi\n" +
+		"printf 'installed' > \"$PROC_COMPOSE_INSTALL_DIR/proc-compose\"\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, stub)
+	}))
+	defer srv.Close()
+
+	command, _ := posixUpdateAdvice(dir)
+	// Swap only the host, so the shell wiring under test is exactly what is
+	// printed to the user.
+	command = strings.Replace(command, InstallScriptURL, srv.URL+"/install.sh", 1)
+
+	if out, err := exec.Command(bash, "-c", command).CombinedOutput(); err != nil {
+		t.Fatalf("the suggested command does not run: %v\n%s\ncommand: %s", err, out, command)
+	}
+	if got := readRecord(t, record); got != dir {
+		t.Errorf("the installer received install dir %q, want %q", got, dir)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "proc-compose")); err != nil {
+		t.Errorf("the command did not update the binary in %s: %v", dir, err)
+	}
+
+	// Control: the assignment before curl sets it for curl, so the installer on
+	// the other end of the pipe sees nothing and updates its own default.
+	control := "PROC_COMPOSE_INSTALL_DIR='" + dir + "' curl -sSfL " + srv.URL + "/install.sh | bash"
+	if out, err := exec.Command(bash, "-c", control).CombinedOutput(); err == nil {
+		t.Logf("control output: %s", out)
+	}
+	if got := readRecord(t, record); got != "" {
+		t.Errorf("control case delivered %q to the installer; the regression this guards is not covered", got)
+	}
+}
+
+func readRecord(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the stub installer never recorded a directory (%s): %v", path, err)
+	}
+	return string(data)
+}
+
+func readReadme(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README: %v", err)
+	}
+	return string(data)
+}
+
+// noColour disables ANSI for one test. SetDisabled is the same switch --no-color
+// flips; the ansi package reads NO_COLOR once at init, so setting the variable
+// here would not take effect.
+func noColour(t *testing.T) {
+	t.Helper()
+	ansi.SetDisabled(true)
+	t.Cleanup(func() { ansi.SetDisabled(false) })
 }
 
 // ── cache reads ──────────────────────────────────────────────────────────────

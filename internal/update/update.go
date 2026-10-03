@@ -21,12 +21,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/anivaryam/proc-compose/internal/ansi"
 	"github.com/anivaryam/proc-compose/internal/paths"
 )
 
@@ -44,8 +44,13 @@ const (
 	// directory.
 	CacheFileName = "update-check.json"
 
-	// UpdateCommand is the supported way to install a newer release.
+	// UpdateCommand is the supported way to update a copy brokit manages.
 	UpdateCommand = "brokit update proc-compose"
+
+	// InstallScriptURL is proc-compose's own single-tool installer. It honours
+	// PROC_COMPOSE_INSTALL_DIR, which is what makes it able to update a specific
+	// copy rather than adding another one somewhere else.
+	InstallScriptURL = "https://raw.githubusercontent.com/anivaryam/proc-compose/main/install.sh"
 
 	// maxBodyBytes bounds how much of the GitHub response is read. The release
 	// document is a few KB; anything past this is not ours.
@@ -56,14 +61,10 @@ const (
 	httpTimeout = 3 * time.Second
 )
 
-// Message renders the notice for a newer release. Colour goes through
-// ansi.Wrap so NO_COLOR / --no-color are honoured by the same switch the
-// runner and monitor already use.
+// Message renders the notice for a newer release, using the upgrade commands
+// that fit the copy that is actually running.
 func Message(installed, latest string) string {
-	bold, reset := ansi.Wrap(ansi.Bold), ansi.Wrap(ansi.Reset)
-	return fmt.Sprintf("A new proc-compose release is available: %s%s%s → %s%s%s\nRun: %s%s%s\n",
-		bold, installed, reset, bold, latest, reset,
-		bold, UpdateCommand, reset)
+	return MessageFor(installed, latest, Detect())
 }
 
 // semver is a parsed MAJOR.MINOR.PATCH triple.
@@ -331,8 +332,17 @@ func (c *Checker) write(entry cacheEntry) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("update check: cannot write cache %s: %w", c.cachePath, err)
 	}
-	if err := os.Rename(name, c.cachePath); err != nil {
-		return fmt.Errorf("update check: cannot write cache %s: %w", c.cachePath, err)
+	for attempt := 0; ; attempt++ {
+		err := os.Rename(name, c.cachePath)
+		if err == nil {
+			return nil
+		}
+		// Windows briefly denies replacement while another reader or writer
+		// holds the destination open. Keep atomic replacement and retry only
+		// this permission error, for at most 200ms, in the background writer.
+		if runtime.GOOS != "windows" || !os.IsPermission(err) || attempt == 20 {
+			return fmt.Errorf("update check: cannot write cache %s: %w", c.cachePath, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return nil
 }
