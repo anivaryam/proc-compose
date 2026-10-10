@@ -23,16 +23,25 @@ import (
 
 // Runner starts and manages all configured processes.
 type Runner struct {
-	Config     *config.Config
-	ConfigPath string // absolute path to config file (used for reload)
-	Filter     []string
-	LogFile    io.Writer   // if non-nil, all output is also written here (no ANSI)
-	IPC        *ipc.Server // if non-nil, state + log events are broadcast to monitors
-	NoColor    bool        // disable ANSI color output (also set via NO_COLOR env var)
-	Verbose    bool        // enable verbose debug output
-	LogFormat  string      // output format: "text" (default) or "json"
-	HealthPort int         // if > 0, HTTP server listens on this port for /health
-	Silent     bool        // suppress startup banner (daemon child sets this)
+	Config        *config.Config
+	ConfigPath    string // absolute path to config file (used for reload)
+	Filter        []string
+	LogFile       io.Writer   // if non-nil, all output is also written here (no ANSI)
+	IPC           *ipc.Server // if non-nil, state + log events are broadcast to monitors
+	NoColor       bool        // disable ANSI color output (also set via NO_COLOR env var)
+	Verbose       bool        // enable verbose debug output
+	LogFormat     string      // output format: "text" (default) or "json"
+	HealthPort    int         // if > 0, HTTP server listens on this port for /health
+	Silent        bool        // suppress startup banner (daemon child sets this)
+	Output        io.Writer   // nil uses stdout; daemon children use their rotating output file
+	Journal       io.Writer   // canonical JSON-lines events, independently of human output
+	Project       *ipc.Project
+	ResolveConfig func(*config.Config) (*config.Config, error)
+	logMu         sync.Mutex
+	sequence      uint64
+	maxName       int
+	logErr        error
+	lastStates    map[string]ipc.ProcState
 
 	store atomic.Pointer[stateStore] // set during Run for command dispatch
 
@@ -66,7 +75,8 @@ type Runner struct {
 
 	// stopAck keeps the daemon alive until an in-flight "shutdown" command has
 	// had its verdict written to the client. Run's exit seals and drains it.
-	stopAck ackBarrier
+	stopAck     ackBarrier
+	lifecycleMu sync.Mutex // serializes restart admission with terminal-stack exit
 }
 
 // ackBarrier holds Run's exit until every in-flight shutdown command has
@@ -150,12 +160,8 @@ type procInfo struct {
 	colorIndex int
 }
 
-func (r *Runner) Run(ctx context.Context) error {
+func (r *Runner) Run(ctx context.Context) (result error) {
 	if r.NoColor {
-		ansi.SetDisabled(true)
-	}
-	if r.LogFormat == "json" {
-		LogFormat = "json"
 		ansi.SetDisabled(true)
 	}
 
@@ -173,11 +179,16 @@ func (r *Runner) Run(ctx context.Context) error {
 		names = append(names, p.name)
 	}
 
-	PrintBanner(names, maxName, BannerOptions{Silent: r.Silent})
+	PrintBanner(names, maxName, BannerOptions{Silent: r.Silent || r.LogFormat == "json"})
+	r.maxName = maxName
 
 	// Seed IPC with initial state before any process starts.
 	store := newStateStore(procs)
 	r.store.Store(store)
+	if r.Project == nil {
+		r.Project = &ipc.Project{RunID: fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()), ConfigPath: r.ConfigPath}
+	}
+	r.systemLog("info", "session.started", "session started")
 
 	// Start health server if configured. Bind synchronously so a failure
 	// surfaces to the caller (and aborts daemon startup) instead of silently
@@ -188,6 +199,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return fmt.Errorf("health server bind failed on port %d: %w", r.HealthPort, err)
 		}
 		go r.serveHealth(ln, store)
+		defer ln.Close()
 	}
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
@@ -195,32 +207,61 @@ func (r *Runner) Run(ctx context.Context) error {
 	// handleCommands is the only caller of Shutdown, and a command that arrived
 	// first would otherwise see a half-initialised runner.
 	r.beginRun(runCtx, cancelRun)
-	defer r.endRun()
+	defer func() {
+		r.endRun()
+		r.logMu.Lock()
+		logErr := r.logErr
+		r.logMu.Unlock()
+		if logErr != nil {
+			result = errors.Join(result, fmt.Errorf("event journal: %w", logErr))
+		}
+	}()
 
 	if r.IPC != nil {
 		for _, st := range store.snapshot() {
 			r.IPC.SetState(st)
 		}
 		go r.handleCommands(store)
-		go r.collectMetrics(ctx, store, procs)
+		go r.collectMetrics(runCtx, store, procs)
 	}
 
-	var (
-		wg          sync.WaitGroup
-		failedMu    sync.Mutex
-		failedNames []string
-	)
+	var wg sync.WaitGroup
 	for _, p := range procs {
 		wg.Add(1)
 		go func(p procInfo) {
 			defer wg.Done()
-			result := r.runProcess(runCtx, p, maxName, store)
-			if result.failed {
-				failedMu.Lock()
-				failedNames = append(failedNames, p.name)
-				failedMu.Unlock()
+			for {
+				result := r.runProcess(runCtx, p, maxName, store)
 				if result.failFast {
 					cancelRun()
+				}
+				st := store.get(p.name)
+				r.lifecycleMu.Lock()
+				st.mu.Lock()
+				st.active = len(st.restartCh) > 0 && runCtx.Err() == nil
+				st.mu.Unlock()
+				if r.IPC != nil && !store.anyActive() {
+					r.stopping.Store(true)
+					cancelRun()
+				}
+				r.lifecycleMu.Unlock()
+				if r.IPC == nil || p.proc.EffectiveMode() == config.ProcessModeTask || runCtx.Err() != nil {
+					return
+				}
+				// A terminal service remains controllable while another process
+				// keeps the daemon alive. Tasks retain one-shot semantics.
+				select {
+				case <-runCtx.Done():
+					return
+				case <-st.restartCh:
+					if updated, ok := r.getProc(p.name); ok {
+						p.proc = updated
+					}
+					st.resetReady()
+					st.mu.Lock()
+					st.restarts++
+					st.active = true
+					st.mu.Unlock()
 				}
 			}
 		}(p)
@@ -236,6 +277,13 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	// ctx.Err() != nil means a signal triggered shutdown — not a failure.
 	var runErr error
+	var failedNames []string
+	for _, st := range store.snapshot() {
+		if st.State == "failed" {
+			failedNames = append(failedNames, st.Name)
+		}
+	}
+	sort.Strings(failedNames)
 	if ctx.Err() == nil && len(failedNames) > 0 {
 		runErr = fmt.Errorf("processes failed: %s", strings.Join(failedNames, ", "))
 	}
@@ -280,6 +328,11 @@ func (r *Runner) beginRun(runCtx context.Context, cancel context.CancelFunc) {
 // main tears the IPC server down.
 func (r *Runner) endRun() {
 	verdict := r.ShutdownResult()
+	if verdict == nil {
+		r.systemLog("info", "shutdown.verified", "managed process cleanup verified")
+	} else {
+		r.systemLog("error", "shutdown.unverified", verdict.Error())
+	}
 
 	// Publish first, drain second.
 	//
@@ -319,47 +372,8 @@ const shutdownFlushTimeout = 10 * time.Second
 func (r *Runner) resolve() []procInfo {
 	var procs []procInfo
 
-	names := make([]string, 0, len(r.Config.Processes))
-	for name := range r.Config.Processes {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	filterSet := make(map[string]bool)
-	for _, f := range r.Filter {
-		filterSet[f] = true
-	}
-
-	// Expand filter to include transitive dependencies so that
-	// "proc-compose up app" also starts anything app depends on.
-	if len(filterSet) > 0 {
-		var expand func(name string)
-		expand = func(name string) {
-			proc, ok := r.Config.Processes[name]
-			if !ok {
-				return
-			}
-			for _, dep := range proc.DependsOn {
-				if !filterSet[dep] {
-					filterSet[dep] = true
-					expand(dep)
-				}
-			}
-		}
-		initial := make([]string, 0, len(filterSet))
-		for name := range filterSet {
-			initial = append(initial, name)
-		}
-		for _, name := range initial {
-			expand(name)
-		}
-	}
-
 	colorIdx := 0
-	for _, name := range names {
-		if len(filterSet) > 0 && !filterSet[name] {
-			continue
-		}
+	for _, name := range config.SelectedNames(r.Config, r.Filter) {
 		procs = append(procs, procInfo{
 			name:       name,
 			proc:       r.Config.Processes[name],
@@ -400,12 +414,11 @@ func (r *Runner) handleCommands(store *stateStore) {
 				res = ipc.CommandResult{Status: "error", Message: fmt.Sprintf("process %q is not currently managed", cmd.Process)}
 				break
 			}
-			if proc.EffectiveMode() == config.ProcessModeTask || st.state == "completed" {
+			if proc.EffectiveMode() == config.ProcessModeTask {
 				res = ipc.CommandResult{Status: "error", Message: fmt.Sprintf("process %q is a task and cannot be restarted; restart the stack to rerun tasks", cmd.Process)}
 				break
 			}
-			st.requestRestart()
-			res = ipc.CommandResult{Status: "ok"}
+			res = r.requestRestart(st)
 		case "reload":
 			res = r.Reload()
 		case "shutdown":
@@ -438,6 +451,20 @@ func (r *Runner) handleCommands(store *stateStore) {
 		cmd.WaitFlushed(shutdownFlushTimeout)
 		r.stopAck.leave()
 	}
+}
+
+func (r *Runner) requestRestart(st *procState) ipc.CommandResult {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopping.Load() {
+		return ipc.CommandResult{Status: "error", Message: "daemon is shutting down"}
+	}
+	st.mu.Lock()
+	st.active = true
+	generation := st.generation + 1
+	st.mu.Unlock()
+	st.requestRestart()
+	return ipc.CommandResult{Status: "ok", Generation: generation}
 }
 
 // shutdownAckTimeout bounds how long a "shutdown" command waits for the stack
@@ -496,6 +523,20 @@ const shutdownVerdictTimeout = 5 * time.Second
 // The listener is bound synchronously by Run so bind failures abort startup.
 func (r *Runner) serveHealth(ln net.Listener, store *stateStore) {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, req *http.Request) {
+		ready := true
+		states := store.snapshot()
+		for _, state := range states {
+			if !state.Ready {
+				ready = false
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if !ready {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ready": ready, "processes": states})
+	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		r.cfgMu.RLock()
 		defer r.cfgMu.RUnlock()

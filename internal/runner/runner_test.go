@@ -1,10 +1,13 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -22,6 +25,130 @@ import (
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
 )
+
+func TestRestart_RecoversFailedServiceInLiveDaemon(t *testing.T) {
+	trigger := filepath.Join(t.TempDir(), "fail")
+	if err := os.WriteFile(trigger, []byte("fail"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r := makeRunner(map[string]config.Process{
+		"worker": {Cmd: helperCmd("fail-after-file", trigger, "30s"), Restart: "never"},
+		"api":    {Cmd: helperCmd("sleep", "30s"), Restart: "never"},
+	})
+	socketPath, server, stopServer := ipcServerForTest(t)
+	defer stopServer()
+	r.IPC = server
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	}()
+	if !waitForProcState(t, r, "worker", func(s ipc.ProcState) bool { return s.State == "failed" }, 5*time.Second) {
+		t.Fatal("worker never failed")
+	}
+	if err := os.Remove(trigger); err != nil {
+		t.Fatal(err)
+	}
+	client, err := ipc.Dial(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Send(ipc.Command{Action: "restart", Process: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		event, err := client.RecvTimeout(5 * time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == ipc.TypeAck {
+			if event.Ack != "ok" || event.AckGeneration != 2 {
+				t.Fatalf("restart verdict: %+v", event)
+			}
+			break
+		}
+	}
+	if !waitForProcState(t, r, "worker", func(s ipc.ProcState) bool { return s.Generation == 2 && s.State == "running" && s.Ready }, 5*time.Second) {
+		t.Fatalf("worker did not recover: %+v", snapshotOf(r, "worker"))
+	}
+}
+
+func TestReload_RebuildsReadinessForReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	write := func(command, probe string, timeout int) {
+		t.Helper()
+		body := fmt.Sprintf("processes:\n  server:\n    cmd: %q\n    ready_timeout: %d\n    ready_when:\n      log: %q\n", command, timeout, probe)
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(helperCmd("log-block", "OLD"), "^OLD$", 10)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Config: cfg, ConfigPath: path, NoColor: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	}()
+	if !waitForProcState(t, r, "server", func(s ipc.ProcState) bool { return s.Ready }, 5*time.Second) {
+		t.Fatal("initial readiness failed")
+	}
+	write(helperCmd("log-block", "NEW"), "^NEW$", 1)
+	if result := r.Reload(); result.Status != "ok" {
+		t.Fatalf("reload: %+v", result)
+	}
+	if !waitForProcState(t, r, "server", func(s ipc.ProcState) bool { return s.Generation == 2 && s.Ready }, 3*time.Second) {
+		t.Fatalf("replacement did not use new probe: %+v", snapshotOf(r, "server"))
+	}
+	write(helperCmd("ready-after", "2s", "NEW"), "^NEW$", 1)
+	if result := r.Reload(); result.Status != "ok" {
+		t.Fatalf("reload: %+v", result)
+	}
+	if !waitForProcState(t, r, "server", func(s ipc.ProcState) bool {
+		return s.Generation == 3 && s.State == "failed" && strings.Contains(s.LastError, "1s")
+	}, 3*time.Second) {
+		t.Fatalf("replacement did not use new timeout: %+v", snapshotOf(r, "server"))
+	}
+}
+
+func TestReload_RejectsModeChangeBeforeMutatingRuntime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	if err := os.WriteFile(path, []byte("processes:\n  worker:\n    cmd: changed\n    mode: task\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r := makeRunner(map[string]config.Process{"worker": {Cmd: "original", Restart: "never"}})
+	r.ConfigPath = path
+	if result := r.Reload(); result.Status != "error" {
+		t.Fatalf("accepted unsupported transition: %+v", result)
+	}
+	if r.Config.Processes["worker"].Cmd != "original" {
+		t.Fatal("rejected reload mutated live configuration")
+	}
+}
+
+func TestReload_DetectsEmptyEnvironmentKeyReplacement(t *testing.T) {
+	a := config.Process{Cmd: "app", Env: map[string]string{"OLD": ""}}
+	b := config.Process{Cmd: "app", Env: map[string]string{"NEW": ""}}
+	if !procChanged(a, b) {
+		t.Fatal("environment key replacement was ignored")
+	}
+}
 
 const helperSentinel = "__PROC_COMPOSE_TEST_HELPER__"
 
@@ -169,10 +296,14 @@ func TestRunnerHelperProcess(t *testing.T) {
 		}
 		os.Exit(2)
 	case "log":
-		if len(args) != 2 {
+		if len(args) < 2 || len(args) > 3 {
 			os.Exit(2)
 		}
-		_, _ = os.Stdout.WriteString(args[1] + "\n")
+		output := os.Stdout
+		if len(args) == 3 && args[2] == "stderr" {
+			output = os.Stderr
+		}
+		_, _ = output.WriteString(args[1] + "\n")
 		os.Exit(0)
 	case "log-block":
 		if len(args) != 2 {
@@ -324,6 +455,75 @@ func TestRunnerHelperProcess(t *testing.T) {
 		os.Exit(0)
 	default:
 		os.Exit(2)
+	}
+}
+
+func TestRun_JSONEventsHaveOneIdentityAndPreserveStderr(t *testing.T) {
+	var output, journal bytes.Buffer
+	r := makeRunner(map[string]config.Process{
+		"job": {Cmd: helperCmd("log", `{"level":"error","message":"application failure"}`, "stderr"), Mode: config.ProcessModeTask, Restart: "never"},
+	})
+	r.Output, r.Journal, r.LogFormat, r.Verbose, r.Silent = &output, &journal, "json", true, true
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != journal.String() {
+		t.Fatal("console and journal diverged")
+	}
+	decoder := json.NewDecoder(&journal)
+	var sequence uint64
+	outputs := 0
+	for {
+		var event ipc.LogEntry
+		if err := decoder.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if event.Version != 1 || event.ID == "" || event.RunID == "" || event.Time.IsZero() || event.Sequence != sequence+1 {
+			t.Fatalf("invalid event identity: %+v", event)
+		}
+		sequence = event.Sequence
+		if event.Kind == "output" {
+			outputs++
+			if event.Stream != "stderr" || event.Level != "error" || event.Generation != 1 || event.PID <= 0 || event.Code != "process.output" {
+				t.Fatalf("lost output provenance: %+v", event)
+			}
+		}
+	}
+	if outputs != 1 {
+		t.Fatalf("application message emitted %d times", outputs)
+	}
+}
+
+func TestReadOutput_OversizedLineDoesNotLoseFollowingRecords(t *testing.T) {
+	var journal bytes.Buffer
+	r := &Runner{Output: io.Discard, Journal: &journal, Project: &ipc.Project{RunID: "test"}}
+	long := strings.Repeat("x", (1<<20)+17)
+	r.readOutput(procInfo{name: "worker"}, "stdout", strings.NewReader(long+"\nnext\n"), nil)
+	decoder := json.NewDecoder(&journal)
+	var first, next ipc.LogEntry
+	if err := decoder.Decode(&first); err != nil {
+		t.Fatal(err)
+	}
+	if err := decoder.Decode(&next); err != nil {
+		t.Fatal(err)
+	}
+	if !first.Truncated || first.OriginalBytes != len(long) || len(first.Line) != 1<<20 || next.Line != "next" {
+		t.Fatalf("oversized line contract lost: truncated=%v original=%d retained=%d next=%q", first.Truncated, first.OriginalBytes, len(first.Line), next.Line)
+	}
+}
+
+func TestRun_JournalFailureIsReported(t *testing.T) {
+	file, err := os.Create(filepath.Join(t.TempDir(), "closed.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	r := makeRunner(map[string]config.Process{"job": {Cmd: helperCmd("exit", "0"), Mode: config.ProcessModeTask}})
+	r.Journal, r.Output, r.Silent = file, io.Discard, true
+	if err := r.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "event journal") {
+		t.Fatalf("lost journal failure: %v", err)
 	}
 }
 
@@ -1219,11 +1419,11 @@ func TestReload_DetectsModeChange(t *testing.T) {
 
 func TestReload_DetectsReadyWhenChange(t *testing.T) {
 	a := config.Process{
-		Cmd: "echo",
+		Cmd:       "echo",
 		ReadyWhen: &config.ReadyWhen{HTTP: "http://localhost:3000/health"},
 	}
 	b := config.Process{
-		Cmd: "echo",
+		Cmd:       "echo",
 		ReadyWhen: &config.ReadyWhen{HTTP: "http://localhost:4000/health"},
 	}
 	if !procChanged(a, b) {

@@ -42,6 +42,7 @@ type Process struct {
 	ReadyWhen       *ReadyWhen        `yaml:"ready_when,omitempty"`       // probe to determine when process is ready
 	ReadyTimeout    int               `yaml:"ready_timeout,omitempty"`    // seconds to wait for readiness before failing; 0 = default (60s); -1 = no limit
 	DependsOn       []string          `yaml:"depends_on,omitempty"`       // wait for these processes to be ready before starting
+	Ports           map[string]int    `yaml:"ports,omitempty"`            // named preferred ports; 0 selects an ephemeral port
 }
 
 func (p Process) EffectiveMode() string {
@@ -63,6 +64,7 @@ type Merge struct {
 type Config struct {
 	Merge     *Merge             `yaml:"merge,omitempty"`
 	Processes map[string]Process `yaml:"processes"`
+	Resources []string           `yaml:"resources,omitempty"` // exclusive resource labels held while the stack runs
 }
 
 var processNameRe = regexp.MustCompile(`^[A-Za-z0-9][-A-Za-z0-9._]*[A-Za-z0-9]$|^[A-Za-z0-9]$`)
@@ -149,6 +151,11 @@ func Load(path string) (*Config, error) {
 	}
 
 	for name, proc := range cfg.Processes {
+		for portName, preferred := range proc.Ports {
+			if !processNameRe.MatchString(portName) || preferred < 0 || preferred > 65535 {
+				return nil, fmt.Errorf("process %q: invalid named port %q (%d)", name, portName, preferred)
+			}
+		}
 		if !processNameRe.MatchString(name) {
 			return nil, fmt.Errorf("process %q has an invalid name (must match [-A-Za-z0-9._], start/end with alphanumeric)", name)
 		}
@@ -250,13 +257,20 @@ func Load(path string) (*Config, error) {
 	if err := detectCycles(cfg.Processes); err != nil {
 		return nil, err
 	}
+	seenResources := make(map[string]bool)
+	for _, resource := range cfg.Resources {
+		if strings.TrimSpace(resource) == "" || len(resource) > 256 || strings.ContainsAny(resource, "\r\n\x00") || seenResources[resource] {
+			return nil, fmt.Errorf("invalid or duplicate resource label %q", resource)
+		}
+		seenResources[resource] = true
+	}
 
 	return &cfg, nil
 }
 
 func normalizeProcessDirs(processes map[string]Process, configDir string) {
 	for name, proc := range processes {
-		if proc.Dir == "" {
+		if proc.Dir == "" || strings.Contains(proc.Dir, "${session.") || strings.Contains(proc.Dir, "${config.") {
 			continue
 		}
 		if filepath.IsAbs(proc.Dir) {
@@ -266,6 +280,41 @@ func normalizeProcessDirs(processes map[string]Process, configDir string) {
 		}
 		processes[name] = proc
 	}
+}
+
+// SelectedNames is the single dependency-closure used by planning, startup,
+// readiness waiting, and dry-run output.
+func SelectedNames(cfg *Config, filter []string) []string {
+	selected := make(map[string]bool)
+	var include func(string)
+	include = func(name string) {
+		if selected[name] {
+			return
+		}
+		proc, exists := cfg.Processes[name]
+		if !exists {
+			return
+		}
+		selected[name] = true
+		for _, dep := range proc.DependsOn {
+			include(dep)
+		}
+	}
+	if len(filter) == 0 {
+		for name := range cfg.Processes {
+			include(name)
+		}
+	} else {
+		for _, name := range filter {
+			include(name)
+		}
+	}
+	names := make([]string, 0, len(selected))
+	for name := range selected {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // detectCycles checks for circular dependencies using DFS with three-color marking.

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -9,7 +10,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 
@@ -22,12 +22,14 @@ import (
 	"github.com/anivaryam/proc-compose/internal/monitor"
 	"github.com/anivaryam/proc-compose/internal/paths"
 	"github.com/anivaryam/proc-compose/internal/runner"
+	"github.com/anivaryam/proc-compose/internal/session"
 	"github.com/anivaryam/proc-compose/internal/systemd"
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
 )
 
 var version = "dev"
+var sessionName string
 
 func main() {
 	var configFile string
@@ -39,20 +41,30 @@ func main() {
 		Long: `A lightweight process runner that starts, logs, and manages
 multiple local services from a single YAML config.
 
+Coding agents:
+  proc-compose agent-guide             # offline, version-matched operating guide
+  proc-compose status --json           # readiness and resolved session metadata
+  proc-compose logs api --json --max-bytes 8192
+  proc-compose why api --json          # bounded failure evidence
+  Use -f and --session consistently; see agent-guide for cursors and cleanup.
+
 Config discovery:
   Without -f, proc-compose searches the current directory and walks upward
   for proc-compose.yml (and falls back to proc-compose.yaml). This lets
   commands run from any nested directory of a monorepo.
 
-Daemon files (per absolute config path):
-  Socket: $XDG_RUNTIME_DIR/pc-<hash>.sock (falls back to $TMPDIR)
+Daemon files (per absolute config path and optional session):
+  Socket: $XDG_RUNTIME_DIR/pc-<hash>.sock (Windows uses a named pipe)
   PID:    $XDG_RUNTIME_DIR/pc-<hash>.pid
   Log:    $XDG_RUNTIME_DIR/pc-<hash>.log (used when --log-file is not set)
+  Events: $XDG_RUNTIME_DIR/pc-<hash>.events.jsonl (structured rotating journal)
+  Without XDG_RUNTIME_DIR, use the per-user cache/proc-compose directory,
+  falling back to the temporary directory when a cache is unavailable.
 
 Environment variables read directly:
   NO_COLOR    Disable ANSI colour output (any non-empty value).
   PORT        Used as merge-port listen port when merge.port is omitted.
-  XDG_RUNTIME_DIR   Base dir for socket / PID / log; defaults to $TMPDIR.
+  XDG_RUNTIME_DIR   Base dir for socket / PID / log / session leases.
 
 Short-flag conflict:
   -v at the root prints the version. -v on "up" enables verbose debug
@@ -91,6 +103,8 @@ Report bugs: https://github.com/anivaryam/proc-compose/issues`,
 		noBanner      bool
 		waitReady     bool
 		waitTimeout   int
+		daemonChild   bool
+		upJSON        bool
 	)
 
 	// ── doctor ────────────────────────────────────────────────────────────────
@@ -142,6 +156,9 @@ auto-injection — see:
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if upJSON && !silent {
+				return fmt.Errorf("up --json requires --silent (use --log-format json for foreground event streaming)")
+			}
 			if survive {
 				if err := validateSurvivePlatform(runtime.GOOS); err != nil {
 					return err
@@ -176,7 +193,7 @@ auto-injection — see:
 
 			// Dry-run: validate config and print processes without starting
 			if dryRun {
-				r := &runner.Runner{Config: cfg}
+				r := &runner.Runner{Config: cfg, Filter: args}
 				r.ListProcesses()
 				return nil
 			}
@@ -227,8 +244,8 @@ auto-injection — see:
 				if effectiveLog == "" {
 					effectiveLog = paths.Log(hash)
 				}
-				childArgs := buildChildArgs(os.Args[1:], absConfig, effectiveLog)
-				pid, err := daemon.Reexec(childArgs, effectiveLog)
+				childArgs := buildChildArgs(args, absConfig, effectiveLog, cmd)
+				pid, err := daemon.Reexec(childArgs, paths.BootLog(hash))
 				if err != nil {
 					return err
 				}
@@ -241,7 +258,7 @@ auto-injection — see:
 				// connections) or dies. Without this handshake we'd report
 				// "daemon started" while the child silently crashed during
 				// startup, leaving the user with no daemon and no error.
-				if err := waitForDaemonReady(pid, socketPath, effectiveLog, 10*time.Second); err != nil {
+				if err := waitForDaemonReady(pid, socketPath, paths.BootLog(hash), 10*time.Second, pidPath); err != nil {
 					return err
 				}
 				if waitReady {
@@ -249,6 +266,13 @@ auto-injection — see:
 					if err := waitForProcessesReady(socketPath, expected, time.Duration(waitTimeout)*time.Second); err != nil {
 						return err
 					}
+				}
+				if upJSON {
+					project, err := session.Read(paths.Metadata(hash))
+					if err != nil {
+						return err
+					}
+					return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{"operation": "up", "pid": pid, "ready": waitReady, "project": project})
 				}
 				fmt.Printf("proc-compose daemon started\n")
 				fmt.Printf("  PID:     %d\n", pid)
@@ -259,6 +283,31 @@ auto-injection — see:
 			}
 
 			// ── Foreground ───────────────────────────────────────────────────
+			plan, err := session.Acquire(cfg, absConfig, hash, sessionName, args)
+			if err != nil {
+				return err
+			}
+			defer plan.Close()
+			cfg = plan.Config
+			plan.Project.LogPath = logFile
+			if logFile != "" {
+				logFile, err = filepath.Abs(logFile)
+				if err != nil {
+					return err
+				}
+				plan.Project.LogPath = logFile
+			}
+			if plan.Project.LogPath == "" {
+				plan.Project.LogPath = paths.Log(hash)
+			}
+			if err := session.Save(paths.Metadata(hash), plan.Project); err != nil {
+				return err
+			}
+			journal, err := logrotate.New(paths.Journal(hash), 10<<20, 3)
+			if err != nil {
+				return fmt.Errorf("event journal: %w", err)
+			}
+			defer journal.Close()
 			var logWriter io.WriteCloser
 			if logFile != "" {
 				if maxLogSize > 0 {
@@ -283,6 +332,7 @@ auto-injection — see:
 			// foreground and daemon-child modes — the latter relies on it for
 			// the parent's readiness handshake.
 			ipcServer := ipc.NewServer(socketPath)
+			ipcServer.SetProject(plan.Project)
 			if err := ipcServer.Listen(); err != nil {
 				daemon.Cleanup(pidPath, socketPath)
 				return fmt.Errorf("IPC bind failed: %w (path: %s)", err, sanitizePath(socketPath))
@@ -295,21 +345,27 @@ auto-injection — see:
 			signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 			go func() {
 				<-sig
-				fmt.Println()
 				cancel()
 			}()
+			defer signal.Stop(sig)
 
 			r := &runner.Runner{
-				Config:     cfg,
-				ConfigPath: absConfig,
-				Filter:     args,
-				LogFile:    logWriter,
-				IPC:        ipcServer,
-				NoColor:    noColor,
-				Verbose:    verbose,
-				LogFormat:  logFormat,
-				HealthPort: healthPort,
-				Silent:     noBanner,
+				Config:        cfg,
+				ConfigPath:    absConfig,
+				Filter:        args,
+				LogFile:       logWriter,
+				IPC:           ipcServer,
+				NoColor:       noColor,
+				Verbose:       verbose,
+				LogFormat:     logFormat,
+				HealthPort:    healthPort,
+				Silent:        noBanner,
+				Journal:       journal,
+				Project:       plan.Project,
+				ResolveConfig: plan.Resolve,
+			}
+			if daemonChild {
+				r.Output, r.LogFile = logWriter, nil
 			}
 
 			runErr := r.Run(ctx)
@@ -336,6 +392,9 @@ auto-injection — see:
 	upCmd.Flags().StringVar(&logFormat, "log-format", "text", "log output format: text or json")
 	upCmd.Flags().IntVar(&healthPort, "health-port", 0, "HTTP port for /health endpoint (0 = disabled)")
 	upCmd.Flags().BoolVar(&noBanner, "no-banner", false, "suppress startup banner (set automatically when daemonizing)")
+	upCmd.Flags().BoolVar(&daemonChild, "daemon-child", false, "internal daemon output routing")
+	_ = upCmd.Flags().MarkHidden("daemon-child")
+	upCmd.Flags().BoolVar(&upJSON, "json", false, "emit daemon session metadata as JSON (requires --silent)")
 	if err := upCmd.Flags().MarkHidden("no-banner"); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to hide --no-banner: %v\n", err)
 	}
@@ -554,6 +613,8 @@ See: https://github.com/anivaryam/proc-compose#auto-restart-on-reboot---survive`
 	}
 
 	// ── restart ──────────────────────────────────────────────────────────────
+	var restartWait bool
+	var restartTimeout int
 	restartCmd := &cobra.Command{
 		Use:     "restart <process>",
 		Aliases: []string{"r"},
@@ -595,6 +656,16 @@ applying another command.`,
 				if ev.Type == ipc.TypeAck {
 					switch ev.Ack {
 					case "ok":
+						if restartWait {
+							if ev.AckGeneration == 0 {
+								return fmt.Errorf("daemon does not expose process generations; restart it with the current proc-compose")
+							}
+							if err := waitForProcessesReady(socketPath, map[string]struct{}{args[0]: {}}, time.Duration(restartTimeout)*time.Second, map[string]uint64{args[0]: ev.AckGeneration}); err != nil {
+								return err
+							}
+							fmt.Printf("restarted %q and verified generation %d is ready\n", args[0], ev.AckGeneration)
+							return nil
+						}
 						fmt.Printf("restart requested for %q\n", args[0])
 						return nil
 					case "busy":
@@ -610,6 +681,8 @@ applying another command.`,
 			}
 		},
 	}
+	restartCmd.Flags().BoolVar(&restartWait, "wait-ready", false, "wait for the replacement incarnation's readiness")
+	restartCmd.Flags().IntVar(&restartTimeout, "timeout", 60, "seconds to wait for replacement readiness")
 
 	// ── reload ───────────────────────────────────────────────────────────────
 	reloadCmd := &cobra.Command{
@@ -703,7 +776,7 @@ non-zero on rejection or daemon-busy.`,
 			}
 
 			if statusJSON {
-				return printStatusJSON(ev.Processes, ev.TunnelURL)
+				return printStatusJSON(ev.Processes, ev.TunnelURL, ev.Project)
 			}
 			printStatusTable(ev.Processes, ev.TunnelURL)
 			return nil
@@ -738,46 +811,7 @@ sections. Suitable for CI and pre-commit checks.`,
 	}
 
 	// ── logs ─────────────────────────────────────────────────────────────────
-	var tailLines int
-	logsCmd := &cobra.Command{
-		Use:   "logs",
-		Short: "Show logs from a running or past daemon",
-		Long: `Print the tail of the daemon log file for the resolved config.
-
-When --silent was used without --log-file, the daemon writes to
-$XDG_RUNTIME_DIR/pc-<hash>.log (where <hash> is derived from the
-absolute config path). When --log-file was passed explicitly, the
-daemon writes to that file and this command will not find it — read
-the explicit file directly.
-
-Defaults to the last 50 lines; pass -n 0 to print the whole file.`,
-		Example:       "  proc-compose logs              # last 50 lines\n  proc-compose logs -n 200       # last 200 lines\n  proc-compose logs -n 0         # entire log file",
-		SilenceUsage:  true,
-		SilenceErrors: false,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			_, hash, _, _, err := resolveConfigPaths(configFile)
-			if err != nil {
-				return err
-			}
-			logPath := liveLogPath(hash)
-			if _, err := os.Stat(logPath); os.IsNotExist(err) {
-				return fmt.Errorf("no log file found at %s (daemon may not have run with --log-file)", sanitizePath(logPath))
-			}
-			data, err := os.ReadFile(logPath)
-			if err != nil {
-				return fmt.Errorf("cannot read log file %s: %w", sanitizePath(logPath), err)
-			}
-			lines := append([]string(nil), strings.Split(string(data), "\n")...)
-			if tailLines > 0 && tailLines < len(lines) {
-				lines = lines[len(lines)-tailLines:]
-			}
-			for _, l := range lines {
-				fmt.Println(l)
-			}
-			return nil
-		},
-	}
-	logsCmd.Flags().IntVarP(&tailLines, "tail", "n", 50, "show last N lines of log")
+	logsCmd := newLogsCommand(&configFile)
 
 	// ── man ───────────────────────────────────────────────────────────────────
 	var manDir string
@@ -895,17 +929,23 @@ See: https://github.com/anivaryam/proc-compose#diagnose-or-generate-config`,
 	doctorCmd.Flags().BoolVar(&doctorJSON, "json", false, "emit machine-readable JSON")
 
 	rootCmd.PersistentFlags().StringVarP(&configFile, "file", "f", "proc-compose.yml", "config file path (default searches current and parent dirs)")
+	rootCmd.PersistentFlags().StringVar(&sessionName, "session", "", "named session with independent identity, ports, logs, and runtime directory")
 	uninstallCmd.Flags().StringVar(&uninstallName, "name", "", "service name to uninstall")
 	if err := uninstallCmd.MarkFlagRequired("name"); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to mark --name as required: %v\n", err)
 	}
-	rootCmd.AddCommand(upCmd, monitorCmd, stopCmd, listCmd, initCmd, restartCmd, reloadCmd, uninstallCmd, logsCmd, manCmd, statusCmd, validateCmd, bootstrapCmd, doctorCmd)
+	rootCmd.AddCommand(upCmd, monitorCmd, stopCmd, listCmd, initCmd, restartCmd, reloadCmd, uninstallCmd, logsCmd, manCmd, statusCmd, validateCmd, bootstrapCmd, doctorCmd, newWhyCommand(&configFile), newAgentGuideCommand())
 
 	// The update notice runs before every command's own work, so it is
 	// printed above the output it refers to and never after a TUI has taken
 	// over the screen. Cobra returns for --help and --version before any run
 	// hook, so those never reach it.
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		if sessionName != "" {
+			if err := validateUnitName(sessionName); err != nil {
+				return fmt.Errorf("invalid --session: %w", err)
+			}
+		}
 		printUpdateNotice(cmd, version, stderrIsTerminal())
 		return nil
 	}
@@ -922,7 +962,7 @@ func resolveConfigPaths(configFile string) (absConfig, hash, socketPath, pidPath
 	if err != nil {
 		return "", "", "", "", err
 	}
-	hash, err = paths.FromConfig(absConfig)
+	hash, err = paths.FromConfig(absConfig, sessionName)
 	if err != nil {
 		return "", "", "", "", err
 	}

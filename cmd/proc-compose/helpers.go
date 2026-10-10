@@ -22,6 +22,7 @@ import (
 	"github.com/anivaryam/proc-compose/internal/paths"
 	"github.com/anivaryam/proc-compose/internal/update"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"golang.org/x/term"
 )
 
@@ -212,7 +213,25 @@ func checkOptionalBinaries(cfg *config.Config) error {
 // buildChildArgs constructs the args slice for the daemonized child process.
 // It strips --silent/-s, replaces any -f/--file with the resolved absolute
 // path, and injects --log-file if not already present.
-func buildChildArgs(osArgs []string, absConfigFile, logFile string) []string {
+func buildChildArgs(osArgs []string, absConfigFile, logFile string, parsed ...*cobra.Command) []string {
+	if len(parsed) > 0 {
+		args := []string{"up"}
+		parsed[0].Flags().Visit(func(flag *pflag.Flag) {
+			switch flag.Name {
+			case "silent", "json", "wait-ready", "wait-timeout", "file", "session", "daemon-child", "no-banner":
+				return
+			}
+			if flag.Value.Type() == "bool" {
+				args = append(args, "--"+flag.Name+"="+flag.Value.String())
+			} else {
+				args = append(args, "--"+flag.Name, flag.Value.String())
+			}
+		})
+		if sessionName != "" {
+			args = append(args, "--session", sessionName)
+		}
+		osArgs = append(args, osArgs...)
+	}
 	stripped := daemon.StripFlag(osArgs, "--silent", false)
 	stripped = daemon.StripFlag(stripped, "-s", false)
 
@@ -249,6 +268,7 @@ func buildChildArgs(osArgs []string, absConfigFile, logFile string) []string {
 	if !hasNoBanner {
 		out = append(out, "--no-banner")
 	}
+	out = append(out, "--daemon-child")
 
 	return out
 }
@@ -257,7 +277,7 @@ func buildChildArgs(osArgs []string, absConfigFile, logFile string) []string {
 // connections) or has died. Returns a descriptive error with a log tail if
 // the daemon does not come up within timeout, so users see the real failure
 // instead of "daemon started" followed by "no daemon found".
-func waitForDaemonReady(pid int, socketPath, logPath string, timeout time.Duration) error {
+func waitForDaemonReady(pid int, socketPath, logPath string, timeout time.Duration, pidPath ...string) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		if !daemon.IsAlive(pid) {
@@ -269,7 +289,16 @@ func waitForDaemonReady(pid int, socketPath, logPath string, timeout time.Durati
 		c, err := ipc.Dial(socketPath)
 		if err == nil {
 			c.Close()
-			return nil
+			if len(pidPath) == 0 {
+				return nil
+			}
+			owner, address, readErr := daemon.ReadPID(pidPath[0])
+			if readErr == nil {
+				if owner != pid || address != socketPath {
+					return fmt.Errorf("startup lost session ownership to another daemon; this invocation did not start that session")
+				}
+				return nil
+			}
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf(
@@ -598,34 +627,8 @@ func getHomeDir() (string, error) {
 // wait on every configured process.
 func waitReadyProcessNames(cfg *config.Config, filter []string) map[string]struct{} {
 	want := make(map[string]struct{})
-	if len(filter) == 0 {
-		for name := range cfg.Processes {
-			want[name] = struct{}{}
-		}
-		return want
-	}
-	for _, n := range filter {
+	for _, n := range config.SelectedNames(cfg, filter) {
 		want[n] = struct{}{}
-	}
-	// Expand transitive depends_on so the set matches what the runner
-	// actually started.
-	for {
-		grew := false
-		for name := range want {
-			proc, ok := cfg.Processes[name]
-			if !ok {
-				continue
-			}
-			for _, dep := range proc.DependsOn {
-				if _, seen := want[dep]; !seen {
-					want[dep] = struct{}{}
-					grew = true
-				}
-			}
-		}
-		if !grew {
-			break
-		}
 	}
 	return want
 }
@@ -635,7 +638,7 @@ func waitReadyProcessNames(cfg *config.Config, filter []string) map[string]struc
 // timeout elapses (whichever comes first). Used by `up --silent --wait-ready`
 // to give scripts a hard guarantee that probes have passed before the next
 // step runs.
-func waitForProcessesReady(socketPath string, want map[string]struct{}, timeout time.Duration) error {
+func waitForProcessesReady(socketPath string, want map[string]struct{}, timeout time.Duration, minimum ...map[string]uint64) error {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
@@ -657,6 +660,9 @@ func waitForProcessesReady(socketPath string, want map[string]struct{}, timeout 
 	// restarting, exited, failed) retracts an earlier success so a stale
 	// ready=true can't satisfy the waiter.
 	satisfied := func(p ipc.ProcState) bool {
+		if len(minimum) > 0 && p.Generation < minimum[0][p.Name] {
+			return false
+		}
 		switch p.State {
 		case "completed":
 			return true // the runner only reaches "completed" on task success
@@ -672,6 +678,10 @@ func waitForProcessesReady(socketPath string, want map[string]struct{}, timeout 
 	// a later failure.
 	check := func(p ipc.ProcState) {
 		if _, expected := want[p.Name]; !expected {
+			return
+		}
+		if len(minimum) > 0 && p.Generation < minimum[0][p.Name] {
+			delete(ready, p.Name)
 			return
 		}
 		if p.State == "failed" {
@@ -789,13 +799,16 @@ func printStatusTable(procs []ipc.ProcState, tunnelURL string) {
 // printStatusJSON emits a stable machine-readable shape that scripts can
 // consume without parsing the table. Wraps processes + tunnel into a single
 // object so callers get one JSON document, not a stream.
-func printStatusJSON(procs []ipc.ProcState, tunnelURL string) error {
+func printStatusJSON(procs []ipc.ProcState, tunnelURL string, project ...*ipc.Project) error {
 	sortProcs(procs)
 	out := map[string]any{
 		"processes": procs,
 	}
 	if tunnelURL != "" {
 		out["tunnel_url"] = tunnelURL
+	}
+	if len(project) > 0 && project[0] != nil {
+		out["project"] = project[0]
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -1027,7 +1040,7 @@ func resolveLiveDaemonPaths(configFile string) (absConfig, hash, socketPath, pid
 	if err != nil {
 		return "", "", "", "", err
 	}
-	hash, err = paths.FromConfig(absConfig)
+	hash, err = paths.FromConfig(absConfig, sessionName)
 	if err != nil {
 		return "", "", "", "", err
 	}
@@ -1043,6 +1056,7 @@ func resolveLiveDaemonPaths(configFile string) (absConfig, hash, socketPath, pid
 // rest of the machine-readable surfaces are listed in updateNoticeSkip.
 
 var updateNoticeSkip = map[string]bool{
+	"agent-guide":      true,
 	"help":             true,
 	"completion":       true,
 	"__complete":       true,

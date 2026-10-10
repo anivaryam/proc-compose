@@ -1,5 +1,7 @@
 package ipc
 
+import "encoding/json"
+
 // logRing is a fixed-capacity ring buffer of log entries. We use it instead
 // of a sliding slice (`s = s[1:]`) because the sliding form forces a memmove
 // every push once the cap is reached, and BroadcastLog runs once per line
@@ -7,25 +9,43 @@ package ipc
 //
 // Push is O(1). Snapshot is O(n) only when called.
 type logRing struct {
-	buf  []LogEntry
-	head int // index of next write
-	n    int // number of valid entries (≤ cap(buf))
+	buf   []LogEntry
+	head  int // index of next write
+	n     int // number of valid entries (≤ cap(buf))
+	sizes []int
+	bytes int
 }
 
 func newLogRing(capacity int) *logRing {
-	return &logRing{buf: make([]LogEntry, 0, capacity)}
+	return &logRing{buf: make([]LogEntry, capacity), sizes: make([]int, capacity)}
 }
 
-func (r *logRing) push(e LogEntry) {
-	cap := cap(r.buf)
-	if r.n < cap {
-		r.buf = append(r.buf, e)
-		r.n++
-		r.head = r.n % cap
+func (r *logRing) push(e LogEntry, encodedSize ...int) {
+	const budget = 256 << 10
+	capacity := len(r.buf)
+	if capacity == 0 {
 		return
 	}
-	r.buf[r.head] = e
-	r.head = (r.head + 1) % cap
+	size := 0
+	if len(encodedSize) > 0 {
+		size = encodedSize[0]
+	} else {
+		data, _ := json.Marshal(e)
+		size = len(data)
+	}
+	if size > budget {
+		return
+	}
+	for r.n > 0 && (r.n == capacity || r.bytes+size > budget) {
+		oldest := (r.head - r.n + capacity) % capacity
+		r.bytes -= r.sizes[oldest]
+		r.buf[oldest] = LogEntry{}
+		r.n--
+	}
+	r.buf[r.head], r.sizes[r.head] = e, size
+	r.bytes += size
+	r.n++
+	r.head = (r.head + 1) % capacity
 }
 
 // snapshot returns a copy of the entries in oldest-to-newest order.
@@ -34,14 +54,9 @@ func (r *logRing) snapshot() []LogEntry {
 	if r.n == 0 {
 		return out
 	}
-	if r.n < cap(r.buf) {
-		copy(out, r.buf[:r.n])
-		return out
+	oldest := (r.head - r.n + len(r.buf)) % len(r.buf)
+	for i := range out {
+		out[i] = r.buf[(oldest+i)%len(r.buf)]
 	}
-	// Buffer is full: oldest entry is at head.
-	tail := len(r.buf) - r.head
-	copy(out, r.buf[r.head:])
-	copy(out[tail:], r.buf[:r.head])
 	return out
 }
-

@@ -1,28 +1,15 @@
 package runner
 
 import (
-	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/anivaryam/proc-compose/internal/ansi"
 )
-
-// LogFormat controls the output format for logs. "text" (default) or "json".
-var LogFormat = "text"
 
 // wrap is a thin alias for ansi.Wrap so existing callsites stay short.
 // Colour state lives in the ansi package now (initialised from NO_COLOR,
 // updated via ansi.SetDisabled when the user passes --no-color).
 func wrap(code string) string { return ansi.Wrap(code) }
-
-// logEntry represents a JSON log entry for structured logging.
-type logEntry struct {
-	Time    string `json:"time"`
-	Process string `json:"process"`
-	Level   string `json:"level"`
-	Message string `json:"message"`
-}
 
 const (
 	colorReset  = ansi.Reset
@@ -49,7 +36,7 @@ type BannerOptions struct {
 // Suppressed entirely when the runner is in JSON log mode (mixed text and
 // JSON output breaks log aggregator parsers) or when opts.Silent is set.
 func PrintBanner(names []string, maxName int, opts BannerOptions) {
-	if opts.Silent || LogFormat == "json" {
+	if opts.Silent {
 		return
 	}
 	fmt.Println()
@@ -67,56 +54,9 @@ func PrintBanner(names []string, maxName int, opts BannerOptions) {
 }
 
 func FormatLine(name string, maxName int, colorIndex int, line string) string {
-	if LogFormat == "json" {
-		entry := logEntry{Time: time.Now().Format(time.RFC3339), Process: name, Level: "info", Message: line}
-		data, _ := json.Marshal(entry)
-		return string(data)
-	}
 	c := colorFor(colorIndex)
 	return fmt.Sprintf("%s%s%-*s%s %s│%s %s",
 		wrap(colorBold), c, maxName, name, wrap(colorReset),
 		wrap(colorDim), wrap(colorReset),
 		line)
-}
-
-func PrintProcessEvent(name string, maxName int, colorIndex int, event string) {
-	if LogFormat == "json" {
-		entry := logEntry{Time: time.Now().Format(time.RFC3339), Process: name, Level: "info", Message: event}
-		data, _ := json.Marshal(entry)
-		fmt.Println(string(data))
-		return
-	}
-	c := colorFor(colorIndex)
-	fmt.Printf("%s%s%-*s%s %s│%s %s%s%s\n",
-		wrap(colorBold), c, maxName, name, wrap(colorReset),
-		wrap(colorDim), wrap(colorReset),
-		wrap(colorYellow), event, wrap(colorReset))
-}
-
-func PrintProcessDebug(name string, maxName int, colorIndex int, event string) {
-	if LogFormat == "json" {
-		entry := logEntry{Time: time.Now().Format(time.RFC3339), Process: name, Level: "debug", Message: event}
-		data, _ := json.Marshal(entry)
-		fmt.Println(string(data))
-		return
-	}
-	c := colorFor(colorIndex)
-	fmt.Printf("%s%s%-*s%s %s│%s %s%s%s\n",
-		wrap(colorBold), c, maxName, name, wrap(colorReset),
-		wrap(colorDim), wrap(colorReset),
-		wrap(colorDim), event, wrap(colorReset))
-}
-
-func PrintProcessError(name string, maxName int, colorIndex int, event string) {
-	if LogFormat == "json" {
-		entry := logEntry{Time: time.Now().Format(time.RFC3339), Process: name, Level: "error", Message: event}
-		data, _ := json.Marshal(entry)
-		fmt.Println(string(data))
-		return
-	}
-	c := colorFor(colorIndex)
-	fmt.Printf("%s%s%-*s%s %s│%s %s%s%s\n",
-		wrap(colorBold), c, maxName, name, wrap(colorReset),
-		wrap(colorDim), wrap(colorReset),
-		wrap(colorRed), event, wrap(colorReset))
 }

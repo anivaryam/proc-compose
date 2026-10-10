@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/anivaryam/proc-compose/internal/config"
@@ -11,22 +12,34 @@ import (
 // Reload re-reads the config file and restarts any processes whose
 // definition changed. The returned result tells the IPC client whether
 // every requested change took effect:
-//   "ok"      — config parsed, all changes applied (or none needed)
-//   "partial" — applied what we could, but skipped processes added or
-//               removed since the daemon started (hot-add/remove unsupported)
-//   "error"   — config could not be parsed
+//
+//	"ok"      — config parsed, all changes applied (or none needed)
+//	"partial" — applied what we could, but skipped processes added or
+//	            removed since the daemon started (hot-add/remove unsupported)
+//	"error"   — config could not be parsed
 func (r *Runner) Reload() ipc.CommandResult {
 	if r.ConfigPath == "" {
 		r.systemEvent("reload: no config path set", true)
 		return ipc.CommandResult{Status: "error", Message: "no config path set"}
 	}
 	newCfg, err := config.Load(r.ConfigPath)
+	if err == nil && r.ResolveConfig != nil {
+		newCfg, err = r.ResolveConfig(newCfg)
+	}
 	if err != nil {
 		r.systemEvent(fmt.Sprintf("reload: %v", err), true)
 		return ipc.CommandResult{Status: "error", Message: err.Error()}
 	}
 
 	r.cfgMu.Lock()
+	// Validate immutable runtime semantics before mutating any live definition.
+	for name, newProc := range newCfg.Processes {
+		if oldProc, exists := r.Config.Processes[name]; exists &&
+			(oldProc.EffectiveMode() != newProc.EffectiveMode() || !slices.Equal(oldProc.DependsOn, newProc.DependsOn)) {
+			r.cfgMu.Unlock()
+			return ipc.CommandResult{Status: "error", Message: fmt.Sprintf("process %q changes mode or dependencies; restart the stack to apply this change", name)}
+		}
+	}
 	type change struct {
 		name string
 		proc config.Process
@@ -43,7 +56,6 @@ func (r *Runner) Reload() ipc.CommandResult {
 			continue
 		}
 		if procChanged(oldProc, newProc) {
-			r.Config.Processes[name] = newProc
 			changes = append(changes, change{name: name, proc: newProc})
 		}
 	}
@@ -67,14 +79,21 @@ func (r *Runner) Reload() ipc.CommandResult {
 		if store != nil {
 			st = store.get(c.name)
 		}
-		if st != nil && st.state == "completed" {
+		if c.proc.EffectiveMode() == config.ProcessModeTask {
 			skipped = append(skipped, c.name)
 			r.systemEvent(fmt.Sprintf("reload: %q is completed and cannot be restarted; restart the daemon to apply changes", c.name), false)
 			continue
 		}
 		if st != nil {
-			st.requestRestart()
-			r.systemEvent(fmt.Sprintf("reload: restarting %q (config changed)", c.name), false)
+			r.cfgMu.Lock()
+			r.Config.Processes[c.name] = c.proc
+			r.cfgMu.Unlock()
+			if result := r.requestRestart(st); result.Status != "ok" {
+				return result
+			}
+			r.systemEvent(fmt.Sprintf("reload: restart requested for %q (config changed)", c.name), false)
+		} else {
+			skipped = append(skipped, c.name)
 		}
 	}
 	if len(changes) == 0 && len(added) == 0 && len(removed) == 0 {
@@ -122,7 +141,7 @@ func procChanged(a, b config.Process) bool {
 		return true
 	}
 	for k, v := range a.Env {
-		if b.Env[k] != v {
+		if other, exists := b.Env[k]; !exists || other != v {
 			return true
 		}
 	}

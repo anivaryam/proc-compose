@@ -33,6 +33,16 @@ func TestFromConfig_DifferentPathsDifferentHashes(t *testing.T) {
 	}
 }
 
+func TestFromConfig_NamedSessionsPreserveDefaultIdentity(t *testing.T) {
+	legacy, _ := FromConfig("proc-compose.yml")
+	defaultSession, _ := FromConfig("proc-compose.yml", "")
+	first, _ := FromConfig("proc-compose.yml", "first")
+	second, _ := FromConfig("proc-compose.yml", "second")
+	if legacy != defaultSession || first == second || first == legacy {
+		t.Fatal("session identity collision or legacy identity changed")
+	}
+}
+
 func TestSocket_PathFormat(t *testing.T) {
 	hash := "deadbeef"
 	got := Socket(hash)

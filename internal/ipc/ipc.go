@@ -1,7 +1,13 @@
 // Package ipc provides inter-process communication via Unix domain sockets or Windows named pipes.
 package ipc
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
+
+// Includes worst-case JSON escaping and the legacy IPC line alias.
+const MaxEventBytes = 16 << 20
 
 // Event types sent over the Unix socket (newline-delimited JSON).
 const (
@@ -29,14 +35,65 @@ type ProcState struct {
 	ColorIndex int       `json:"color_index"`
 	CPUPercent float64   `json:"cpu_percent,omitempty"` // CPU usage as percentage
 	MemoryMB   float64   `json:"memory_mb,omitempty"`   // memory usage in megabytes
+	Generation uint64    `json:"generation,omitempty"`
+	LastError  string    `json:"last_error,omitempty"`
+	ExitCode   *int      `json:"exit_code,omitempty"`
+	DependsOn  []string  `json:"depends_on,omitempty"`
 }
 
 // LogEntry is a single log line emitted by a managed process.
 type LogEntry struct {
-	Process string `json:"process"`
-	Line    string `json:"line"`
-	IsEvent bool   `json:"is_event,omitempty"` // process lifecycle event (yellow)
-	IsError bool   `json:"is_error,omitempty"` // error-level line (red)
+	Version       int        `json:"schema_version,omitempty"`
+	ID            string     `json:"id,omitempty"`
+	RunID         string     `json:"run_id,omitempty"`
+	Sequence      uint64     `json:"sequence,omitempty"`
+	Session       string     `json:"session,omitempty"`
+	Time          time.Time  `json:"time,omitempty"`
+	Process       string     `json:"process"`
+	Line          string     `json:"message"`
+	Kind          string     `json:"kind,omitempty"`
+	Level         string     `json:"level,omitempty"`
+	Code          string     `json:"code,omitempty"`
+	Stream        string     `json:"stream,omitempty"`
+	PID           int        `json:"pid,omitempty"`
+	Generation    uint64     `json:"generation,omitempty"`
+	State         *ProcState `json:"state,omitempty"`
+	Truncated     bool       `json:"truncated,omitempty"`
+	OriginalBytes int        `json:"original_bytes,omitempty"`
+	IsEvent       bool       `json:"is_event,omitempty"` // process lifecycle event (yellow)
+	IsError       bool       `json:"is_error,omitempty"` // error-level line (red)
+}
+
+// Older daemons used "line". Keep their events readable by upgraded clients.
+func (e *LogEntry) UnmarshalJSON(data []byte) error {
+	type plain LogEntry
+	var wire struct {
+		plain
+		LegacyLine *string `json:"line"`
+		Message    *string `json:"message"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*e = LogEntry(wire.plain)
+	if wire.Message != nil {
+		e.Line = *wire.Message
+	} else if wire.LegacyLine != nil {
+		e.Line = *wire.LegacyLine
+	}
+	return nil
+}
+
+type Project struct {
+	Session     string                       `json:"session,omitempty"`
+	RunID       string                       `json:"run_id"`
+	ConfigPath  string                       `json:"config_path"`
+	Directory   string                       `json:"directory"`
+	Ports       map[string]map[string]int    `json:"ports,omitempty"`
+	URLs        map[string]map[string]string `json:"urls,omitempty"`
+	Resources   []string                     `json:"resources,omitempty"`
+	LogPath     string                       `json:"log_path,omitempty"`
+	JournalPath string                       `json:"journal_path"`
 }
 
 // CommandResult carries a runner's verdict for a command back to the
@@ -49,8 +106,9 @@ type LogEntry struct {
 //
 // Message holds a human-readable explanation and is empty for plain "ok".
 type CommandResult struct {
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
+	Status     string `json:"status"`
+	Message    string `json:"message,omitempty"`
+	Generation uint64 `json:"generation,omitempty"`
 }
 
 // Command is a message sent from a CLI client to the daemon. The Reply
@@ -97,6 +155,7 @@ type Event struct {
 	Processes  []ProcState `json:"processes,omitempty"`
 	RecentLogs []LogEntry  `json:"recent_logs,omitempty"`
 	TunnelURL  string      `json:"tunnel_url,omitempty"` // non-empty when a tunnel is active
+	Project    *Project    `json:"project,omitempty"`
 
 	// TypeLog — a log line from a running process.
 	Log *LogEntry `json:"log,omitempty"`
@@ -111,6 +170,31 @@ type Event struct {
 	// "partial", "error", "busy". AckDetail carries an optional
 	// human-readable explanation (e.g. which processes were skipped on a
 	// partial reload, or why a command was rejected).
-	Ack       string `json:"ack,omitempty"`
-	AckDetail string `json:"ack_detail,omitempty"`
+	Ack           string `json:"ack,omitempty"`
+	AckDetail     string `json:"ack_detail,omitempty"`
+	AckGeneration uint64 `json:"ack_generation,omitempty"`
+}
+
+// Keep the historical IPC "line" field for already-running older monitors.
+// The journal and agent pages use LogEntry directly and retain one "message"
+// field, so compatibility does not double agent context or persisted storage.
+func (e Event) MarshalJSON() ([]byte, error) {
+	type plain Event
+	type legacyLog struct {
+		LogEntry
+		LegacyLine string `json:"line"`
+	}
+	var log *legacyLog
+	if e.Log != nil {
+		log = &legacyLog{LogEntry: *e.Log, LegacyLine: e.Log.Line}
+	}
+	var recent []legacyLog
+	for _, entry := range e.RecentLogs {
+		recent = append(recent, legacyLog{LogEntry: entry, LegacyLine: entry.Line})
+	}
+	return json.Marshal(struct {
+		plain
+		Log        *legacyLog  `json:"log,omitempty"`
+		RecentLogs []legacyLog `json:"recent_logs,omitempty"`
+	}{plain: plain(e), Log: log, RecentLogs: recent})
 }

@@ -23,6 +23,7 @@ type Server struct {
 	history   *logRing // bounded buffer of recent log lines
 	states    map[string]*ProcState
 	tunnelURL string // last public URL reported by the tunnel process
+	project   *Project
 
 	cmdCh chan Command // received commands forwarded to runner
 }
@@ -108,6 +109,12 @@ func (s *Server) SetState(st ProcState) {
 	s.mu.Unlock()
 }
 
+func (s *Server) SetProject(project *Project) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.project = project
+}
+
 // BroadcastLog adds the entry to the ring buffer and fans it out to monitors.
 func (s *Server) BroadcastLog(entry LogEntry) {
 	ev, err := json.Marshal(Event{Type: TypeLog, Log: &entry})
@@ -118,7 +125,7 @@ func (s *Server) BroadcastLog(entry LogEntry) {
 	ev = append(ev, '\n')
 
 	s.mu.Lock()
-	s.history.push(entry)
+	s.history.push(entry, len(ev))
 	clients := s.clientSlice()
 	s.mu.Unlock()
 
@@ -239,6 +246,7 @@ func (s *Server) handleCommand(conn net.Conn, in *Command) {
 		case res := <-cmd.Reply:
 			ack.Ack = res.Status
 			ack.AckDetail = res.Message
+			ack.AckGeneration = res.Generation
 		case <-time.After(30 * time.Second):
 			ack.Ack = "error"
 			ack.AckDetail = "timed out waiting for runner reply"
@@ -295,5 +303,5 @@ func (s *Server) snapshot() Event {
 		procs = append(procs, *st)
 	}
 	hist := s.history.snapshot()
-	return Event{Type: TypeSnapshot, Processes: procs, RecentLogs: hist, TunnelURL: s.tunnelURL}
+	return Event{Type: TypeSnapshot, Processes: procs, RecentLogs: hist, TunnelURL: s.tunnelURL, Project: s.project}
 }

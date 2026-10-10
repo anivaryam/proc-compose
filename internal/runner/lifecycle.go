@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
-	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
 type processRunResult struct {
@@ -35,8 +33,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		if depSt == nil {
 			continue // validated at config load; defensive guard
 		}
-		PrintProcessEvent(p.name, maxName, p.colorIndex, fmt.Sprintf("waiting for %s...", dep))
-		r.logEvent(p, fmt.Sprintf("waiting for %s...", dep))
+		r.processLog(p, "info", "dependency.wait", fmt.Sprintf("waiting for %s...", dep))
 		select {
 		case <-ctx.Done():
 			depSt.mu.Lock()
@@ -44,10 +41,10 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			depSt.mu.Unlock()
 			if depFailed {
 				msg := fmt.Sprintf("dependency %q failed", dep)
-				PrintProcessError(p.name, maxName, p.colorIndex, msg)
-				r.logEvent(p, msg)
+				r.processLog(p, "error", "dependency.failed", msg)
 				st.mu.Lock()
 				st.state = "failed"
+				st.lastError = msg
 				st.mu.Unlock()
 				r.broadcastState(p, st)
 				st.markReady(false)
@@ -60,10 +57,10 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			depSt.mu.Unlock()
 			if !depOK {
 				msg := fmt.Sprintf("dependency %q failed", dep)
-				PrintProcessError(p.name, maxName, p.colorIndex, msg)
-				r.logEvent(p, msg)
+				r.processLog(p, "error", "dependency.failed", msg)
 				st.mu.Lock()
 				st.state = "failed"
+				st.lastError = msg
 				st.mu.Unlock()
 				r.broadcastState(p, st)
 				st.markReady(false)
@@ -76,17 +73,23 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		return r.runTaskProcess(ctx, p, maxName, st)
 	}
 
-	// Pre-compile log probe regex once (validated at config load).
-	var logRe *regexp.Regexp
-	if p.proc.ReadyWhen != nil && p.proc.ReadyWhen.Log != "" {
-		logRe = regexp.MustCompile(p.proc.ReadyWhen.Log)
-	}
-	readyTimeout := resolveReadyTimeout(p.proc.ReadyTimeout)
-
 	for {
+		// Readiness settings belong to an incarnation, including after reload.
+		if updated, ok := r.getProc(p.name); ok {
+			p.proc = updated
+		}
+		var logRe *regexp.Regexp
+		if p.proc.ReadyWhen != nil && p.proc.ReadyWhen.Log != "" {
+			logRe = regexp.MustCompile(p.proc.ReadyWhen.Log)
+		}
+		readyTimeout := resolveReadyTimeout(p.proc.ReadyTimeout)
 		st.mu.Lock()
 		st.startedAt = time.Now()
-		st.state = "running"
+		st.state = "starting"
+		st.pid = 0
+		st.generation++
+		st.lastError = ""
+		st.exitCode = nil
 		st.mu.Unlock()
 		r.broadcastState(p, st)
 
@@ -104,8 +107,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		}()
 
 		onStart, onLine := r.buildReadinessCallbacks(p, maxName, st, logRe, readyTimeout, procCtx, procCancel, func(msg string) {
-			PrintProcessDebug(p.name, maxName, p.colorIndex, msg)
-			r.logEvent(p, msg)
+			r.processLog(p, "debug", "readiness.progress", msg)
 		})
 
 		startTime := time.Now()
@@ -127,7 +129,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			st.state = "exited"
 			st.mu.Unlock()
 			r.broadcastState(p, st)
-			PrintProcessEvent(p.name, maxName, p.colorIndex, "stopped")
+			r.processLog(p, "info", "process.stopped", "stopped")
 			return processRunResult{}
 		default:
 		}
@@ -146,8 +148,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 				p.proc = updated
 			}
 			st.resetReady()
-			PrintProcessEvent(p.name, maxName, p.colorIndex, "restarting (requested)...")
-			r.logEvent(p, "restarting (requested)...")
+			r.processLog(p, "info", "process.restart_requested", "restarting (requested)...")
 			st.mu.Lock()
 			st.restarts++
 			st.state = "restarting"
@@ -170,8 +171,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 				if p.proc.MaxRestarts > 0 && next > p.proc.MaxRestarts {
 					return processRunResult{failed: r.giveUp(p, maxName, st)}
 				}
-				PrintProcessEvent(p.name, maxName, p.colorIndex, "exited, restarting...")
-				r.logEvent(p, "exited, restarting...")
+				r.processLog(p, "info", "process.restarting", "exited, restarting...")
 				// A fresh cycle means a fresh readiness latch: dependents must
 				// wait for the new incarnation's probe, not the dead one's.
 				st.resetReady()
@@ -183,13 +183,16 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 				time.Sleep(backoff)
 				continue
 			}
-			PrintProcessEvent(p.name, maxName, p.colorIndex, "exited")
-			r.logEvent(p, "exited")
+			r.processLog(p, "info", "process.exited", "exited")
 			return processRunResult{}
 		}
 
-		PrintProcessError(p.name, maxName, p.colorIndex, fmt.Sprintf("exited: %v", err))
-		r.logEvent(p, fmt.Sprintf("exited: %v", err))
+		r.processLog(p, "error", "process.failed", fmt.Sprintf("exited: %v", err))
+		st.mu.Lock()
+		if st.lastError == "" {
+			st.lastError = err.Error()
+		}
+		st.mu.Unlock()
 
 		if p.proc.Restart == "never" {
 			st.mu.Lock()
@@ -214,8 +217,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		st.state = "restarting"
 		st.mu.Unlock()
 		r.broadcastState(p, st)
-		PrintProcessEvent(p.name, maxName, p.colorIndex, fmt.Sprintf("restarting in %s...", backoff))
-		r.logEvent(p, fmt.Sprintf("restarting in %s...", backoff))
+		r.processLog(p, "info", "process.restarting", fmt.Sprintf("restarting in %s...", backoff))
 
 		select {
 		case <-ctx.Done():
@@ -237,7 +239,9 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st *procState) processRunResult {
 	st.mu.Lock()
 	st.startedAt = time.Now()
-	st.state = "running"
+	st.state = "starting"
+	st.pid = 0
+	st.generation++
 	st.mu.Unlock()
 	r.broadcastState(p, st)
 
@@ -252,7 +256,7 @@ func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st
 		st.state = "exited"
 		st.mu.Unlock()
 		r.broadcastState(p, st)
-		PrintProcessEvent(p.name, maxName, p.colorIndex, "stopped")
+		r.processLog(p, "info", "process.stopped", "stopped")
 		return processRunResult{}
 	}
 
@@ -262,16 +266,15 @@ func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st
 		st.mu.Unlock()
 		st.markReady(true)
 		r.broadcastState(p, st)
-		PrintProcessEvent(p.name, maxName, p.colorIndex, "completed")
-		r.logEvent(p, "completed")
+		r.processLog(p, "info", "task.completed", "completed")
 		return processRunResult{}
 	}
 
 	msg := fmt.Sprintf("task failed: %v", err)
-	PrintProcessError(p.name, maxName, p.colorIndex, msg)
-	r.logEvent(p, msg)
+	r.processLog(p, "error", "task.failed", msg)
 	st.mu.Lock()
 	st.state = "failed"
+	st.lastError = msg
 	st.mu.Unlock()
 	st.markReady(false)
 	r.broadcastState(p, st)
@@ -296,19 +299,16 @@ func (r *Runner) buildReadinessCallbacks(
 		onStart = func() {
 			st.markReady(true)
 			r.broadcastState(p, st)
-			PrintProcessEvent(p.name, maxName, p.colorIndex, "ready")
-			r.logEvent(p, "ready")
+			r.processLog(p, "info", "process.ready", "ready")
 		}
 	case p.proc.ReadyWhen.HTTP != "":
 		probeURL := p.proc.ReadyWhen.HTTP
 		onStart = func() {
 			go func() {
 				ok := probeHTTP(procCtx, probeURL, readyTimeout, func(msg string) {
-					PrintProcessDebug(p.name, maxName, p.colorIndex, msg)
-					r.logEvent(p, msg)
+					r.processLog(p, "debug", "readiness.progress", msg)
 				}, func(msg string) {
-					PrintProcessDebug(p.name, maxName, p.colorIndex, msg)
-					r.logEvent(p, msg)
+					r.processLog(p, "debug", "readiness.progress", msg)
 				})
 				r.handleProbeResult(p, maxName, st, "http", ok, procCtx, procCancel)
 			}()
@@ -318,11 +318,9 @@ func (r *Runner) buildReadinessCallbacks(
 		onStart = func() {
 			go func() {
 				ok := probeTCP(procCtx, probeAddr, readyTimeout, func(msg string) {
-					PrintProcessDebug(p.name, maxName, p.colorIndex, msg)
-					r.logEvent(p, msg)
+					r.processLog(p, "debug", "readiness.progress", msg)
 				}, func(msg string) {
-					PrintProcessDebug(p.name, maxName, p.colorIndex, msg)
-					r.logEvent(p, msg)
+					r.processLog(p, "debug", "readiness.progress", msg)
 				})
 				r.handleProbeResult(p, maxName, st, "tcp", ok, procCtx, procCancel)
 			}()
@@ -338,19 +336,19 @@ func (r *Runner) buildReadinessCallbacks(
 					st.mu.Unlock()
 					if !alreadyReady && procCtx.Err() == nil {
 						msg := fmt.Sprintf("readiness probe (log) timed out after %s", readyTimeout)
-						PrintProcessError(p.name, maxName, p.colorIndex, msg)
-						r.logEvent(p, msg)
+						st.mu.Lock()
+						st.lastError = msg
+						st.mu.Unlock()
+						r.processLog(p, "error", "readiness.failed", msg)
 						procCancel()
 					}
 				}
 			}()
 		}
 		onLine = func(line string) {
-			if logRe.MatchString(line) {
-				st.markReady(true)
+			if logRe.MatchString(line) && st.markReady(true) {
 				r.broadcastState(p, st)
-				PrintProcessEvent(p.name, maxName, p.colorIndex, "ready (log match)")
-				r.logEvent(p, "ready (log match)")
+				r.processLog(p, "info", "process.ready", "ready (log match)")
 			}
 		}
 	}
@@ -389,7 +387,10 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
-	cmd.Stderr = cmd.Stdout
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start: %w", err)
@@ -411,7 +412,9 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 
 	st.mu.Lock()
 	st.pid = cmd.Process.Pid
+	st.state = "running"
 	st.mu.Unlock()
+	r.broadcastState(p, st)
 
 	// Observe the command leader's exit without reaping it.
 	//
@@ -446,7 +449,7 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	// Releases the log reader if something outside the group still holds the
 	// pipe after the group has been killed.
 	var escaped atomic.Bool
-	closeStdout := sync.OnceFunc(func() { _ = stdout.Close() })
+	closeStdout := sync.OnceFunc(func() { _ = stdout.Close(); _ = stderr.Close() })
 
 	if onStart != nil {
 		onStart()
@@ -457,32 +460,11 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	// own output reaches end-of-stream while still working, so end-of-stream is
 	// an observation about the output and never a reason to terminate anything.
 	scanDone := make(chan struct{})
-	go func() {
-		defer close(scanDone)
-		scanner := bufio.NewScanner(stdout)
-		// Default 64 KiB buffer truncates long log lines (minified JSON, stack
-		// traces) silently. 1 MiB matches the IPC client's bound and is plenty
-		// for normal process output.
-		scanner.Buffer(make([]byte, 64*1024), 1<<20)
-		for scanner.Scan() {
-			raw := scanner.Text()
-			fmt.Println(FormatLine(p.name, maxName, p.colorIndex, raw))
-			if r.LogFile != nil {
-				fmt.Fprintf(r.LogFile, "%s | %s\n", p.name, raw)
-			}
-			if r.IPC != nil {
-				r.IPC.BroadcastLog(ipc.LogEntry{Process: p.name, Line: raw})
-				if p.name == "tunnel" {
-					if url := extractTunnelURL(raw); url != "" {
-						r.IPC.BroadcastTunnelURL(url)
-					}
-				}
-			}
-			if onLine != nil {
-				onLine(raw)
-			}
-		}
-	}()
+	var readers sync.WaitGroup
+	readers.Add(2)
+	go func() { defer readers.Done(); r.readOutput(p, "stdout", stdout, onLine) }()
+	go func() { defer readers.Done(); r.readOutput(p, "stderr", stderr, onLine) }()
+	go func() { readers.Wait(); close(scanDone) }()
 
 	// The exit observer runs for the lifetime of the command. It never reaps:
 	// WNOWAIT on Linux, and an EVFILT_PROC knote on macOS, both report the exit
@@ -624,6 +606,16 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	} else {
 		err = cmd.Wait()
 	}
+	code := 0
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		code = exitErr.ExitCode()
+	} else if err != nil {
+		code = -1
+	}
+	st.mu.Lock()
+	st.exitCode = &code
+	st.mu.Unlock()
 
 	// Verify now that every signal has been sent and the leader is collected.
 	if state := pg.State(); state != GroupEmpty {
@@ -852,13 +844,14 @@ func (r *Runner) handleProbeResult(p procInfo, maxName int, st *procState, kind 
 	if ok {
 		st.markReady(true)
 		r.broadcastState(p, st)
-		PrintProcessEvent(p.name, maxName, p.colorIndex, "ready ("+kind+" probe)")
-		r.logEvent(p, "ready ("+kind+" probe)")
+		r.processLog(p, "info", "process.ready", "ready ("+kind+" probe)")
 		return
 	}
 	msg := "readiness probe (" + kind + ") timed out"
-	PrintProcessError(p.name, maxName, p.colorIndex, msg)
-	r.logEvent(p, msg)
+	st.mu.Lock()
+	st.lastError = msg
+	st.mu.Unlock()
+	r.processLog(p, "error", "readiness.failed", msg)
 	procCancel()
 }
 
@@ -879,10 +872,10 @@ func resolveReadyTimeout(seconds int) time.Duration {
 // Extracted from runProcess to avoid duplication.
 func (r *Runner) giveUp(p procInfo, maxName int, st *procState) bool {
 	msg := fmt.Sprintf("max restarts (%d) reached, giving up", p.proc.MaxRestarts)
-	PrintProcessError(p.name, maxName, p.colorIndex, msg)
-	r.logEvent(p, msg)
+	r.processLog(p, "error", "process.restart_limit", msg)
 	st.mu.Lock()
 	st.state = "failed"
+	st.lastError = msg
 	st.mu.Unlock()
 	r.broadcastState(p, st)
 	return true

@@ -15,20 +15,23 @@ import (
 // FNV-64 is used over MD5: identifier is non-security (just a per-config
 // directory namespace), and FNV avoids tripping security scanners that flag
 // md5 sums regardless of context.
-func FromConfig(configFile string) (string, error) {
+func FromConfig(configFile string, session ...string) (string, error) {
 	abs, err := filepath.Abs(configFile)
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve config path: %w", err)
 	}
 	h := fnv.New64a()
 	h.Write([]byte(abs))
+	if len(session) > 0 && session[0] != "" {
+		h.Write([]byte("\x00" + session[0]))
+	}
 	return fmt.Sprintf("%016x", h.Sum64())[:8], nil
 }
 
 // runtimeDir returns a per-user directory for daemon files. Preference:
-//   1. $XDG_RUNTIME_DIR (Linux: /run/user/$UID, already mode 0700)
-//   2. os.UserCacheDir() + "/proc-compose" (mkdir 0700)
-//   3. os.TempDir() as last resort (shared; no privacy guarantees)
+//  1. $XDG_RUNTIME_DIR (Linux: /run/user/$UID, already mode 0700)
+//  2. os.UserCacheDir() + "/proc-compose" (mkdir 0700)
+//  3. os.TempDir() as last resort (shared; no privacy guarantees)
 //
 // Failures fall back silently to os.TempDir so the caller's open/listen call
 // surfaces the eventual error with a meaningful path.
@@ -92,3 +95,9 @@ func PID(hash string) string {
 func Log(hash string) string {
 	return filepath.Join(runtimeDir(), "pc-"+hash+".log")
 }
+
+func Journal(hash string) string    { return filepath.Join(runtimeDir(), "pc-"+hash+".events.jsonl") }
+func Metadata(hash string) string   { return filepath.Join(runtimeDir(), "pc-"+hash+".meta.json") }
+func BootLog(hash string) string    { return filepath.Join(runtimeDir(), "pc-"+hash+".boot.log") }
+func SessionDir(hash string) string { return filepath.Join(runtimeDir(), "pc-"+hash+".d") }
+func LeaseDir() string              { return filepath.Join(runtimeDir(), "proc-compose-leases") }

@@ -2,7 +2,6 @@ package runner
 
 import (
 	"fmt"
-	"sort"
 
 	"github.com/anivaryam/proc-compose/internal/ansi"
 	"github.com/anivaryam/proc-compose/internal/config"
@@ -15,10 +14,9 @@ func (r *Runner) ListProcesses() {
 	}
 
 	names := make([]string, 0, len(r.Config.Processes))
-	for name := range r.Config.Processes {
-		names = append(names, name)
+	for _, p := range r.resolve() {
+		names = append(names, p.name)
 	}
-	sort.Strings(names)
 
 	maxName := 0
 	for _, name := range names {

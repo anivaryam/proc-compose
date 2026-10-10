@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -17,13 +19,153 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anivaryam/proc-compose/internal/agentguide"
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/logs"
 	"github.com/anivaryam/proc-compose/internal/paths"
+	"github.com/anivaryam/proc-compose/internal/session"
 	"github.com/anivaryam/proc-compose/internal/update"
 	"github.com/spf13/cobra"
 )
+
+func TestAgentGuide_OfflineOutputAndBrokenPipe(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(cwd)
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	command := newAgentGuideCommand()
+	command.SetOut(&output)
+	command.SetArgs(nil)
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != agentguide.Text {
+		t.Fatal("CLI guide diverged from shipped Markdown")
+	}
+	if updateNoticeEligible(command, true) {
+		t.Fatal("offline agent guide can trigger network update notices")
+	}
+	reader, writer := io.Pipe()
+	reader.Close()
+	defer writer.Close()
+	command = newAgentGuideCommand()
+	command.SilenceErrors, command.SilenceUsage = true, true
+	command.SetOut(writer)
+	command.SetArgs(nil)
+	if err := command.Execute(); err == nil {
+		t.Fatal("guide ignored output failure")
+	}
+}
+
+func TestWhy_RetainedFailurePacketIncludesDependencyAndExitEvidence(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	configPath := filepath.Join(t.TempDir(), "proc-compose.yml")
+	hash, _ := paths.FromConfig(configPath)
+	project := &ipc.Project{RunID: "run", ConfigPath: configPath, JournalPath: paths.Journal(hash)}
+	if err := session.Save(paths.Metadata(hash), project); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(paths.Journal(hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := 7
+	states := []ipc.ProcState{{Name: "api", State: "failed", LastError: "readiness failed", ExitCode: &code, Generation: 1}, {Name: "web", State: "failed", DependsOn: []string{"api"}, LastError: "dependency failed", Generation: 1}}
+	for i := range states {
+		if err := json.NewEncoder(file).Encode(ipc.LogEntry{Version: 1, ID: fmt.Sprintf("run:%d", i+1), RunID: "run", Process: states[i].Name, Kind: "state", State: &states[i], Line: states[i].State}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file.Close()
+	var output bytes.Buffer
+	command := newWhyCommand(&configPath)
+	command.SetOut(&output)
+	command.SetArgs([]string{"web", "--json"})
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var report explanation
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Source != "retained" || len(report.BlockedBy) != 1 || report.BlockedBy[0].Name != "api" || *report.BlockedBy[0].ExitCode != 7 || len(report.Context.Events) != 2 {
+		t.Fatalf("failure evidence missing: %+v", report)
+	}
+}
+
+func TestLogsFollow_ResumesAndCancelsWithoutReplay(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	configPath := filepath.Join(t.TempDir(), "proc-compose.yml")
+	hash, _ := paths.FromConfig(configPath)
+	file, err := os.OpenFile(paths.Journal(hash), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	write := func(sequence uint64) {
+		t.Helper()
+		event := ipc.LogEntry{Version: 1, ID: fmt.Sprintf("run:%d", sequence), RunID: "run", Sequence: sequence, Process: "worker", Kind: "output", Line: "message"}
+		if err := json.NewEncoder(file).Encode(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(1)
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := newLogsCommand(&configPath)
+	command.SetContext(ctx)
+	command.SetOut(writer)
+	command.SetArgs([]string{"--json", "--follow", "--after", "start"})
+	done := make(chan error, 1)
+	go func() { defer writer.Close(); done <- command.Execute() }()
+	decoder := json.NewDecoder(reader)
+	var first, second logs.Page
+	if err := decoder.Decode(&first); err != nil {
+		t.Fatal(err)
+	}
+	write(2)
+	if err := decoder.Decode(&second); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Events) != 1 || first.Events[0].ID != "run:1" || len(second.Events) != 1 || second.Events[0].ID != "run:2" {
+		t.Fatalf("follow replayed or lost output: %+v %+v", first, second)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("follow ignored cancellation")
+	}
+}
+
+func TestBuildChildArgs_ParsedFlagsDoNotReenterDaemonParent(t *testing.T) {
+	command := &cobra.Command{Use: "up"}
+	command.Flags().Bool("silent", false, "")
+	command.Flags().Bool("json", false, "")
+	command.Flags().Bool("wait-ready", false, "")
+	command.Flags().Bool("verbose", false, "")
+	if err := command.ParseFlags([]string{"--silent=true", "--json", "--wait-ready", "--verbose"}); err != nil {
+		t.Fatal(err)
+	}
+	child := buildChildArgs([]string{"worker"}, "/abs/cfg.yml", "/tmp/log", command)
+	joined := strings.Join(child, " ")
+	if strings.Contains(joined, "--silent") || strings.Contains(joined, "--json") || strings.Contains(joined, "--wait-ready") || !strings.Contains(joined, "--verbose=true") || !strings.Contains(joined, "--daemon-child") {
+		t.Fatalf("invalid child options: %v", child)
+	}
+}
 
 func TestValidateUnitName(t *testing.T) {
 	good := []string{"app", "myapp", "app_1", "app-1", "app.1", "A", "x123_y-z.t", strings.Repeat("a", 64)}
@@ -53,7 +195,7 @@ func TestValidateUnitName(t *testing.T) {
 
 func TestBuildChildArgs_StripsSilentAndInjectsFile(t *testing.T) {
 	got := buildChildArgs([]string{"up", "--silent"}, "/abs/cfg.yml", "/var/log/x.log")
-	want := []string{"--file", "/abs/cfg.yml", "up", "--log-file", "/var/log/x.log", "--no-banner"}
+	want := []string{"--file", "/abs/cfg.yml", "up", "--log-file", "/var/log/x.log", "--no-banner", "--daemon-child"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
@@ -61,7 +203,7 @@ func TestBuildChildArgs_StripsSilentAndInjectsFile(t *testing.T) {
 
 func TestBuildChildArgs_StripsShortSilent(t *testing.T) {
 	got := buildChildArgs([]string{"up", "-s"}, "/abs/cfg.yml", "/var/log/x.log")
-	want := []string{"--file", "/abs/cfg.yml", "up", "--log-file", "/var/log/x.log", "--no-banner"}
+	want := []string{"--file", "/abs/cfg.yml", "up", "--log-file", "/var/log/x.log", "--no-banner", "--daemon-child"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
@@ -69,7 +211,7 @@ func TestBuildChildArgs_StripsShortSilent(t *testing.T) {
 
 func TestBuildChildArgs_ReplacesExistingFileFlag(t *testing.T) {
 	got := buildChildArgs([]string{"up", "-f", "old.yml", "--silent"}, "/abs/cfg.yml", "/v/x.log")
-	want := []string{"--file", "/abs/cfg.yml", "up", "--log-file", "/v/x.log", "--no-banner"}
+	want := []string{"--file", "/abs/cfg.yml", "up", "--log-file", "/v/x.log", "--no-banner", "--daemon-child"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
@@ -77,7 +219,7 @@ func TestBuildChildArgs_ReplacesExistingFileFlag(t *testing.T) {
 
 func TestBuildChildArgs_PreservesExistingLogFile(t *testing.T) {
 	got := buildChildArgs([]string{"up", "--silent", "--log-file", "user.log"}, "/abs/cfg.yml", "/auto.log")
-	want := []string{"--file", "/abs/cfg.yml", "up", "--log-file", "user.log", "--no-banner"}
+	want := []string{"--file", "/abs/cfg.yml", "up", "--log-file", "user.log", "--no-banner", "--daemon-child"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
@@ -687,6 +829,32 @@ func TestWaitForProcessesReady_RestartingNotReady(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("waitForProcessesReady did not return within the test deadline")
+	}
+}
+
+func TestWaitForProcessesReady_RequiresReplacementGeneration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket scripted peer")
+	}
+	for _, oldState := range []string{"failed", "running"} {
+		t.Run(oldState, func(t *testing.T) {
+			peer := newScriptedPeer(t, []ipc.ProcState{{Name: "svc", State: oldState, Ready: true, Generation: 1}})
+			done := make(chan error, 1)
+			go func() {
+				done <- waitForProcessesReady(peer.socketPath, map[string]struct{}{"svc": {}}, 3*time.Second, map[string]uint64{"svc": 2})
+			}()
+			peer.waitConnected(t)
+			peer.push(ipc.ProcState{Name: "svc", State: "running", Generation: 2, Ready: false})
+			peer.push(ipc.ProcState{Name: "svc", State: "running", Generation: 2, Ready: true})
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(4 * time.Second):
+				t.Fatal("replacement waiter did not finish")
+			}
+		})
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/anivaryam/proc-compose/internal/daemon"
 	"net"
 	"os"
 	"os/exec"
@@ -135,5 +136,18 @@ func TestWaitForDaemonReady_SucceedsWhenSocketReady(t *testing.T) {
 	os.WriteFile(logPath, []byte(""), 0644)
 	if err := waitForDaemonReady(cmd.Process.Pid, socketPath, logPath, 2*time.Second); err != nil {
 		t.Fatalf("expected nil when socket is ready, got: %v", err)
+	}
+	pidPath := filepath.Join(t.TempDir(), "owner.pid")
+	if err := daemon.WritePID(pidPath, os.Getpid(), socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForDaemonReady(cmd.Process.Pid, socketPath, logPath, time.Second, pidPath); err == nil || !strings.Contains(err.Error(), "ownership") {
+		t.Fatalf("accepted another daemon's socket: %v", err)
+	}
+	if err := daemon.WritePID(pidPath, cmd.Process.Pid, socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForDaemonReady(cmd.Process.Pid, socketPath, logPath, time.Second, pidPath); err != nil {
+		t.Fatalf("rejected owned daemon: %v", err)
 	}
 }

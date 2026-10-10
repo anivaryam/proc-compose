@@ -16,6 +16,10 @@ type procState struct {
 	colorIndex int
 	cpuPercent float64
 	memoryMB   float64
+	generation uint64
+	lastError  string
+	exitCode   *int
+	active     bool
 
 	// Readiness signaling for depends_on.
 	// All fields below are guarded by mu so that resetReady (called between
@@ -42,6 +46,7 @@ func newStateStore(infos []procInfo) *stateStore {
 	for _, p := range infos {
 		s.procs[p.name] = &procState{
 			state:      "starting",
+			active:     true,
 			colorIndex: p.colorIndex,
 			readyCh:    make(chan struct{}),
 			restartCh:  make(chan struct{}, 1),
@@ -56,17 +61,18 @@ func newStateStore(infos []procInfo) *stateStore {
 // exited/failed before becoming ready (waiters should treat this as failure).
 // Safe to call multiple times within a cycle; only the first call has any
 // effect. After resetReady the cycle is renewed and markReady can fire again.
-func (st *procState) markReady(ok bool) {
+func (st *procState) markReady(ok bool) bool {
 	st.mu.Lock()
 	if st.readyClosed {
 		st.mu.Unlock()
-		return
+		return false
 	}
 	st.readyClosed = true
 	st.readyOK = ok
 	ch := st.readyCh
 	st.mu.Unlock()
 	close(ch)
+	return true
 }
 
 // currentlyReady reports whether readiness should be advertised right now.
@@ -156,8 +162,26 @@ func (s *stateStore) snapshot() []ipc.ProcState {
 			ColorIndex: p.colorIndex,
 			CPUPercent: p.cpuPercent,
 			MemoryMB:   p.memoryMB,
+			Generation: p.generation,
+			LastError:  p.lastError,
+			ExitCode:   p.exitCode,
+			DependsOn:  append([]string(nil), info.proc.DependsOn...),
 		})
 		p.mu.Unlock()
 	}
 	return out
+}
+
+func (s *stateStore) anyActive() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.procs {
+		p.mu.Lock()
+		active := p.active
+		p.mu.Unlock()
+		if active {
+			return true
+		}
+	}
+	return false
 }

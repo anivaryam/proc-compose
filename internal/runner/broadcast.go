@@ -1,19 +1,83 @@
 package runner
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
+// readOutput consumes oversized lines without blocking the child or silently
+// ending the stream. The retained prefix and original size are explicit.
+func (r *Runner) readOutput(p procInfo, stream string, input io.Reader, onLine func(string)) {
+	const maxLine = 1 << 20
+	reader := bufio.NewReaderSize(input, 64*1024)
+	var retained []byte
+	total := 0
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		complete := err != bufio.ErrBufferFull
+		hasLine := len(fragment) > 0 || total > 0
+		if complete {
+			fragment = bytes.TrimSuffix(bytes.TrimSuffix(fragment, []byte("\n")), []byte("\r"))
+		}
+		total += len(fragment)
+		if available := maxLine - len(retained); available > 0 {
+			if len(fragment) > available {
+				fragment = fragment[:available]
+			}
+			retained = append(retained, fragment...)
+		}
+		if complete && hasLine {
+			raw := string(retained)
+			level := "info"
+			var fields struct {
+				Level    string `json:"level"`
+				Severity string `json:"severity"`
+			}
+			if json.Unmarshal(retained, &fields) == nil {
+				candidate := strings.ToLower(fields.Level)
+				if candidate == "" {
+					candidate = strings.ToLower(fields.Severity)
+				}
+				switch candidate {
+				case "debug", "info", "warn", "error", "fatal":
+					level = candidate
+				}
+			}
+			event := ipc.LogEntry{Kind: "output", Level: level, Code: "process.output", Stream: stream, Line: raw, IsError: level == "error" || level == "fatal"}
+			if total > maxLine {
+				event.Truncated, event.OriginalBytes = true, total
+			}
+			r.emit(p, event)
+			if r.IPC != nil && p.name == "tunnel" {
+				if url := extractTunnelURL(raw); url != "" {
+					r.IPC.BroadcastTunnelURL(url)
+				}
+			}
+			if onLine != nil {
+				onLine(raw)
+			}
+			retained, total = retained[:0], 0
+		}
+		if err != nil && err != bufio.ErrBufferFull {
+			if err != io.EOF {
+				r.processLog(p, "error", "output.read_failed", err.Error())
+			}
+			return
+		}
+	}
+}
+
 // broadcastState pushes the current state to IPC (no-op if IPC is nil).
 func (r *Runner) broadcastState(p procInfo, st *procState) {
-	if r.IPC == nil {
-		return
-	}
 	st.mu.Lock()
 	snap := ipc.ProcState{
 		Name:       p.name,
@@ -26,36 +90,103 @@ func (r *Runner) broadcastState(p procInfo, st *procState) {
 		ColorIndex: p.colorIndex,
 		CPUPercent: st.cpuPercent,
 		MemoryMB:   st.memoryMB,
+		Generation: st.generation,
+		LastError:  st.lastError,
+		ExitCode:   st.exitCode,
+		DependsOn:  append([]string(nil), p.proc.DependsOn...),
 	}
 	st.mu.Unlock()
-	r.IPC.BroadcastState(snap)
+	if r.IPC != nil {
+		r.IPC.BroadcastState(snap)
+	}
+	r.logMu.Lock()
+	previous, exists := r.lastStates[p.name]
+	changed := !exists || previous.State != snap.State || previous.Generation != snap.Generation || previous.PID != snap.PID || previous.Ready != snap.Ready || previous.LastError != snap.LastError
+	if r.lastStates == nil {
+		r.lastStates = make(map[string]ipc.ProcState)
+	}
+	r.lastStates[p.name] = snap
+	r.logMu.Unlock()
+	if changed {
+		r.emit(p, ipc.LogEntry{Kind: "state", Level: "debug", Code: "process.state", Line: snap.State, State: &snap, IsEvent: true})
+	}
 }
 
-// logEvent writes a plain lifecycle line to LogFile (no-op if nil).
-func (r *Runner) logEvent(p procInfo, event string) {
-	if r.LogFile != nil {
-		fmt.Fprintf(r.LogFile, "%s | %s\n", p.name, event)
+func (r *Runner) processLog(p procInfo, level, code, message string) {
+	kind := "lifecycle"
+	if strings.HasPrefix(code, "readiness.") {
+		kind = "probe"
+	}
+	r.emit(p, ipc.LogEntry{Kind: kind, Level: level, Code: code, Stream: "supervisor", Line: message, IsEvent: true, IsError: level == "error"})
+}
+
+func (r *Runner) systemLog(level, code, message string) {
+	r.emit(procInfo{name: "proc-compose"}, ipc.LogEntry{Kind: "session", Level: level, Code: code, Stream: "supervisor", Line: message, IsEvent: true, IsError: level == "error"})
+}
+
+// emit is the sole event-ordering and output boundary. A message is rendered
+// once per sink; files, agents, and the monitor observe the same identity.
+func (r *Runner) emit(p procInfo, entry ipc.LogEntry) {
+	entry.Process = p.name
+	if store := r.store.Load(); store != nil {
+		if st := store.get(p.name); st != nil {
+			st.mu.Lock()
+			entry.PID, entry.Generation = st.pid, st.generation
+			st.mu.Unlock()
+		}
+	}
+	if entry.State != nil {
+		entry.PID, entry.Generation = entry.State.PID, entry.State.Generation
+	}
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
+	r.sequence++
+	entry.Version, entry.Sequence, entry.Time = 1, r.sequence, time.Now().UTC()
+	if r.Project != nil {
+		entry.RunID, entry.Session = r.Project.RunID, r.Project.Session
+	}
+	entry.ID = fmt.Sprintf("%s:%d", entry.RunID, entry.Sequence)
+	data, err := json.Marshal(entry)
+	if err != nil {
+		r.logErr = err
+		return
+	}
+	if r.Journal != nil {
+		if _, err := r.Journal.Write(append(data, '\n')); err != nil {
+			r.logErr = err
+		}
+	}
+	if entry.Level != "debug" || r.Verbose {
+		output := r.Output
+		if output == nil {
+			output = os.Stdout
+		}
+		line := string(data)
+		if r.LogFormat != "json" {
+			line = FormatLine(p.name, r.maxName, p.colorIndex, entry.Line)
+		}
+		fmt.Fprintln(output, line)
+		if r.LogFile != nil { // foreground tee; daemon output is already the file sink
+			fileLine := string(data)
+			if r.LogFormat != "json" {
+				fileLine = fmt.Sprintf("%s | %s", p.name, entry.Line)
+			}
+			fmt.Fprintln(r.LogFile, fileLine)
+		}
 	}
 	if r.IPC != nil {
-		r.IPC.BroadcastLog(ipc.LogEntry{Process: p.name, Line: event, IsEvent: true})
+		r.IPC.BroadcastLog(entry)
 	}
 }
 
 // systemEvent writes a runner-level message to stderr, the optional log file,
 // and any connected monitors. isErr=true tags the entry red in the TUI.
 func (r *Runner) systemEvent(msg string, isErr bool) {
-	fmt.Fprintln(os.Stderr, msg)
-	if r.LogFile != nil {
-		fmt.Fprintln(r.LogFile, msg)
+	level := "info"
+	if isErr {
+		level = "error"
 	}
-	if r.IPC != nil {
-		r.IPC.BroadcastLog(ipc.LogEntry{
-			Process: "proc-compose",
-			Line:    msg,
-			IsEvent: !isErr,
-			IsError: isErr,
-		})
-	}
+	r.systemLog(level, "session.event", msg)
 }
 
 var (

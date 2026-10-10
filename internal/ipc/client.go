@@ -55,7 +55,7 @@ func DialTimeout(socketPath string, d time.Duration) (*Client, error) {
 		return nil, fmt.Errorf("no proc-compose daemon running (socket: %s)", sanitizeSocketPath(socketPath))
 	}
 	sc := bufio.NewScanner(conn)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	sc.Buffer(make([]byte, 64<<10), MaxEventBytes)
 	return &Client{conn: conn, scanner: sc}, nil
 }
 
