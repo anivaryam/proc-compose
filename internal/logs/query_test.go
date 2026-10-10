@@ -3,6 +3,7 @@ package logs
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,6 +47,38 @@ func TestQuery_RotationPaginationAndCursorGap(t *testing.T) {
 	gap, err := Query(path, Options{After: "run:1", Limit: 2})
 	if err != nil || !gap.Gap {
 		t.Fatalf("lost history not disclosed: %+v %v", gap, err)
+	}
+}
+
+func TestQuery_OpenReadersPermitRotationAndKeepPinnedData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	writer, err := logrotate.New(path, 256, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	first, _ := json.Marshal(ipc.LogEntry{Version: 1, ID: "run:1", RunID: "run", Sequence: 1, Line: "first"})
+	if _, err := writer.Write(append(first, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := openJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	for i := 2; i <= 40; i++ {
+		data, _ := json.Marshal(ipc.LogEntry{Version: 1, ID: fmt.Sprintf("run:%d", i), RunID: "run", Sequence: uint64(i), Line: strings.Repeat("x", 256)})
+		if _, err := writer.Write(append(data, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil || !strings.Contains(string(data), `"id":"run:1"`) {
+		t.Fatalf("pinned reader lost original content: %s %v", data, err)
+	}
+	page, err := Query(path, Options{Tail: true, Limit: 1})
+	if err != nil || len(page.Events) != 1 || page.Events[0].ID != "run:40" {
+		t.Fatalf("rotation lost latest output: %+v %v", page, err)
 	}
 }
 

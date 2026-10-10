@@ -183,7 +183,7 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 			if index != 0 {
 				name = fmt.Sprintf("%s.%d", path, index)
 			}
-			file, err := os.Open(name)
+			file, err := openJournal(name)
 			if os.IsNotExist(err) {
 				observed[name] = nil
 				continue

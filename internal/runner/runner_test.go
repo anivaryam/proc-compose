@@ -1397,6 +1397,9 @@ func ipcServerForTest(t *testing.T) (string, *ipc.Server, func()) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	socketPath := filepath.Join(dir, "pc.sock")
+	if runtime.GOOS == "windows" {
+		socketPath = `\\.\pipe\` + filepath.Base(dir)
+	}
 
 	server := ipc.NewServer(socketPath)
 	if err := server.Listen(); err != nil {
