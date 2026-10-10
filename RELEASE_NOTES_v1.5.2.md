@@ -40,6 +40,10 @@ fixes. Existing default session identities and configurations remain supported.
 - Daemon JSON output no longer contains duplicate plain-text log entries.
 - Selected-process dry-runs use the actual transitive dependency selection.
 - `/ready` reports readiness independently of the existing `/health` endpoint.
+- Windows journal readers permit rename/delete sharing so live queries do not
+  block rotation. Restart regression tests use native Windows named pipes.
+- Release binaries use Go 1.26.9 to address standard-library findings in the
+  previous build toolchain. The CI vulnerability scan now fails on findings.
 
 ## Upgrade notes
 
