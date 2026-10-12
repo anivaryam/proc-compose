@@ -590,7 +590,6 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 			// The leader is collected, but this platform's containment is a
 			// durable kernel handle, so authority is unaffected and the group
 			// is still torn down normally.
-			err = reap.recv()
 			observation = exitObserved
 		}
 	default:
@@ -602,7 +601,6 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 		case <-reap.done:
 			// The leader has been collected, so its identifier may already
 			// have been released. Nothing below may signal the group.
-			err = reap.recv()
 			observation = exitOwnershipLost
 		}
 	}
@@ -683,11 +681,11 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	//   cmd.Wait() is what reaps, and reaping releases that reservation. It is
 	//   therefore the last step that touches the command.
 	pg.Withdraw()
-	// Receive the exit status. recv returns the same published result to every
-	// caller, so this is safe when a natural completion already received it
-	// above. It must not be skipped because the result is already published:
-	// on the reap-free observer path nothing has received it yet, and an exited
-	// leader is often collected before this point.
+	// Receive the exit status here, on every path. recv returns the same
+	// published result to every caller, and it must not be skipped because the
+	// result is already published: on the reap-free observer path nothing has
+	// received it yet, and an exited leader is often collected before this
+	// point.
 	//
 	// When no reap is in flight — the reap-free observer path — this is the only
 	// reap, so it happens here, last.

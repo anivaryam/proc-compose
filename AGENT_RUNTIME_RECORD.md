@@ -1293,6 +1293,45 @@ reviewed Linux scope.)
 - Remaining: review, commit, push to PR #1, and green CI: macOS, Windows with
   `-race` and the `go build`-dependent tests, lint, and vulncheck.
 
+### 2026-10-13 — First CI run of the follow-up: lint and macOS fixes
+
+- Follow-up commit `5322d48` was pushed to PR #1 after review. CI run
+  38306358474: Linux, Windows, and vulncheck passed. `lint` and
+  `test (macos-latest)` failed.
+- **Lint** (v1.64.8, `SA4006` at `lifecycle.go:593` and `:605`). Making the
+  final `err = reap.recv()` unconditional left the two earlier assignments in
+  the durable and ownership-lost branches dead. `recv` returns one published
+  result, so they were removed with no behavior change. The Windows durable
+  path was rerun natively: runner package 127 pass, 0 fail.
+- **macOS: defect from `60352dc`, not in v1.5.2.** Every natural exit went
+  unobserved: `Run did not return for a command that exits at once`, checks
+  ended in `check_timeout`, and two packages hit the 10-minute test timeout.
+  - Cause: `60352dc` changed `reapFreeObserver.Observe` from a blocking
+    `waitid` to `WNOHANG` polling that decides on `info.Pid`. `waitSiginfo`
+    used Linux's 64-bit `siginfo_t` layout (`si_pid` at offset 16) on both
+    platforms. On Darwin `si_pid` is at offset 12 and offset 16 is `si_uid`
+    (Go 1.26.8 `runtime/defs_darwin_{amd64,arm64}.go`).
+  - `3e7b389` passed macOS because its blocking `Observe` returned on any
+    successful `waitid` without reading the payload, as the Darwin comment
+    still said.
+  - The macOS job on `60352dc` was cancelled, so this was never seen.
+- **Fix.** `waitSiginfo` is now defined per platform, in `exitwatch_linux.go`
+  (unchanged layout) and `exitwatch_darwin.go` (Darwin layout, 128-byte
+  buffer). `exitwait_unix.go` builds only for `linux || darwin`, the only
+  platforms that use it. Other Unix targets still use the reaping fallback in
+  `exitwatch_other.go`. New `TestWaitSiginfo_PidMatchesKernelLayout`
+  (`exitwait_unix_test.go`) pins the offset: 16 on Linux, 12 on Darwin.
+- **Checks.**
+  - `GOOS={linux,windows,darwin,freebsd} go vet ./...` clean;
+    darwin/amd64 and darwin/arm64 runner tests compile.
+  - Focused Linux race tests passed; full Linux `go test ./... -race` passed
+    16 of 16 packages.
+  - Local golangci-lint is v2.14 and cannot read the repo's v1 config. A
+    scratch v2 translation, outside the repo, found no `SA4006`. Its other
+    findings are v2-only checks and do not match the v1 CI result.
+  - **macOS behavior is not verified locally** (no Mac here); it needs the
+    next CI run.
+
 ## Recording future work
 
 For each implementation session or milestone update, append:
