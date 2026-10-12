@@ -24,6 +24,8 @@ sessions remain supported.
 - An interruption that arrives after readiness but before the check starts is
   reported as interrupted (exit 130), not as a check start failure.
 - The compact JSON error keeps its status and exit precedence.
+- IPC commands sent while a stack is shutting down, including `stop`, are
+  answered again instead of timing out after 30 seconds.
 - Windows: `logs` queries no longer fail with "Access is denied" when they
   race the deletion of the oldest rotated journal file. The race now gives
   the documented retryable error, and real permission errors are still
@@ -34,6 +36,10 @@ sessions remain supported.
   as `exited`.
 
 ## Compatibility
+
+- Linux binaries are now statically linked on amd64 as well as arm64, so they
+  run on any distribution, including older glibc releases and musl-based ones
+  such as Alpine. The amd64 binary previously required glibc 2.34 or newer.
 
 - No configuration changes. Run identifiers keep the `<pid>-<nanoseconds>`
   format.

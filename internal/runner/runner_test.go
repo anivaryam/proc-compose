@@ -1404,8 +1404,11 @@ func TestHandleRestart_RejectsTaskMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix socket IPC not used on Windows")
 	}
+	// The service keeps the daemon alive after the task completes, so the
+	// request is answered by a live stack rather than racing its shutdown.
 	r := makeRunner(map[string]config.Process{
 		"migrate": {Cmd: helperCmd("exit", "0"), Restart: "never", Mode: config.ProcessModeTask},
+		"keeper":  {Cmd: helperCmd("sleep", "60s"), Restart: "never"},
 	})
 
 	socketPath, ipcServer, stopServer := ipcServerForTest(t)
@@ -1414,12 +1417,23 @@ func TestHandleRestart_RejectsTaskMode(t *testing.T) {
 	r.IPC = ipcServer
 	r.ConfigPath = t.TempDir() + "/proc-compose.yml"
 
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- r.Run(context.Background())
+		done <- r.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
 	}()
 
-	time.Sleep(200 * time.Millisecond)
+	if !waitForProcState(t, r, "migrate", func(s ipc.ProcState) bool { return s.State == "completed" }, 10*time.Second) {
+		t.Fatalf("task never completed: %+v", snapshotOf(r, "migrate"))
+	}
 
 	ipcClient, err := ipc.Dial(socketPath)
 	if err != nil {
@@ -1432,7 +1446,7 @@ func TestHandleRestart_RejectsTaskMode(t *testing.T) {
 	}
 
 	for {
-		ev, err := ipcClient.Recv()
+		ev, err := ipcClient.RecvTimeout(5 * time.Second)
 		if err != nil {
 			t.Fatalf("recv failed: %v", err)
 		}
@@ -1447,11 +1461,85 @@ func TestHandleRestart_RejectsTaskMode(t *testing.T) {
 			break
 		}
 	}
+}
 
+// TestHandleCommands_AnswersDuringTeardown pins that IPC commands are answered
+// while the stack tears down. The command loop used to stop as soon as the run
+// was cancelled, so a client asking during teardown, including a stop, waited
+// for the server's 30s timeout instead of getting the daemon's answer.
+func TestHandleCommands_AnswersDuringTeardown(t *testing.T) {
+	r := makeRunner(map[string]config.Process{"api": {Cmd: serviceHelperCmd("sleep", "60s"), Restart: "never"}})
+	// The reap is the last step of teardown, so holding it keeps the run
+	// cancelled but not yet returned on every platform.
+	waitStarted, reapRelease := make(chan struct{}), make(chan struct{})
+	waitStartedOnce := sync.OnceFunc(func() { close(waitStarted) })
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		waitStartedOnce()
+		<-reapRelease
+		return cmd.Wait()
+	}
+	socketPath, ipcServer, stopServer := ipcServerForTest(t)
+	defer stopServer()
+	r.IPC = ipcServer
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		_ = r.Run(ctx)
+		close(runDone)
+	}()
+	releaseReap := sync.OnceFunc(func() { close(reapRelease) })
+	t.Cleanup(func() {
+		releaseReap()
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop after the reap was released")
+		}
+	})
+
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.State == "running" }, 10*time.Second) {
+		t.Fatal("service never started")
+	}
+	cancel()
 	select {
-	case <-done:
+	case <-waitStarted:
 	case <-time.After(10 * time.Second):
-		t.Log("runner did not finish in time")
+		t.Fatal("teardown never reached the reap")
+	}
+	select {
+	case <-runDone:
+		t.Fatal("Run returned while its reap was held; teardown is not in progress")
+	default:
+	}
+
+	client, err := ipc.Dial(socketPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	if err := client.Send(ipc.Command{Action: "restart", Process: "api"}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	for {
+		ev, err := client.RecvTimeout(5 * time.Second)
+		if err != nil {
+			t.Fatalf("no answer to a command sent during teardown: %v", err)
+		}
+		if ev.Type != ipc.TypeAck {
+			continue
+		}
+		if ev.Ack != "error" || ev.AckDetail != "daemon is shutting down" {
+			t.Fatalf("ack during teardown = %s %q, want error %q", ev.Ack, ev.AckDetail, "daemon is shutting down")
+		}
+		break
+	}
+	releaseReap()
+	select {
+	case <-runDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return after the reap was released")
 	}
 }
 

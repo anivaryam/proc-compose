@@ -1369,6 +1369,56 @@ reviewed Linux scope.)
   - Full Linux `-race`: 16/16. Process scans on Linux and Windows: clean.
   - macOS needs the next CI run.
 
+### 2026-10-13 — Static Linux release build; command loop during teardown
+
+- CI run 38309723198 on `f9849b5` passed all five jobs (Linux, macOS,
+  Windows, lint, vulncheck). The merge was paused when the maintainer asked
+  about Linux distribution support.
+- **Distribution support.** The v1.5.2 artifacts were inspected without being
+  run. `linux_amd64` was dynamically linked against glibc and required
+  GLIBC_2.34: `release.yml` builds it natively on Ubuntu with cgo on.
+  `linux_arm64` was cross-compiled with cgo off, so it was static. The amd64
+  binary could not start on glibc < 2.34 (RHEL/Rocky/Alma 8, Debian 11,
+  Ubuntu 20.04, Amazon Linux 2) or on musl (Alpine). Nothing in the code needs
+  cgo.
+- **Approved workflow change.** `release.yml` builds every target with
+  `CGO_ENABLED=0`. Local builds of all five targets: both Linux binaries are
+  static (`ldd`: "not a dynamic executable"); macOS links libSystem as Go
+  always does there.
+- **Regression found by testing the static build mode.**
+  - `CGO_ENABLED=0 go test ./...` failed
+    `TestHandleRestart_RejectsTaskMode` 19 of 20 times ("timed out waiting for
+    runner reply"). v1.5.2 passed 5 of 5 with and without cgo. With cgo on,
+    the current tree failed too, so cgo was not the cause.
+  - Cause, from `60352dc`: `handleCommands` returned when `runCtx` was
+    cancelled. Commands sent during teardown, including `stop`, were accepted
+    but never answered, and the client waited for the server's 30s timeout.
+    v1.5.2 answered them with "daemon is shutting down".
+  - CI never saw it because `-race` slows the helper processes enough for the
+    test's 200ms sleep to land before teardown.
+  - Production window: from run cancellation until `Run` returns. The daemon
+    closes the IPC server right after `Run` returns (`main.go:377`).
+- **Fix.** The command loop runs on its own context, cancelled when `Run`
+  returns, after `endRun`. Commands are answered throughout teardown, using
+  the existing admission refusal, and none are served after `Run` returns.
+- **Tests.**
+  - New `TestHandleCommands_AnswersDuringTeardown` holds teardown at the reap
+    with `waitProcess` and requires an answer within 5s. It failed before the
+    fix (`ipc: timed out waiting for event`).
+  - `TestHandleRestart_RejectsTaskMode` now keeps the daemon alive with a
+    long-running service and waits for the task to complete instead of
+    sleeping 200ms. It asserts the same reply as before.
+  - Both passed 10 of 10 with cgo on and off, and 3 of 3 under `-race`.
+- **Checks.**
+  - `GOOS={linux,windows,darwin,freebsd} go vet ./...` clean.
+  - Full `CGO_ENABLED=0 go test ./...` passes; full `-race` suite passes.
+  - Native Windows (built with cgo off): runner 129 pass, 0 fail, new test
+    included.
+  - Process scans on Linux and Windows: clean.
+- **Gap, proposed and not applied:** CI tests only with `-race`, which needs
+  cgo, while the release binary is now built without cgo. A CI step running
+  `CGO_ENABLED=0 go test ./...` would cover the shipped build mode.
+
 ## Recording future work
 
 For each implementation session or milestone update, append:

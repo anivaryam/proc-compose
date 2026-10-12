@@ -237,6 +237,12 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 	}
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
+	// IPC commands are served until Run returns, not only until the run is
+	// cancelled: a client that asks during teardown, including a stop, must get
+	// the daemon's answer rather than the server's 30s timeout. Registered
+	// before endRun's defer, so it runs after endRun.
+	commandsCtx, stopCommands := context.WithCancel(context.Background())
+	defer stopCommands()
 	// The shutdown handle must exist before any command can be dispatched:
 	// handleCommands is the only caller of Shutdown, and a command that arrived
 	// first would otherwise see a half-initialised runner.
@@ -256,7 +262,7 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 		for _, st := range store.snapshot() {
 			r.IPC.SetState(st)
 		}
-		go r.handleCommands(runCtx, store)
+		go r.handleCommands(commandsCtx, store)
 		metricsDone = make(chan struct{})
 		go func() {
 			defer close(metricsDone)

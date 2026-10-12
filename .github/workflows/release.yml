@@ -45,7 +45,7 @@ jobs:
 
             echo "Building ${GOOS}/${GOARCH}..."
             TMP="$(mktemp -d)"
-            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags "$LDFLAGS" -o "${TMP}/${bin}" ./cmd/proc-compose
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags "$LDFLAGS" -o "${TMP}/${bin}" ./cmd/proc-compose
 
             archive="proc-compose_${GOOS}_${GOARCH}"
             if [ "$GOOS" = "windows" ]; then
