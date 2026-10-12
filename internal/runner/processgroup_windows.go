@@ -3,6 +3,7 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -102,13 +103,47 @@ func (pg *windowsProcessGroup) Kill() error {
 	return pg.job.Terminate()
 }
 
-// Withdraw records that the runner has finished signalling.
+// Withdraw is retained as the pre-reap lifecycle boundary. Windows containment
+// remains authoritative until Seal/Close releases the Job Object.
 //
 // Nothing is closed here. The job handle must stay open until the process has
 // been verified and the group's verdict recorded, because the kernel keeps
 // tracking membership through the handle regardless of whether the command
 // leader has exited.
 func (pg *windowsProcessGroup) Withdraw() {}
+
+// Seal observes membership and closes the Job Object while holding the same
+// lock used by Terminate, State, Track, and Close. Close is kill-on-close, so
+// the returned state is the last truthful observation before that action; a
+// post-close query would only report that the handle is unavailable.
+func (pg *windowsProcessGroup) Seal() (SealObservation, error) {
+	pg.mu.Lock()
+	defer pg.mu.Unlock()
+	state := GroupUnavailable
+	identity := "unknown"
+	var stateErr error
+	if pg.job != nil {
+		identity = "job object"
+		if !pg.tracked {
+			state = GroupEmpty
+		} else {
+			var counters winjob.Counters
+			if err := pg.job.QueryCounters(&counters); err != nil {
+				stateErr = err
+			} else if counters.ActiveProcesses == 0 {
+				state = GroupEmpty
+			} else {
+				state = GroupOwned
+			}
+		}
+	}
+	if pg.job == nil {
+		return SealObservation{State: state, Identity: identity}, pg.createErr
+	}
+	closeErr := pg.job.Close()
+	pg.job = nil
+	return SealObservation{State: state, Identity: identity}, errors.Join(stateErr, closeErr)
+}
 
 // State reports what the kernel knows about the job.
 func (pg *windowsProcessGroup) State() GroupState {

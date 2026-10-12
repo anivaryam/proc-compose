@@ -46,6 +46,7 @@ type LogEntry struct {
 	Version       int        `json:"schema_version,omitempty"`
 	ID            string     `json:"id,omitempty"`
 	RunID         string     `json:"run_id,omitempty"`
+	AttemptID     string     `json:"attempt_id,omitempty"` // verification attempt that owned this run, if any
 	Sequence      uint64     `json:"sequence,omitempty"`
 	Session       string     `json:"session,omitempty"`
 	Time          time.Time  `json:"time,omitempty"`
@@ -94,6 +95,18 @@ type Project struct {
 	Resources   []string                     `json:"resources,omitempty"`
 	LogPath     string                       `json:"log_path,omitempty"`
 	JournalPath string                       `json:"journal_path"`
+	Owner       *Owner                       `json:"owner,omitempty"`
+}
+
+// Owner describes who created a session, for human/agent handoff. It is
+// descriptive metadata, never cleanup authority: only the process holding the
+// session lease may stop what it started.
+type Owner struct {
+	PID       int       `json:"pid"`
+	Command   string    `json:"command"`            // "up" or "verify"
+	Label     string    `json:"label,omitempty"`    // PROC_COMPOSE_OWNER, e.g. an agent/task name
+	Worktree  string    `json:"worktree,omitempty"` // nearest ancestor containing .git, if any
+	StartedAt time.Time `json:"started_at"`
 }
 
 // CommandResult carries a runner's verdict for a command back to the

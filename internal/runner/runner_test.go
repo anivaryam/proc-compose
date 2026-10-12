@@ -14,9 +14,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -165,6 +168,18 @@ func helperCmd(args ...string) string {
 		return os.Args[0] + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel + " " + payload
 	}
 	return posixQuote(os.Args[0]) + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel + " " + payload
+}
+
+// serviceHelperCmd is helperCmd for a long-running service whose leader must be
+// the helper itself. On Unix the shell execs it, so a test that kills or waits
+// the leader through its owned handle leaves no helper behind. Windows cmd has
+// no exec; there the helper stays a child of cmd, inside the same Job Object,
+// which the runner's seal closes with kill-on-close.
+func serviceHelperCmd(args ...string) string {
+	if runtime.GOOS == "windows" {
+		return helperCmd(args...)
+	}
+	return "exec " + helperCmd(args...)
 }
 
 // discardOutputScript wraps a command so that the shell running it does not keep
@@ -1938,7 +1953,10 @@ func (g *uncontainedProcessGroup) Kill() error             { return os.ErrProces
 func (g *uncontainedProcessGroup) State() GroupState       { return GroupUnavailable }
 func (g *uncontainedProcessGroup) Identify() string        { return "unavailable" }
 func (g *uncontainedProcessGroup) Withdraw()               {}
-func (g *uncontainedProcessGroup) Close() error            { return nil }
+func (g *uncontainedProcessGroup) Seal() (SealObservation, error) {
+	return SealObservation{State: g.State(), Identity: g.Identify()}, nil
+}
+func (g *uncontainedProcessGroup) Close() error { return nil }
 
 // startTrackedGroup starts cmdStr in its own process group and returns the
 // concrete group plus the Cmd, so a test can drive the group's own mutex. The
@@ -2106,7 +2124,101 @@ func (g *unstoppableProcessGroup) Kill() error             { return nil }
 func (g *unstoppableProcessGroup) State() GroupState       { return GroupOwned }
 func (g *unstoppableProcessGroup) Identify() string        { return "41234" }
 func (g *unstoppableProcessGroup) Withdraw()               {}
-func (g *unstoppableProcessGroup) Close() error            { return nil }
+func (g *unstoppableProcessGroup) Seal() (SealObservation, error) {
+	return SealObservation{State: g.State(), Identity: g.Identify()}, nil
+}
+func (g *unstoppableProcessGroup) Close() error { return nil }
+
+type gatedSealGroup struct {
+	mu          sync.Mutex
+	signalStart chan struct{}
+	signalGate  chan struct{}
+	sealed      bool
+	closed      bool
+}
+
+func (g *gatedSealGroup) Setup(_ *exec.Cmd)       {}
+func (g *gatedSealGroup) Track(_ *exec.Cmd) error { return nil }
+func (g *gatedSealGroup) Terminate() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.sealed {
+		return os.ErrProcessDone
+	}
+	close(g.signalStart)
+	<-g.signalGate
+	return nil
+}
+func (g *gatedSealGroup) Kill() error       { return g.Terminate() }
+func (g *gatedSealGroup) State() GroupState { return GroupOwned }
+func (g *gatedSealGroup) Identify() string  { return "gated" }
+func (g *gatedSealGroup) Withdraw() {
+	g.mu.Lock()
+	g.sealed = true
+	g.mu.Unlock()
+}
+func (g *gatedSealGroup) Seal() (SealObservation, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.sealed = true
+	g.closed = true
+	return SealObservation{State: GroupOwned, Identity: "gated"}, nil
+}
+func (g *gatedSealGroup) Close() error { _, err := g.Seal(); return err }
+
+// TestRunnerSweep_SealWaitsForSignalAndPreservesUnverifiedResult pins the
+// shared-runner boundary: a signal already holding the group lock completes
+// before sealing returns, and sealing an owned group remains a failed verdict
+// even while its independent reap is still blocked.
+func TestRunnerSweep_SealWaitsForSignalAndPreservesUnverifiedResult(t *testing.T) {
+	r := &Runner{}
+	pg := &gatedSealGroup{signalStart: make(chan struct{}), signalGate: make(chan struct{})}
+	r.trackGroup("gated", pg, 0)
+	signalRelease := sync.OnceFunc(func() { close(pg.signalGate) })
+	defer signalRelease()
+
+	signalDone := make(chan error, 1)
+	go func() { signalDone <- pg.Terminate() }()
+	<-pg.signalStart
+
+	reapGate := make(chan struct{})
+	reapRelease := sync.OnceFunc(func() { close(reapGate) })
+	defer reapRelease()
+	go func() { <-reapGate }() // model a cmd.Wait that has not completed
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sweepDone := make(chan struct{})
+	go func() { r.sweepGroups(ctx); close(sweepDone) }()
+	select {
+	case <-sweepDone:
+		t.Fatal("seal returned while the in-flight signal was blocked")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	signalRelease()
+	if err := <-signalDone; err != nil {
+		t.Fatalf("in-flight signal: %v", err)
+	}
+	select {
+	case <-sweepDone:
+	case <-time.After(time.Second):
+		t.Fatal("seal did not finish after the in-flight signal completed")
+	}
+	if err := r.ShutdownResult(); err == nil || !strings.Contains(err.Error(), "could not terminate") {
+		t.Fatalf("shutdown verdict = %v, want owned group reported unverified", err)
+	}
+	if err := r.ShutdownResult(); !strings.Contains(err.Error(), "gated") {
+		t.Fatalf("shutdown verdict = %v, want sealed identity retained", err)
+	}
+	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("signal after seal = %v, want os.ErrProcessDone", err)
+	}
+	if !pg.closed {
+		t.Fatal("seal did not close the group")
+	}
+	reapRelease()
+}
 
 // TestShutdown_ReportsSurvivorItCannotTerminate covers the reporting
 // requirement from the daemon's side: a managed process that provably cannot be
@@ -2846,3 +2958,594 @@ const quickExitScript = `#!/bin/sh
 echo $$ > "$1"
 exit 0
 `
+
+// helperArgv is helperCmd as a direct argv, for checks that bypass the shell.
+func helperArgv(args ...string) []string {
+	payload := base64.RawURLEncoding.EncodeToString([]byte(strings.Join(args, "\x00")))
+	return []string{os.Args[0], "-test.run=^TestRunnerHelperProcess$", "--", helperSentinel, payload}
+}
+
+func startCheckStack(t *testing.T) (*Runner, context.CancelFunc, func() error) {
+	t.Helper()
+	r := makeRunner(map[string]config.Process{"api": {Cmd: helperCmd("sleep", "60s"), Restart: "never"}})
+	r.NoColor, r.Silent, r.Output = true, true, io.Discard
+	r.CleanupHandoffTimeout = 10 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var runErr error
+	go func() { runErr = r.Run(ctx); close(done) }()
+	wait := func() error {
+		select {
+		case <-done:
+			return runErr
+		case <-time.After(20 * time.Second):
+			return errors.New("runner did not stop")
+		}
+	}
+	t.Cleanup(func() {
+		cancel()
+		if err := wait(); err != nil && err.Error() == "runner did not stop" {
+			t.Error(err)
+		}
+	})
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Ready }, 10*time.Second) {
+		t.Fatal("stack did not become ready")
+	}
+	return r, cancel, wait
+}
+
+func TestRunCheck_DirectArgvAndOutputCapture(t *testing.T) {
+	r, cancel, wait := startCheckStack(t)
+	literal := `a b "quoted" $HOME; echo injected`
+	result := r.RunCheck(context.Background(), CheckSpec{Name: "verify:check", Argv: helperArgv("log", literal), Cleanup: 5 * time.Second, MaxOutputBytes: 4096})
+	if result.Err != nil || !result.Started || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("check result = %+v", result)
+	}
+	if result.Stdout != literal+"\n" {
+		t.Fatalf("stdout = %q, want literal argv %q", result.Stdout, literal)
+	}
+	if result.Generation != 1 || result.HandedOff {
+		t.Fatalf("generation/handoff = %d/%t", result.Generation, result.HandedOff)
+	}
+	if again := r.RunCheck(context.Background(), CheckSpec{Name: "verify:check", Argv: helperArgv("exit", "0"), Cleanup: time.Second}); again.Err == nil {
+		t.Fatal("a check name was reused within one stack")
+	}
+	cancel()
+	if err := wait(); err != nil {
+		t.Fatalf("stack cleanup after check = %v", err)
+	}
+}
+
+func TestRunCheck_NonzeroExitAndOutputCap(t *testing.T) {
+	r, _, _ := startCheckStack(t)
+	result := r.RunCheck(context.Background(), CheckSpec{Name: "verify:check", Argv: helperArgv("log", strings.Repeat("x", 100), "stderr"), Cleanup: 5 * time.Second, MaxOutputBytes: 10})
+	if result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("exit = %v", result.ExitCode)
+	}
+	if !result.OutputTruncated || len(result.Stderr) != 10 || result.Stdout != "" {
+		t.Fatalf("capture = stdout %q stderr %q truncated %t", result.Stdout, result.Stderr, result.OutputTruncated)
+	}
+	failed := r.RunCheck(context.Background(), CheckSpec{Name: "verify:check2", Argv: helperArgv("exit", "3"), Cleanup: 5 * time.Second})
+	if failed.ExitCode == nil || *failed.ExitCode != 3 || failed.Err != nil {
+		t.Fatalf("nonzero check = %+v", failed)
+	}
+}
+
+func TestRunCheck_DeadlineTerminatesCheck(t *testing.T) {
+	r, _, _ := startCheckStack(t)
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	result := r.RunCheck(ctx, CheckSpec{Name: "verify:check", Argv: helperArgv("touch-block", pidFile), Cleanup: 10 * time.Second})
+	if !result.Started || result.HandedOff {
+		t.Fatalf("timed-out check = %+v", result)
+	}
+	if result.ExitCode != nil && *result.ExitCode == 0 {
+		t.Fatalf("timed-out check reported success: %+v", result)
+	}
+	if elapsed := time.Since(started); elapsed > 9*time.Second {
+		t.Fatalf("check teardown took %s", elapsed)
+	}
+	assertTerminated(t, result.PID, "timed-out check", 5*time.Second)
+	if unresolved := r.Unresolved(); len(unresolved) != 0 {
+		t.Fatalf("unresolved after clean check teardown: %+v", unresolved)
+	}
+}
+
+func TestRunCheck_RefusedWithoutRunningStack(t *testing.T) {
+	r := makeRunner(map[string]config.Process{})
+	if result := r.RunCheck(context.Background(), CheckSpec{Name: "c", Argv: helperArgv("exit", "0")}); !result.AdmissionRefused || result.Started {
+		t.Fatalf("check without stack = %+v", result)
+	}
+	if result := r.RunCheck(context.Background(), CheckSpec{Name: "c"}); result.Err == nil {
+		t.Fatal("empty argv accepted")
+	}
+}
+
+type admissionGateProcessGroup struct {
+	ProcessGroup
+	trackStarted     chan struct{}
+	trackRelease     chan struct{}
+	terminateStarted chan struct{}
+	terminateRelease chan struct{}
+	closed           chan struct{}
+	terminateOnce    sync.Once
+	closeOnce        sync.Once
+	pid              int
+	cmd              *exec.Cmd
+}
+
+func (g *admissionGateProcessGroup) Track(cmd *exec.Cmd) error {
+	g.pid = cmd.Process.Pid
+	g.cmd = cmd
+	close(g.trackStarted)
+	<-g.trackRelease
+	return g.ProcessGroup.Track(cmd)
+}
+
+func (g *admissionGateProcessGroup) Terminate() error {
+	g.terminateOnce.Do(func() {
+		close(g.terminateStarted)
+		<-g.terminateRelease
+	})
+	return g.ProcessGroup.Terminate()
+}
+
+func (g *admissionGateProcessGroup) Close() error {
+	err := g.ProcessGroup.Close()
+	g.closeOnce.Do(func() { close(g.closed) })
+	return err
+}
+
+type signalSealGateProcessGroup struct {
+	ProcessGroup
+	mu              sync.Mutex
+	signalStarted   chan struct{}
+	signalRelease   chan struct{}
+	sealStarted     chan struct{}
+	sealReturned    chan struct{}
+	signalOnce      sync.Once
+	sealOnce        sync.Once
+	sealed          bool
+	cmd             *exec.Cmd
+	observation     SealObservation
+	sealErr         error
+	delegateSignals int
+}
+
+func (g *signalSealGateProcessGroup) Setup(cmd *exec.Cmd) {
+	g.ProcessGroup.Setup(cmd)
+	cmd.Cancel = func() error { return g.Terminate() }
+}
+
+func (g *signalSealGateProcessGroup) Track(cmd *exec.Cmd) error {
+	g.cmd = cmd
+	return g.ProcessGroup.Track(cmd)
+}
+
+func (g *signalSealGateProcessGroup) signal(fn func() error) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.sealed {
+		return os.ErrProcessDone
+	}
+	g.signalOnce.Do(func() {
+		close(g.signalStarted)
+		<-g.signalRelease
+	})
+	g.delegateSignals++
+	return fn()
+}
+
+func (g *signalSealGateProcessGroup) Terminate() error {
+	return g.signal(g.ProcessGroup.Terminate)
+}
+
+func (g *signalSealGateProcessGroup) Kill() error {
+	return g.signal(g.ProcessGroup.Kill)
+}
+
+func (g *signalSealGateProcessGroup) Seal() (SealObservation, error) {
+	g.sealOnce.Do(func() { close(g.sealStarted) })
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.sealed {
+		return g.observation, g.sealErr
+	}
+	g.observation, g.sealErr = g.ProcessGroup.Seal()
+	g.sealed = true
+	close(g.sealReturned)
+	return g.observation, g.sealErr
+}
+
+type synchronizedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func trackedReaper(t *testing.T, r *Runner, process string) *trackedReap {
+	t.Helper()
+	r.reapersMu.Lock()
+	defer r.reapersMu.Unlock()
+	for _, tracked := range r.reapers {
+		if tracked.process == process {
+			return tracked
+		}
+	}
+	t.Fatalf("no reaper registered for %q", process)
+	return nil
+}
+
+func assertRunnerQuiescent(t *testing.T, r *Runner, state []ipc.ProcState, process config.Process, verdict, output, journal string, sequence uint64) {
+	t.Helper()
+	if got := r.store.Load().snapshot(); !reflect.DeepEqual(got, state) {
+		t.Fatalf("runner state changed after handoff: before=%+v after=%+v", state, got)
+	}
+	if got := r.Config.Processes["api"]; !reflect.DeepEqual(got, process) {
+		t.Fatalf("config changed after handoff: before=%+v after=%+v", process, got)
+	}
+	if got := r.ShutdownResult(); (got == nil) != (verdict == "") || (got != nil && got.Error() != verdict) {
+		t.Fatalf("shutdown verdict changed after handoff: before=%q after=%v", verdict, got)
+	}
+	if got := r.Output.(*synchronizedBuffer).String(); got != output {
+		t.Fatalf("runner output changed after handoff: before=%q after=%q", output, got)
+	}
+	if got := r.Journal.(*synchronizedBuffer).String(); got != journal {
+		t.Fatalf("runner journal changed after handoff: before=%q after=%q", journal, got)
+	}
+	r.logMu.Lock()
+	gotSequence := r.sequence
+	r.logMu.Unlock()
+	if gotSequence != sequence {
+		t.Fatalf("runner event sequence changed after handoff: before=%d after=%d", sequence, gotSequence)
+	}
+}
+
+func TestRunnerCleanupHandoff_SealsBeforeReturningAndQuiescesWorker(t *testing.T) {
+	command := serviceHelperCmd("sleep", "120s")
+	configPath := filepath.Join(t.TempDir(), "proc-compose.yml")
+	writeConfig := func(command string) {
+		t.Helper()
+		body := "processes:\n  api:\n    cmd: " + strconv.Quote(command) + "\n    restart: never\n"
+		if err := os.WriteFile(configPath, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConfig(command)
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, journal := &synchronizedBuffer{}, &synchronizedBuffer{}
+	r := &Runner{Config: cfg, ConfigPath: configPath}
+	r.NoColor = true
+	r.Silent = true
+	r.Output = output
+	r.Journal = journal
+	r.CleanupHandoffTimeout = 250 * time.Millisecond
+	group := &signalSealGateProcessGroup{
+		ProcessGroup:  newProcessGroup(),
+		signalStarted: make(chan struct{}),
+		signalRelease: make(chan struct{}),
+		sealStarted:   make(chan struct{}),
+		sealReturned:  make(chan struct{}),
+	}
+	r.processGroupFactory = func() ProcessGroup { return group }
+	waitStarted, reapRelease := make(chan struct{}), make(chan struct{})
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		close(waitStarted)
+		<-reapRelease
+		return cmd.Wait()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	var runErr error
+	go func() {
+		runErr = r.Run(ctx)
+		close(runDone)
+	}()
+	signalReleased := sync.OnceFunc(func() { close(group.signalRelease) })
+	reapReleased := sync.OnceFunc(func() { close(reapRelease) })
+	t.Cleanup(func() {
+		signalReleased()
+		reapReleased()
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(10 * time.Second):
+			if group.cmd != nil && group.cmd.Process != nil {
+				_ = group.cmd.Process.Kill()
+			}
+			select {
+			case <-runDone:
+			case <-time.After(5 * time.Second):
+				t.Error("runner did not quiesce after emergency owned-handle kill")
+			}
+		}
+		if group.cmd != nil && group.cmd.Process != nil && pidIsRunning(group.cmd.Process.Pid) {
+			t.Errorf("handoff fixture process %d survived cleanup", group.cmd.Process.Pid)
+		}
+	})
+
+	if !waitForProcState(t, r, "api", func(state ipc.ProcState) bool { return state.State == "running" && state.PID > 0 }, 10*time.Second) {
+		t.Fatal("production process did not reach running state")
+	}
+	pid := snapshotOf(r, "api").PID
+	cancel()
+	select {
+	case <-group.signalStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("production cancellation did not enter the delayed signal")
+	}
+	select {
+	case <-group.sealStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bounded production Run did not reach group sealing")
+	}
+	select {
+	case <-group.sealReturned:
+		t.Fatal("seal returned before the delayed in-flight signal completed")
+	default:
+	}
+	signalReleased()
+	select {
+	case <-group.sealReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("seal did not complete after the delayed signal was released")
+	}
+	select {
+	case <-waitStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("production lifecycle did not enter its tracked reaper")
+	}
+	if result := r.requestRestart(r.store.Load().get("api")); result.Status != "error" {
+		t.Fatalf("restart after seal = %+v, want admission refusal", result)
+	}
+	select {
+	case <-runDone:
+		if runErr == nil || !strings.Contains(runErr.Error(), "not reaped") {
+			t.Fatalf("Runner.Run result = %v, want unverified cleanup failure", runErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Runner.Run remained blocked by the production reaper")
+	}
+	tracked := trackedReaper(t, r, "api")
+	if tracked.reap.taken() {
+		t.Fatal("reaper unexpectedly completed before its gate was released")
+	}
+	if err := group.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("signal after seal = %v, want os.ErrProcessDone", err)
+	}
+	group.mu.Lock()
+	if !group.sealed || group.delegateSignals == 0 {
+		group.mu.Unlock()
+		t.Fatalf("signal/seal observation: sealed=%t delegated=%d", group.sealed, group.delegateSignals)
+	}
+	group.mu.Unlock()
+
+	stateBefore := r.store.Load().snapshot()
+	processBefore := r.Config.Processes["api"]
+	verdictBefore := r.ShutdownResult().Error()
+	outputBefore, journalBefore := output.String(), journal.String()
+	r.logMu.Lock()
+	sequenceBefore := r.sequence
+	r.logMu.Unlock()
+	reapReleased()
+	select {
+	case <-tracked.reap.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("released production reaper did not finish and get joined")
+	}
+	assertTerminated(t, pid, "handoff fixture leader", 5*time.Second)
+	assertRunnerQuiescent(t, r, stateBefore, processBefore, verdictBefore, outputBefore, journalBefore, sequenceBefore)
+	writeConfig(serviceHelperCmd("sleep", "121s"))
+	if result := r.Reload(); result.Status != "error" {
+		t.Fatalf("reload after bounded Run = %+v, want refusal", result)
+	}
+	assertRunnerQuiescent(t, r, stateBefore, processBefore, verdictBefore, outputBefore, journalBefore, sequenceBefore)
+}
+
+// TestRunCheck_StackShutdownQuiescesActiveCheck is the independent-review
+// reproduction: stopping the stack while a check runs must cancel and reap the
+// check before Run returns, and nothing may be emitted after Run returns.
+func TestRunCheck_StackShutdownQuiescesActiveCheck(t *testing.T) {
+	r := makeRunner(map[string]config.Process{"api": {Cmd: helperCmd("sleep", "60s"), Restart: "never"}})
+	r.Output = io.Discard
+	r.NoColor, r.Silent = true, true
+	r.CleanupHandoffTimeout = 250 * time.Millisecond
+	trackRelease, terminateRelease := make(chan struct{}), make(chan struct{})
+	close(trackRelease)
+	close(terminateRelease)
+	checkGroup := &admissionGateProcessGroup{
+		ProcessGroup: newProcessGroup(), trackStarted: make(chan struct{}), trackRelease: trackRelease,
+		terminateStarted: make(chan struct{}), terminateRelease: terminateRelease, closed: make(chan struct{}),
+	}
+	created := 0
+	r.processGroupFactory = func() ProcessGroup {
+		created++
+		if created == 2 {
+			return checkGroup
+		}
+		return newProcessGroup()
+	}
+	stackCtx, cancelStack := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { _ = r.Run(stackCtx); close(runDone) }()
+	checkCtx, cancelCheck := context.WithCancel(context.Background())
+	checkDone := make(chan struct{})
+	checkLaunched := false
+	t.Cleanup(func() {
+		cancelCheck()
+		select {
+		case <-checkGroup.trackStarted:
+			if checkGroup.cmd != nil && checkGroup.cmd.Process != nil {
+				_ = checkGroup.cmd.Process.Kill()
+			}
+		default:
+		}
+		if checkLaunched {
+			select {
+			case <-checkDone:
+			case <-time.After(10 * time.Second):
+				t.Error("check cleanup did not finish")
+			}
+		}
+		cancelStack()
+		select {
+		case <-runDone:
+		case <-time.After(10 * time.Second):
+			t.Error("stack cleanup did not finish")
+		}
+		_ = checkGroup.Close()
+	})
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Ready }, 10*time.Second) {
+		t.Fatal("stack did not become ready")
+	}
+	checkLaunched = true
+	var result CheckResult
+	go func() {
+		result = r.RunCheck(checkCtx, CheckSpec{Name: "verify:check", Argv: helperArgv("sleep", "60s"), Cleanup: time.Second, MaxOutputBytes: 4096})
+		close(checkDone)
+	}()
+	select {
+	case <-checkGroup.trackStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("check did not start")
+	}
+	cancelStack()
+	select {
+	case <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stack shutdown did not return")
+	}
+	select {
+	case <-checkDone:
+	default:
+		t.Fatal("Runner.Run returned before its active check finished")
+	}
+	if pidIsRunning(checkGroup.cmd.Process.Pid) {
+		t.Errorf("Runner.Run returned with its owned check still alive (PID %d)", checkGroup.cmd.Process.Pid)
+	}
+	if !result.Started || (result.ExitCode != nil && *result.ExitCode == 0) {
+		t.Fatalf("check cancelled by stack shutdown = %+v", result)
+	}
+	r.logMu.Lock()
+	before := r.sequence
+	r.logMu.Unlock()
+	time.Sleep(100 * time.Millisecond)
+	r.logMu.Lock()
+	after := r.sequence
+	r.logMu.Unlock()
+	if after != before {
+		t.Errorf("runner emitted events after Run returned: sequence %d -> %d", before, after)
+	}
+	if late := r.RunCheck(context.Background(), CheckSpec{Name: "verify:late", Argv: helperArgv("exit", "0")}); !late.AdmissionRefused || late.Started {
+		t.Fatalf("check admitted after Run returned: %+v", late)
+	}
+	assertTerminated(t, checkGroup.cmd.Process.Pid, "check", 5*time.Second)
+}
+
+// TestRunCheck_StackHandoffBoundsBlockedCheckReap holds the check's reap so
+// teardown cannot finish on its own. The stack's handoff budget, not the
+// check's own (much longer) deadline, must end the wait: Run returns within
+// that one budget and reports the unreaped check instead of success.
+func TestRunCheck_StackHandoffBoundsBlockedCheckReap(t *testing.T) {
+	r := makeRunner(map[string]config.Process{"api": {Cmd: helperCmd("sleep", "60s"), Restart: "never"}})
+	r.Output = io.Discard
+	r.NoColor, r.Silent = true, true
+	r.CleanupHandoffTimeout = 300 * time.Millisecond
+	reapStarted, reapRelease := make(chan struct{}), make(chan struct{})
+	startedOnce, releaseOnce := sync.OnceFunc(func() { close(reapStarted) }), sync.OnceFunc(func() { close(reapRelease) })
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		if len(cmd.Args) > 0 && cmd.Args[0] == os.Args[0] {
+			startedOnce()
+			<-reapRelease
+		}
+		return cmd.Wait()
+	}
+	stackCtx, cancelStack := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { _ = r.Run(stackCtx); close(runDone) }()
+	t.Cleanup(func() {
+		releaseOnce()
+		cancelStack()
+		select {
+		case <-runDone:
+		case <-time.After(10 * time.Second):
+			t.Error("stack cleanup did not finish")
+		}
+	})
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Ready }, 10*time.Second) {
+		t.Fatal("stack did not become ready")
+	}
+	var deadlineCalls atomic.Int32
+	checkDone := make(chan CheckResult, 1)
+	go func() {
+		checkDone <- r.RunCheck(context.Background(), CheckSpec{Name: "verify:check", Argv: helperArgv("sleep", "60s"),
+			CleanupDeadline: func() time.Time { deadlineCalls.Add(1); return time.Now().Add(time.Minute) }})
+	}()
+	if !waitForCheckRunning(r, "verify:check", 10*time.Second) {
+		t.Fatal("check did not start")
+	}
+	started := time.Now()
+	cancelStack()
+	select {
+	case <-reapStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("check teardown did not reach its reap")
+	}
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stack handoff did not end the blocked check wait")
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("blocked check held Run for %s despite a 300ms handoff", elapsed)
+	}
+	result := <-checkDone
+	if !result.HandedOff || result.ExitCode != nil {
+		t.Fatalf("blocked check = %+v, want handoff without exit status", result)
+	}
+	if deadlineCalls.Load() != 1 {
+		t.Fatalf("CleanupDeadline called %d times, want once at the trigger", deadlineCalls.Load())
+	}
+	found := false
+	for _, u := range r.Unresolved() {
+		found = found || u.Name == "verify:check"
+	}
+	if !found || r.ShutdownResult() == nil {
+		t.Fatalf("unreaped check not reported: unresolved=%+v verdict=%v", r.Unresolved(), r.ShutdownResult())
+	}
+	releaseOnce()
+	assertTerminated(t, result.PID, "handed-off check", 5*time.Second)
+}
+
+func waitForCheckRunning(r *Runner, name string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if st := r.stateFor(name); st != nil {
+			st.mu.Lock()
+			running := st.pid != 0
+			st.mu.Unlock()
+			if running {
+				return true
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}

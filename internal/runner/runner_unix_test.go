@@ -3,13 +3,20 @@
 package runner
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
 // TestProcessGroup_LeaderExitKeepsSignallingAuthority is the ownership
@@ -101,11 +108,411 @@ func TestProcessGroup_WithdrawStopsSignalling(t *testing.T) {
 	}
 }
 
+func TestProcessGroup_SealClosesSignalAuthority(t *testing.T) {
+	pg, cmd := startTrackedGroup(t, helperCmd("sleep", "120s"))
+	if err := pg.Kill(); err != nil {
+		t.Fatalf("Kill before Seal = %v", err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("Wait() = nil after forced termination, want a killed-process result")
+	}
+
+	observation, err := pg.Seal()
+	if err != nil {
+		t.Fatalf("Seal() = %v", err)
+	}
+	if observation.State != GroupEmpty {
+		t.Fatalf("Seal() observed %v, want empty after termination", observation.State)
+	}
+	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Kill after Seal = %v, want os.ErrProcessDone", err)
+	}
+}
+
+func TestProcessGroup_SealPreservesSurvivorIdentity(t *testing.T) {
+	// Replace the shell with the helper so test cleanup owns the group leader
+	// itself; sealing withdraws group signaling, so a forked helper would escape
+	// leader-only cleanup.
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", "exec "+helperCmd("sleep", "120s"))
+	pg := newProcessGroup()
+	pg.Setup(cmd)
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start: %v", err)
+	}
+	if err := pg.Track(cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		cancel()
+		t.Fatalf("track: %v", err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill() // direct owned handle; never use the withdrawn PGID
+			_, _ = cmd.Process.Wait()
+			if pidIsRunning(pid) {
+				t.Errorf("seal fixture process %d still running after direct kill and wait", pid)
+			}
+		}
+		cancel()
+		_ = pg.Close()
+	})
+	wantIdentity := strconv.Itoa(cmd.Process.Pid)
+
+	observation, err := pg.Seal()
+	if err != nil {
+		t.Fatalf("Seal() = %v", err)
+	}
+	if observation.State != GroupOwned {
+		t.Fatalf("Seal() state = %v, want an unverified owned group", observation.State)
+	}
+	if observation.Identity != wantIdentity {
+		t.Fatalf("Seal() identity = %q, want preserved group ID %q", observation.Identity, wantIdentity)
+	}
+	if got := survivorsError(sealedGroupResult("survivor", observation)); got == nil || !strings.Contains(got.Error(), wantIdentity) {
+		t.Fatalf("survivor result = %v, want preserved group ID %s", got, wantIdentity)
+	}
+	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Kill after Seal = %v, want os.ErrProcessDone", err)
+	}
+}
+
+type failedTrackProcessGroup struct {
+	ProcessGroup
+	cmd    *exec.Cmd
+	sealed chan struct{}
+}
+
+func (g *failedTrackProcessGroup) Track(cmd *exec.Cmd) error {
+	g.cmd = cmd
+	return errors.New("controlled Track failure")
+}
+
+func (g *failedTrackProcessGroup) Seal() (SealObservation, error) {
+	observation, err := g.ProcessGroup.Seal()
+	close(g.sealed)
+	return observation, err
+}
+
+// The admission tests below stay Unix-only. Each one holds or fails Track after
+// cmd.Start. On Windows the command runs under cmd /c and is assigned to its Job
+// Object only after it has started, so a helper that cmd spawns in that window
+// is outside the job, and these fixtures would leak it. That window is a known
+// Windows containment gap, not something these tests can cover.
+func TestRunnerAdmission_TrackFailureKillsAndReapsStartedProcess(t *testing.T) {
+	command := serviceHelperCmd("sleep", "120s")
+	r := makeRunner(map[string]config.Process{"api": {Cmd: command, Restart: "never"}})
+	group := &failedTrackProcessGroup{ProcessGroup: newProcessGroup(), sealed: make(chan struct{})}
+	r.processGroupFactory = func() ProcessGroup { return group }
+	runDone := make(chan struct{})
+	var runErr error
+	go func() {
+		runErr = r.Run(context.Background())
+		close(runDone)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-runDone:
+		case <-time.After(10 * time.Second):
+			if group.cmd != nil && group.cmd.Process != nil {
+				_ = group.cmd.Process.Kill()
+			}
+			select {
+			case <-runDone:
+			case <-time.After(5 * time.Second):
+				t.Error("runner remained blocked after killing the owned process handle")
+			}
+		}
+		if group.cmd != nil && group.cmd.Process != nil && pidIsRunning(group.cmd.Process.Pid) {
+			t.Errorf("failed-admission process %d survived test cleanup", group.cmd.Process.Pid)
+		}
+	})
+
+	select {
+	case <-runDone:
+		if runErr == nil || !strings.Contains(runErr.Error(), "api") {
+			t.Fatalf("Runner.Run result = %v, want failed process result", runErr)
+		}
+	case <-time.After(10 * time.Second):
+		if group.cmd != nil && group.cmd.Process != nil {
+			_ = group.cmd.Process.Kill()
+		}
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Runner.Run did not finish cleanup after Track failure")
+		}
+		t.Fatalf("Runner.Run exceeded cleanup wait after Track failure: %v", runErr)
+	}
+	if group.cmd == nil || group.cmd.Process == nil {
+		t.Fatal("Track failure did not observe the already-started process")
+	}
+	select {
+	case <-group.sealed:
+	case <-time.After(time.Second):
+		t.Fatal("process-group resources were not sealed after Track failure")
+	}
+	assertTerminated(t, group.cmd.Process.Pid, "failed-admission process", 5*time.Second)
+	r.groupsMu.Lock()
+	defer r.groupsMu.Unlock()
+	if len(r.groups) != 0 {
+		t.Fatalf("failed admission left registered groups: %v", r.groups)
+	}
+}
+
+func TestRunnerAdmission_CancelBetweenStartAndRegistration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	command := serviceHelperCmd("sleep", "120s")
+	writeConfig := func(command string) {
+		t.Helper()
+		body := "processes:\n  api:\n    cmd: " + strconv.Quote(command) + "\n    restart: never\n"
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConfig(command)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Config: cfg, ConfigPath: path, NoColor: true, Silent: true}
+	group := &admissionGateProcessGroup{
+		trackStarted:     make(chan struct{}),
+		trackRelease:     make(chan struct{}),
+		terminateStarted: make(chan struct{}),
+		terminateRelease: make(chan struct{}),
+		closed:           make(chan struct{}),
+	}
+	r.processGroupFactory = func() ProcessGroup {
+		group.ProcessGroup = newProcessGroup()
+		return group
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	var runErr error
+	go func() {
+		runErr = r.Run(ctx)
+		close(runDone)
+	}()
+	trackReleased := sync.OnceFunc(func() { close(group.trackRelease) })
+	terminateReleased := sync.OnceFunc(func() { close(group.terminateRelease) })
+	t.Cleanup(func() {
+		trackReleased()
+		terminateReleased()
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not finish after releasing admission gates; killing owned process handle")
+			if group.cmd != nil && group.cmd.Process != nil {
+				_ = group.cmd.Process.Kill()
+			}
+			select {
+			case <-runDone:
+			case <-time.After(5 * time.Second):
+				t.Error("runner remained blocked after killing its owned process handle")
+			}
+		}
+		if group.pid > 0 && pidIsRunning(group.pid) {
+			t.Errorf("admission fixture process %d survived test cleanup", group.pid)
+		}
+	})
+
+	select {
+	case <-group.trackStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("production Runner.Run did not reach process-group tracking")
+	}
+	pid := group.pid
+	cancel() // context cancellation lands after cmd.Start and before Track.
+	select {
+	case <-runDone:
+		t.Fatalf("Runner.Run returned before the started process was registered: %v", runErr)
+	case <-time.After(25 * time.Millisecond):
+	}
+	// Queue both replacement paths while the launch still holds lifecycleMu.
+	// Once Track is released, either request may acquire the lock before the
+	// cancellation watcher; runCtx.Err must still refuse it without mutation.
+	writeConfig(serviceHelperCmd("sleep", "121s"))
+	restartResult := make(chan ipc.CommandResult, 1)
+	go func() { restartResult <- r.requestRestart(r.store.Load().get("api")) }()
+	reloadResult := make(chan ipc.CommandResult, 1)
+	go func() { reloadResult <- r.Reload() }()
+	trackReleased()
+
+	select {
+	case <-group.terminateStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("registered process did not enter production teardown")
+	}
+	r.groupsMu.Lock()
+	registered := r.groups["api"] == group
+	r.groupsMu.Unlock()
+	if !registered {
+		t.Fatal("started process was not visible in the cleanup registry before teardown")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !r.stopping.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !r.stopping.Load() {
+		t.Fatal("cancellation did not close launch admission")
+	}
+	select {
+	case result := <-restartResult:
+		if result.Status != "error" {
+			t.Fatalf("restart racing cancellation = %+v, want refusal", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("restart request remained blocked after launch admission ended")
+	}
+	select {
+	case result := <-reloadResult:
+		if result.Status != "error" {
+			t.Fatalf("reload racing cancellation = %+v, want refusal", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reload remained blocked after launch admission ended")
+	}
+	if got := r.Config.Processes["api"].Cmd; got != command {
+		t.Fatalf("reload changed command after admission closed: %q", got)
+	}
+
+	stopped, _, err := r.Shutdown(false)
+	if err != nil {
+		t.Fatalf("Shutdown after parent cancellation: %v", err)
+	}
+	terminateReleased()
+	select {
+	case <-stopped:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Shutdown did not observe production cleanup completion")
+	}
+	select {
+	case <-runDone:
+		if runErr != nil {
+			t.Fatalf("Runner.Run after cancellation: %v", runErr)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Runner.Run did not finish after production teardown was released")
+	}
+	select {
+	case <-group.closed:
+	case <-time.After(time.Second):
+		t.Fatal("registered process group was not closed by production cleanup")
+	}
+	assertTerminated(t, pid, "admitted process", 5*time.Second)
+}
+
+func TestRunnerCleanupHandoff_FailedTrackDoesNotHoldAdmissionOrRun(t *testing.T) {
+	proc := config.Process{Cmd: serviceHelperCmd("sleep", "120s"), Restart: "never"}
+	output, journal := &synchronizedBuffer{}, &synchronizedBuffer{}
+	r := makeRunner(map[string]config.Process{"api": proc})
+	r.NoColor = true
+	r.Silent = true
+	r.Output = output
+	r.Journal = journal
+	r.CleanupHandoffTimeout = 200 * time.Millisecond
+	group := &failedTrackProcessGroup{ProcessGroup: newProcessGroup(), sealed: make(chan struct{})}
+	r.processGroupFactory = func() ProcessGroup { return group }
+	waitStarted, reapRelease := make(chan struct{}), make(chan struct{})
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		close(waitStarted)
+		<-reapRelease
+		return cmd.Wait()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	var runErr error
+	go func() {
+		runErr = r.Run(ctx)
+		close(runDone)
+	}()
+	reapReleased := sync.OnceFunc(func() { close(reapRelease) })
+	t.Cleanup(func() {
+		reapReleased()
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(10 * time.Second):
+			if group.cmd != nil && group.cmd.Process != nil {
+				_ = group.cmd.Process.Kill()
+			}
+			select {
+			case <-runDone:
+			case <-time.After(5 * time.Second):
+				t.Error("runner did not finish after emergency owned-handle kill")
+			}
+		}
+		if group.cmd != nil && group.cmd.Process != nil && pidIsRunning(group.cmd.Process.Pid) {
+			t.Errorf("failed-track fixture process %d survived cleanup", group.cmd.Process.Pid)
+		}
+	})
+
+	select {
+	case <-waitStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("failed Track did not start its tracked reap")
+	}
+	select {
+	case <-group.sealed:
+	case <-time.After(time.Second):
+		t.Fatal("failed Track did not seal its unregistered group")
+	}
+	cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for !r.stopping.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !r.stopping.Load() {
+		t.Fatal("admission remained blocked behind the unresolved failed-track reap")
+	}
+	select {
+	case <-runDone:
+		if runErr == nil || !strings.Contains(runErr.Error(), "not reaped") {
+			t.Fatalf("Runner.Run result = %v, want unverified failed-track reap", runErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Runner.Run remained blocked by failed-track cleanup wait")
+	}
+	if result := r.requestRestart(r.store.Load().get("api")); result.Status != "error" {
+		t.Fatalf("restart after failed-track handoff = %+v, want refusal", result)
+	}
+	tracked := trackedReaper(t, r, "api")
+	if tracked.reap.taken() {
+		t.Fatal("failed-track reaper unexpectedly completed before release")
+	}
+	stateBefore := r.store.Load().snapshot()
+	processBefore := r.Config.Processes["api"]
+	verdictBefore := r.ShutdownResult().Error()
+	outputBefore, journalBefore := output.String(), journal.String()
+	r.logMu.Lock()
+	sequenceBefore := r.sequence
+	r.logMu.Unlock()
+	reapReleased()
+	select {
+	case <-tracked.reap.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("failed-track reaper did not finish after its gate was released")
+	}
+	if group.cmd == nil || group.cmd.Process == nil {
+		t.Fatal("failed Track did not retain the started process handle for cleanup proof")
+	}
+	assertTerminated(t, group.cmd.Process.Pid, "failed-track leader", 5*time.Second)
+	assertRunnerQuiescent(t, r, stateBefore, processBefore, verdictBefore, outputBefore, journalBefore, sequenceBefore)
+}
+
 // TestObserveLeaderExit_SetupDoesNotBlockOnARunningCommand pins correction 1:
 // setup must return promptly for a long-running service, and must report that
 // the leader has not exited yet rather than waiting for it.
 func TestObserveLeaderExit_SetupDoesNotBlockOnARunningCommand(t *testing.T) {
-	_, cmd := startTrackedGroup(t, helperCmd("sleep", "120s"))
+	// Replace the shell with the helper so fixture cleanup owns and reaps the
+	// exact process being observed rather than orphaning a shell child.
+	_, cmd := startTrackedGroup(t, "exec "+helperCmd("sleep", "120s"))
 
 	done := make(chan struct{})
 	var obs exitObserver

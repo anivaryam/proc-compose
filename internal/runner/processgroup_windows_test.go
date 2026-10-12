@@ -161,7 +161,8 @@ func TestWindowsJob_AuthoritySurvivesLeaderExit(t *testing.T) {
 // State() must stay unverifiable rather than claiming an empty group.
 func TestWindowsJob_UnavailableContainmentIsReported(t *testing.T) {
 	// A group that was never created models a failed job object creation.
-	pg := &windowsProcessGroup{createErr: errors.New("job object could not be created")}
+	createErr := errors.New("job object could not be created")
+	pg := &windowsProcessGroup{createErr: createErr}
 
 	self, err := os.FindProcess(os.Getpid())
 	if err != nil {
@@ -181,8 +182,12 @@ func TestWindowsJob_UnavailableContainmentIsReported(t *testing.T) {
 	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("Kill() with no containment = %v, want os.ErrProcessDone", err)
 	}
-	if err := pg.Close(); err != nil {
-		t.Fatalf("Close() with no containment = %v, want nil", err)
+	observation, err := pg.Seal()
+	if !errors.Is(err, createErr) {
+		t.Fatalf("Seal() error = %v, want job creation error", err)
+	}
+	if observation.State != GroupUnavailable || observation.Identity != "unknown" {
+		t.Fatalf("Seal() observation = %+v, want unavailable state and unknown identity", observation)
 	}
 }
 
@@ -266,6 +271,29 @@ func TestWindowsJob_WithdrawDoesNotReleaseAuthority(t *testing.T) {
 	}
 	if pg.Identify() == "unknown" {
 		t.Fatal("Identify() after Withdraw = unknown, want the job to still be identified")
+	}
+}
+
+func TestWindowsJob_SealPreservesPreCloseObservation(t *testing.T) {
+	pg, _ := startGroupForJobTest(t, "ping -n 30 127.0.0.1 >NUL")
+	if got := pg.State(); got != GroupOwned {
+		t.Fatalf("State() before Seal = %v, want owned", got)
+	}
+	observation, err := pg.Seal()
+	if err != nil {
+		t.Fatalf("Seal() = %v", err)
+	}
+	if observation.State != GroupOwned {
+		t.Fatalf("Seal() observation = %v, want pre-close owned state", observation.State)
+	}
+	if observation.Identity != "job object" {
+		t.Fatalf("Seal() identity = %q, want pre-close job identity", observation.Identity)
+	}
+	if got := pg.State(); got != GroupUnavailable {
+		t.Fatalf("State() after Seal = %v, want unavailable rather than false emptiness", got)
+	}
+	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Kill after Seal = %v, want os.ErrProcessDone", err)
 	}
 }
 

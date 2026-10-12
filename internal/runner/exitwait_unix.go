@@ -3,6 +3,7 @@
 package runner
 
 import (
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -92,27 +93,36 @@ func (o *reapFreeObserver) probe() error {
 	return err
 }
 
-// Observe blocks until the leader exits, leaving it unreaped.
+// Observe polls for the leader's exit, leaving it unreaped. Polling makes stop
+// effective so a sealed cleanup can join the observer before returning.
 func (o *reapFreeObserver) Observe(stop <-chan struct{}) exitObservation {
 	if o.sawExit {
 		return exitObserved
 	}
-
-	var info waitSiginfo
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	for {
-		err := waitid(pidIDType, o.pid, unix.WEXITED|unix.WNOWAIT, &info)
-		switch {
-		case err == nil:
-			return exitObserved
-		case err == unix.EINTR:
-			info = waitSiginfo{}
-			continue
-		default:
-			// ECHILD means the leader is no longer waitable, which is the only
-			// way this can fail in normal operation. Treat any failure the same
-			// way: an observation that does not establish the leader as an
-			// unreaped zombie must never authorise a group signal.
-			return exitOwnershipLost
+		select {
+		case <-stop:
+			return exitPending
+		case <-ticker.C:
+			var info waitSiginfo
+			for {
+				err := waitid(pidIDType, o.pid, unix.WEXITED|unix.WNOWAIT|unix.WNOHANG, &info)
+				if err == unix.EINTR {
+					info = waitSiginfo{}
+					continue
+				}
+				if err != nil {
+					// ECHILD means the leader is no longer waitable. Any failure
+					// cannot authorise group signalling.
+					return exitOwnershipLost
+				}
+				if info.Pid != 0 {
+					return exitObserved
+				}
+				break
+			}
 		}
 	}
 }

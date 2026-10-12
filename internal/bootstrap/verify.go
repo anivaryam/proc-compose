@@ -10,12 +10,13 @@ import (
 )
 
 type commandVerifier struct {
-	Root string
+	Root       string
+	Executable string
 }
 
 func (v commandVerifier) Verify(configPath string) (*Verification, error) {
 	start := time.Now()
-	report := &Verification{ConfigPath: configPath}
+	report := &Verification{ConfigPath: configPath, ValidationStatus: "failed"}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -28,7 +29,11 @@ func (v commandVerifier) Verify(configPath string) (*Verification, error) {
 	_ = logFile.Close()
 	report.LogFile = logPath
 
-	cmd := exec.CommandContext(ctx, os.Args[0], "up", "--dry-run", "--log-file", logPath, "-f", configPath)
+	executable := v.Executable
+	if executable == "" {
+		executable = os.Args[0]
+	}
+	cmd := exec.CommandContext(ctx, executable, "up", "--dry-run", "--log-file", logPath, "-f", configPath)
 	if v.Root != "" {
 		cmd.Dir = v.Root
 	}
@@ -36,13 +41,12 @@ func (v commandVerifier) Verify(configPath string) (*Verification, error) {
 	cmd.Stderr = &stderr
 	err = cmd.Run()
 	report.ElapsedMS = time.Since(start).Milliseconds()
-	report.Started = err == nil
-	report.Ready = err == nil
-	report.Stopped = true
 	if err != nil {
+		report.ValidationStatus = "failed"
 		report.Message = stderr.String()
 		return report, fmt.Errorf("verification failed: %w", err)
 	}
-	report.Message = "dry-run verification passed"
+	report.ValidationStatus = "passed"
+	report.Message = "configuration validation passed (dry run; no application processes started)"
 	return report, nil
 }

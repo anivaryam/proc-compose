@@ -2,7 +2,9 @@ package bootstrap
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -153,6 +155,23 @@ func TestWriteText(t *testing.T) {
 	}
 }
 
+func TestWriteTextDescribesConfigurationValidation(t *testing.T) {
+	report := newReport(Options{Verify: true}, "/tmp/proc-compose.yml")
+	report.Verification = &Verification{
+		ValidationStatus: "passed",
+		Message:          "configuration validation passed (dry run; no application processes started)",
+	}
+
+	var buf strings.Builder
+	if err := WriteText(&buf, report); err != nil {
+		t.Fatalf("WriteText returned error: %v", err)
+	}
+	text := buf.String()
+	if !strings.Contains(text, "configuration validation: passed") || strings.Contains(text, "ready=true") || strings.Contains(text, "started=true") {
+		t.Fatalf("unexpected verification text:\n%s", text)
+	}
+}
+
 type fakeVerifier struct {
 	result *Verification
 	err    error
@@ -169,12 +188,12 @@ func TestRunVerifyUsesTemporaryConfigWhenNotWriting(t *testing.T) {
 	report, err := Run(Options{
 		Root:     dir,
 		Verify:   true,
-		Verifier: fakeVerifier{result: &Verification{Started: true, Ready: true, Stopped: true}},
+		Verifier: fakeVerifier{result: &Verification{ValidationStatus: "passed"}},
 	})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if report.Verification == nil || !report.Verification.Ready {
+	if report.Verification == nil || report.Verification.ValidationStatus != "passed" {
 		t.Fatalf("verification = %+v", report.Verification)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "proc-compose.yml")); !os.IsNotExist(err) {
@@ -190,12 +209,61 @@ func TestRunWriteVerifyVerifiesWrittenConfig(t *testing.T) {
 		Root:     dir,
 		Write:    true,
 		Verify:   true,
-		Verifier: fakeVerifier{result: &Verification{Started: true, Ready: true, Stopped: true}},
+		Verifier: fakeVerifier{result: &Verification{ValidationStatus: "passed"}},
 	})
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 	if report.Verification == nil || report.Verification.ConfigPath != filepath.Join(dir, "proc-compose.yml") {
 		t.Fatalf("verification path = %+v", report.Verification)
+	}
+}
+
+func TestCommandVerifierReportsDryRunValidation(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "proc-compose-test")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	build := exec.Command("go", "build", "-o", bin, "../../cmd/proc-compose")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build proc-compose: %v\n%s", err, out)
+	}
+
+	verifier := commandVerifier{Root: dir, Executable: bin}
+	validConfig := filepath.Join(dir, "valid.yml")
+	writeFile(t, validConfig, "processes: {app: {cmd: echo hello}}\n")
+	passed, err := verifier.Verify(validConfig)
+	if err != nil {
+		t.Fatalf("Verify(valid config) returned error: %v", err)
+	}
+	if passed.ValidationStatus != "passed" || passed.Started || passed.Ready || passed.Stopped {
+		t.Fatalf("successful dry run reported live lifecycle state: %+v", passed)
+	}
+
+	invalidConfig := filepath.Join(dir, "invalid.yml")
+	writeFile(t, invalidConfig, "processes: [\n")
+	failed, err := verifier.Verify(invalidConfig)
+	if err == nil {
+		t.Fatal("Verify(invalid config) unexpectedly succeeded")
+	}
+	if failed.ValidationStatus != "failed" || failed.Started || failed.Ready || failed.Stopped {
+		t.Fatalf("failed dry run reported incorrect state: %+v", failed)
+	}
+}
+
+func TestCommandVerifierReportsTemporaryFileFailure(t *testing.T) {
+	tempPath := filepath.Join(t.TempDir(), "not-a-directory")
+	writeFile(t, tempPath, "file")
+	t.Setenv("TMPDIR", tempPath)
+	t.Setenv("TMP", tempPath)
+	t.Setenv("TEMP", tempPath)
+
+	verification, err := (commandVerifier{}).Verify("unused.yml")
+	if err == nil {
+		t.Fatal("Verify unexpectedly succeeded when its temporary directory was unusable")
+	}
+	if verification.ValidationStatus != "failed" || verification.Started || verification.Ready || verification.Stopped {
+		t.Fatalf("temporary-file failure reported incorrect state: %+v", verification)
 	}
 }

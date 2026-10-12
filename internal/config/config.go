@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -83,7 +84,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	if len(cfg.Processes) == 0 && cfg.Merge == nil {
-		return nil, fmt.Errorf("no processes defined in %s", path)
+		return nil, invalid(CodeNoProcesses, nil, nil, "no processes defined in %s", path)
 	}
 
 	// Resolve config dir to absolute so relative process dirs work from any CWD.
@@ -108,7 +109,7 @@ func Load(path string) (*Config, error) {
 
 		cmd, err := buildMergeCmd(cfg.Merge)
 		if err != nil {
-			return nil, err
+			return nil, invalid(CodeInvalidMerge, []any{"merge"}, err, "%s", err)
 		}
 		if cfg.Processes == nil {
 			cfg.Processes = make(map[string]Process)
@@ -150,53 +151,57 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	for name, proc := range cfg.Processes {
-		for portName, preferred := range proc.Ports {
-			if !processNameRe.MatchString(portName) || preferred < 0 || preferred > 65535 {
-				return nil, fmt.Errorf("process %q: invalid named port %q (%d)", name, portName, preferred)
+	// Validate in name order so the first reported error is deterministic.
+	for _, name := range sortedProcessNames(cfg.Processes) {
+		proc := cfg.Processes[name]
+		at := func(field ...any) []any { return append([]any{"processes", name}, field...) }
+		portNames := make([]string, 0, len(proc.Ports))
+		for portName := range proc.Ports {
+			portNames = append(portNames, portName)
+		}
+		sort.Strings(portNames)
+		for _, portName := range portNames {
+			if preferred := proc.Ports[portName]; !processNameRe.MatchString(portName) || preferred < 0 || preferred > 65535 {
+				return nil, invalid(CodeInvalidPort, at("ports", portName), nil, "process %q: invalid named port %q (%d)", name, portName, preferred)
 			}
 		}
 		if !processNameRe.MatchString(name) {
-			return nil, fmt.Errorf("process %q has an invalid name (must match [-A-Za-z0-9._], start/end with alphanumeric)", name)
+			return nil, invalid(CodeInvalidProcessName, at(), nil, "process %q has an invalid name (must match [-A-Za-z0-9._], start/end with alphanumeric)", name)
 		}
 		if proc.Cmd == "" {
-			return nil, fmt.Errorf("process %q has no cmd", name)
+			return nil, invalid(CodeMissingCmd, at(), nil, "process %q has no cmd", name)
 		}
 		if proc.Restart == "" {
 			proc.Restart = "never"
 		}
-		switch proc.Restart {
-		case "never", "on-failure", "always":
-		default:
-			return nil, fmt.Errorf("process %q has invalid restart policy %q (use never, on-failure, or always)", name, proc.Restart)
+		if !slices.Contains(RestartPolicies, proc.Restart) {
+			return nil, invalid(CodeInvalidRestart, at("restart"), nil, "process %q has invalid restart policy %q (use never, on-failure, or always)", name, proc.Restart)
 		}
-		switch proc.Mode {
-		case "", ProcessModeService, ProcessModeTask:
-		default:
-			return nil, fmt.Errorf("process %q: invalid mode %q (use service or task)", name, proc.Mode)
+		if proc.Mode != "" && !slices.Contains(ProcessModes, proc.Mode) {
+			return nil, invalid(CodeInvalidMode, at("mode"), nil, "process %q: invalid mode %q (use service or task)", name, proc.Mode)
 		}
 		if proc.Mode == ProcessModeTask {
 			if proc.ReadyWhen != nil {
-				return nil, fmt.Errorf("process %q: mode: task cannot use ready_when", name)
+				return nil, invalid(CodeTaskIncompatible, at("ready_when"), nil, "process %q: mode: task cannot use ready_when", name)
 			}
 			if proc.ReadyTimeout != 0 {
-				return nil, fmt.Errorf("process %q: mode: task cannot use ready_timeout", name)
+				return nil, invalid(CodeTaskIncompatible, at("ready_timeout"), nil, "process %q: mode: task cannot use ready_timeout", name)
 			}
 			if proc.Restart != "never" {
-				return nil, fmt.Errorf("process %q: mode: task cannot use restart: %s (only restart: never is allowed)", name, proc.Restart)
+				return nil, invalid(CodeTaskIncompatible, at("restart"), nil, "process %q: mode: task cannot use restart: %s (only restart: never is allowed)", name, proc.Restart)
 			}
 			if proc.MaxRestarts > 0 {
-				return nil, fmt.Errorf("process %q: mode: task cannot use max_restarts", name)
+				return nil, invalid(CodeTaskIncompatible, at("max_restarts"), nil, "process %q: mode: task cannot use max_restarts", name)
 			}
 		}
 		if proc.MaxRestarts < 0 {
-			return nil, fmt.Errorf("process %q: max_restarts must be >= 0", name)
+			return nil, invalid(CodeInvalidValue, at("max_restarts"), nil, "process %q: max_restarts must be >= 0", name)
 		}
 		if proc.MaxRestarts > 0 && proc.Restart == "never" {
-			return nil, fmt.Errorf("process %q: max_restarts has no effect with restart: never", name)
+			return nil, invalid(CodeInvalidValue, at("max_restarts"), nil, "process %q: max_restarts has no effect with restart: never", name)
 		}
 		if proc.ShutdownTimeout < 0 {
-			return nil, fmt.Errorf("process %q: shutdown_timeout must be >= 0", name)
+			return nil, invalid(CodeInvalidValue, at("shutdown_timeout"), nil, "process %q: shutdown_timeout must be >= 0", name)
 		}
 		if rw := proc.ReadyWhen; rw != nil {
 			n := 0
@@ -210,11 +215,11 @@ func Load(path string) (*Config, error) {
 				n++
 			}
 			if n != 1 {
-				return nil, fmt.Errorf("process %q: ready_when must specify exactly one of http, tcp, or log", name)
+				return nil, invalid(CodeInvalidReadyWhen, at("ready_when"), nil, "process %q: ready_when must specify exactly one of http, tcp, or log", name)
 			}
 			if rw.Log != "" {
 				if _, err := regexp.Compile(rw.Log); err != nil {
-					return nil, fmt.Errorf("process %q: ready_when.log is not a valid regex: %w", name, err)
+					return nil, invalid(CodeInvalidReadyWhen, at("ready_when", "log"), err, "process %q: ready_when.log is not a valid regex: %w", name, err)
 				}
 			}
 		}
@@ -225,7 +230,7 @@ func Load(path string) (*Config, error) {
 			}
 			fileVars, err := parseEnvFile(envFilePath)
 			if err != nil {
-				return nil, fmt.Errorf("process %q: %w", name, err)
+				return nil, invalid(CodeEnvFile, at("env_file"), err, "process %q: %w", name, err)
 			}
 			if len(fileVars) > 0 {
 				merged := make(map[string]string, len(fileVars)+len(proc.Env))
@@ -243,13 +248,13 @@ func Load(path string) (*Config, error) {
 	}
 
 	// Validate depends_on references after all processes (including merge-port) are registered.
-	for name, proc := range cfg.Processes {
-		for _, dep := range proc.DependsOn {
+	for _, name := range sortedProcessNames(cfg.Processes) {
+		for i, dep := range cfg.Processes[name].DependsOn {
 			if dep == name {
-				return nil, fmt.Errorf("process %q cannot depend on itself", name)
+				return nil, invalid(CodeSelfDependency, []any{"processes", name, "depends_on", i}, nil, "process %q cannot depend on itself", name)
 			}
 			if _, ok := cfg.Processes[dep]; !ok {
-				return nil, fmt.Errorf("process %q depends_on unknown process %q", name, dep)
+				return nil, invalid(CodeUnknownDependency, []any{"processes", name, "depends_on", i}, nil, "process %q depends_on unknown process %q", name, dep)
 			}
 		}
 	}
@@ -258,9 +263,9 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	seenResources := make(map[string]bool)
-	for _, resource := range cfg.Resources {
+	for i, resource := range cfg.Resources {
 		if strings.TrimSpace(resource) == "" || len(resource) > 256 || strings.ContainsAny(resource, "\r\n\x00") || seenResources[resource] {
-			return nil, fmt.Errorf("invalid or duplicate resource label %q", resource)
+			return nil, invalid(CodeInvalidResource, []any{"resources", i}, nil, "invalid or duplicate resource label %q", resource)
 		}
 		seenResources[resource] = true
 	}
@@ -347,7 +352,7 @@ func detectCycles(processes map[string]Process) error {
 				for i, j := 0, len(cycle)-1; i < j; i, j = i+1, j-1 {
 					cycle[i], cycle[j] = cycle[j], cycle[i]
 				}
-				return fmt.Errorf("circular dependency: %s", strings.Join(cycle, " -> "))
+				return invalid(CodeDependencyCycle, []any{"processes", name, "depends_on", slices.Index(processes[name].DependsOn, dep)}, nil, "circular dependency: %s", strings.Join(cycle, " -> "))
 			case white:
 				if err := visit(dep); err != nil {
 					return err

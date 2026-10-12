@@ -19,7 +19,7 @@ import (
 //	"error"   — config could not be parsed
 func (r *Runner) Reload() ipc.CommandResult {
 	if r.ConfigPath == "" {
-		r.systemEvent("reload: no config path set", true)
+		r.reloadEvent("reload: no config path set", true)
 		return ipc.CommandResult{Status: "error", Message: "no config path set"}
 	}
 	newCfg, err := config.Load(r.ConfigPath)
@@ -27,7 +27,7 @@ func (r *Runner) Reload() ipc.CommandResult {
 		newCfg, err = r.ResolveConfig(newCfg)
 	}
 	if err != nil {
-		r.systemEvent(fmt.Sprintf("reload: %v", err), true)
+		r.reloadEvent(fmt.Sprintf("reload: %v", err), true)
 		return ipc.CommandResult{Status: "error", Message: err.Error()}
 	}
 
@@ -67,10 +67,10 @@ func (r *Runner) Reload() ipc.CommandResult {
 	r.cfgMu.Unlock()
 
 	for _, name := range added {
-		r.systemEvent(fmt.Sprintf("reload: new process %q ignored (hot-add not supported)", name), false)
+		r.reloadEvent(fmt.Sprintf("reload: new process %q ignored (hot-add not supported)", name), false)
 	}
 	for _, name := range removed {
-		r.systemEvent(fmt.Sprintf("reload: removed process %q ignored (hot-remove not supported)", name), false)
+		r.reloadEvent(fmt.Sprintf("reload: removed process %q ignored (hot-remove not supported)", name), false)
 	}
 	var skipped []string
 	store := r.store.Load()
@@ -81,23 +81,30 @@ func (r *Runner) Reload() ipc.CommandResult {
 		}
 		if c.proc.EffectiveMode() == config.ProcessModeTask {
 			skipped = append(skipped, c.name)
-			r.systemEvent(fmt.Sprintf("reload: %q is completed and cannot be restarted; restart the daemon to apply changes", c.name), false)
+			r.reloadEvent(fmt.Sprintf("reload: %q is completed and cannot be restarted; restart the daemon to apply changes", c.name), false)
 			continue
 		}
 		if st != nil {
+			r.lifecycleMu.Lock()
+			if r.launchAdmissionClosedLocked() {
+				r.lifecycleMu.Unlock()
+				return ipc.CommandResult{Status: "error", Message: "daemon is shutting down"}
+			}
 			r.cfgMu.Lock()
 			r.Config.Processes[c.name] = c.proc
 			r.cfgMu.Unlock()
-			if result := r.requestRestart(st); result.Status != "ok" {
+			result := r.requestRestartLocked(st)
+			r.lifecycleMu.Unlock()
+			if result.Status != "ok" {
 				return result
 			}
-			r.systemEvent(fmt.Sprintf("reload: restart requested for %q (config changed)", c.name), false)
+			r.reloadEvent(fmt.Sprintf("reload: restart requested for %q (config changed)", c.name), false)
 		} else {
 			skipped = append(skipped, c.name)
 		}
 	}
 	if len(changes) == 0 && len(added) == 0 && len(removed) == 0 {
-		r.systemEvent("reload: no changes detected", false)
+		r.reloadEvent("reload: no changes detected", false)
 	}
 
 	if len(added) > 0 || len(removed) > 0 {
@@ -125,6 +132,18 @@ func (r *Runner) Reload() ipc.CommandResult {
 		return ipc.CommandResult{Status: "ok", Message: "no changes detected"}
 	}
 	return ipc.CommandResult{Status: "ok", Message: fmt.Sprintf("restarted %d", len(changes))}
+}
+
+// reloadEvent serializes reload diagnostics with admission closure. A reload
+// that finishes reading config after shutdown cannot emit runner output after
+// the bounded Run operation has returned.
+func (r *Runner) reloadEvent(message string, isError bool) {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.launchAdmissionClosedLocked() {
+		return
+	}
+	r.systemEvent(message, isError)
 }
 
 // procChanged returns true if any field of the process definition differs.

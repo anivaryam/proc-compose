@@ -196,3 +196,23 @@ func TestQuery_DoesNotExposeUncommittedPartialRecord(t *testing.T) {
 		t.Fatalf("partial record leaked: %+v %v", page, err)
 	}
 }
+
+func TestQuery_AttemptFilter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	var lines []string
+	for i, attempt := range []string{"A", "B", "A", ""} {
+		event := ipc.LogEntry{Version: 1, ID: fmt.Sprintf("run:%d", i+1), RunID: "run", AttemptID: attempt, Sequence: uint64(i + 1), Process: "api", Line: "x"}
+		data, _ := json.Marshal(event)
+		lines = append(lines, string(data))
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	page, err := Query(path, Options{AttemptID: "A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 2 || page.Events[0].ID != "run:1" || page.Events[1].ID != "run:3" {
+		t.Fatalf("attempt page = %+v", page.Events)
+	}
+}

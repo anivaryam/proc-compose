@@ -20,7 +20,7 @@ func WriteText(w io.Writer, report *Report) error {
 		}
 	}
 	if report.Verification != nil {
-		fmt.Fprintf(w, "\nverification: started=%t ready=%t stopped=%t\n", report.Verification.Started, report.Verification.Ready, report.Verification.Stopped)
+		fmt.Fprintf(w, "\nconfiguration validation: %s (dry run; no application processes started)\n", report.Verification.ValidationStatus)
 		if report.Verification.Message != "" {
 			fmt.Fprintf(w, "  %s\n", report.Verification.Message)
 		}

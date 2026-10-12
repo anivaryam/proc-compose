@@ -29,6 +29,7 @@ type Options struct {
 	Search     string
 	Since      time.Time
 	RunID      string
+	AttemptID  string
 	Generation uint64
 }
 
@@ -255,6 +256,7 @@ func matches(event ipc.LogEntry, opts Options) bool {
 		(opts.Code == "" || opts.Code == event.Code) &&
 		(opts.Stream == "" || opts.Stream == event.Stream) &&
 		(opts.RunID == "" || opts.RunID == event.RunID) &&
+		(opts.AttemptID == "" || opts.AttemptID == event.AttemptID) &&
 		(opts.Generation == 0 || opts.Generation == event.Generation) &&
 		(opts.Since.IsZero() || !event.Time.Before(opts.Since)) &&
 		(opts.Search == "" || strings.Contains(strings.ToLower(event.Line), strings.ToLower(opts.Search)))
