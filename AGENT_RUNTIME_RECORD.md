@@ -1004,6 +1004,295 @@ reviewed Linux scope.)
   3. The CI log is checked to confirm that the moved tests ran on Windows.
   4. Decide whether to fix the Windows containment gap before the pilot.
 
+### 2026-10-13 — PR #1 CI failures: lint and Windows concurrent sessions
+
+- Source: branch `agent-runtime-verify`, HEAD
+  `60352dcc896156ec000514108bf91501c122a530`, clean before this pass.
+- PR #1, CI run 38292246544, tested merge
+  `690b2db2cc33ec361e68ea608b9c180b7b9ab59f`:
+  - Linux tests and vulncheck passed.
+  - `lint` failed (job 114954853530).
+  - `test (windows-latest)` failed (job 114954853204). All other Windows
+    packages passed, including `internal/runner`, which holds the moved
+    handoff and quiescence regressions.
+  - macOS was cancelled and needs a fresh native run.
+- **Lint** (`golangci-lint` v1.64.8, `ineffassign`): in `verify.Compact`,
+  `exit := result.ExitCode` was always overwritten by the following switch.
+  It is now `var exit int`; the switch is unchanged, so the status and exit
+  precedence are unchanged.
+- **Windows `TestRun_DistinctSessionsRunConcurrently`**: the CI log shows only
+  the combined message "concurrent sessions shared an endpoint or run
+  identity", so it does not say which half failed. Evidence gathered:
+  - **Port reuse could not happen while the sessions overlapped.**
+    `session.allocate` holds an exclusive lease per allocated port
+    (`LockFileEx` with `LOCKFILE_FAIL_IMMEDIATELY` on Windows, `flock` on
+    Unix). The lease is per handle, so a second session in the same process
+    is refused that port. A shared port would therefore mean the attempts did
+    not overlap, and the old test allowed that: nothing forced both to be
+    live at once.
+  - **The run ID could repeat.** Both generators (`session.Acquire` and the
+    `Runner.Run` fallback) formatted `"<pid>-<time.Now().UnixNano()>"`. In Go
+    1.26.8 (`src/runtime/time_windows_amd64.s`), `time.now` reads the wall
+    clock from `KUSER_SHARED_DATA.SystemTime` (`0x7ffe0014`). The kernel
+    updates it on the clock interrupt, not every nanosecond, so two attempts
+    acquired in one test process within one tick get the same run ID. Linux
+    reads a fine-grained clock, which is consistent with Linux passing.
+  - **Attribution:** this is a mechanism established from source, plus a
+    deterministic reproduction under a fixed clock. It is not a native
+    Windows observation: which half failed in run 38292246544 cannot be
+    recovered from its log. The rewritten test reports each half separately,
+    so the next native run will show it if either recurs.
+- Changes:
+  - `ipc.NewRunID` keeps the `<pid>-<nanoseconds>` format and is unique
+    within a process: a reading at or before the last issued value is moved
+    just past it. Both generators now call it. Nothing parses run IDs.
+  - Regression `TestNewRunID_UniqueWhenTheClockDoesNotAdvance`, added to the
+    `ipc` package's existing test file: 8×64 concurrent calls with one fixed
+    clock value; IDs must be unique, keep the format, and be at or after the
+    clock. A backwards clock must not reuse an ID. It **failed** with the old
+    formatting temporarily restored
+    (`duplicate run ID "143304-1791813600000000000"`) and passes with the fix.
+  - `TestRun_DistinctSessionsRunConcurrently`: a bounded barrier in the
+    `afterStartup` seam (15s, released in `t.Cleanup`) makes both attempts be
+    past readiness, holding leases with stacks running, before either runs
+    its check. The test fails if they did not overlap. Ports and run IDs are
+    asserted separately, and each failure prints both sessions' run ID,
+    endpoint map, and start/ready/check/finish times. The isolation assertions
+    are unchanged in strength, and nothing is skipped. A temporarily inverted
+    port assertion confirmed that the diagnostics print both sessions in
+    full; it was then restored.
+  - Not attributed to the known Windows containment gap: this test starts no
+    child before `Track`, and the failure was an identity/endpoint
+    assertion, not a leak.
+- Checks, Linux/WSL2, cached Go 1.26.8,
+  `GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off TMPDIR=/tmp/opencode`:
+  - Focused, first: `go test -race -count=1 ./internal/ipc -run TestNewRunID -v`
+    passed; `go test -race -count=1 ./internal/verify -run '^(TestRun_DistinctSessionsRunConcurrently|TestEncode_CompactErrorNeverReportsSuccess)$' -v`
+    passed (the second is the existing compact-result regression).
+  - `go test -race -count=1 -timeout 400s ./internal/ipc ./internal/session ./internal/runner ./internal/verify ./cmd/proc-compose`:
+    all ok (runner 48.0s, verify 44.6s, cmd 25.0s).
+  - `GOOS={linux,windows,darwin} go vet ./...`: clean.
+  - `gofmt -l` on the changed Go files: clean.
+  - `GOOS={windows,darwin} GOARCH=amd64 go test -c` for ipc, session, runner,
+    and verify: compiled, **not executed**.
+  - Process scan afterwards: no helpers left.
+  - `golangci-lint`/`ineffassign`: **not available locally** (not installed,
+    and this pass installs nothing). The lint fix is verified only by
+    inspection until CI reruns.
+- Remaining blockers: native Windows confirmation of both fixes, a fresh
+  macOS run, and lint all need the follow-up commit pushed and CI rerun.
+  Nothing was committed, pushed, or merged. No CI or configuration changes.
+
+### 2026-10-13 — Release-preparation fixes (proposed v1.5.3)
+
+- Source: branch `agent-runtime-verify`, HEAD
+  `60352dcc896156ec000514108bf91501c122a530`, plus the uncommitted CI-repair
+  pass above (run-ID generator, compact-result correction), which is kept.
+  PR #1 is a draft; its only CI run is still 38292246544 on the old head.
+- **Barrier timeout (review finding).** The `afterStartup` barrier in
+  `TestRun_DistinctSessionsRunConcurrently` let an attempt continue when its
+  15s wait expired. It is now a `startupBarrier` test helper: on timeout it
+  records the timeout and cancels the context shared by both attempts, so
+  neither can pass. The test asserts that both attempts reach readiness, that
+  neither leaves the barrier or finishes during a 200ms hold, and that each
+  leaves at or after the deliberate release. Result collection is bounded
+  (2 min, then cancel). Port and run-ID assertions and diagnostics are kept.
+  - New `TestStartupBarrier_TimeoutCancelsTheAttempt` drives the timeout path
+    through a real attempt that is never released.
+  - Mutation check: a barrier that does not hold failed the concurrency test
+    ("an attempt left the barrier ... before release"); restored afterwards.
+- **Interruption before the check starts (existing-contract defect, found by
+  the timeout test).** An interruption after readiness but before the check
+  started was reported as `failed`, `check_start_failed`, exit 1, precedence
+  `failure_without_interruption`. The plan requires `interrupted`/130 for any
+  catchable interruption after acquisition. `recordCheck` now treats a check
+  refused with `context.Canceled` under an interrupted parent as the
+  interruption. A genuine start failure that coincides with an interruption
+  keeps `check_start_failed` and also sets interruption precedence. Before the
+  fix the new test failed with exactly that misclassification.
+- **Windows containment before execution (release blocker).** `Setup` adds
+  `CREATE_SUSPENDED` to the command's existing `SysProcAttr`. `Track` assigns
+  the suspended process to its Job Object and then resumes it. Go 1.26.8
+  `syscall.StartProcess` closes the primary thread handle
+  (`syscall/exec_windows.go`), so the thread is found with a
+  `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` walk. `go-winjob`'s own
+  `StartInJobObject`/`ResumeProcess` was not reused: it skips the first
+  snapshot entry and leaves a suspended process alive if `Assign` fails.
+  - Cancellation before `Track`: `Kill` records it; `Track` contains the
+    command without resuming it, and teardown terminates the job (or `Seal`'s
+    kill-on-close ends it).
+  - Assignment failure: the command never ran; the existing lifecycle path
+    kills it through the owned process handle and the seal observes `empty`.
+  - Resume failure: `Track` terminates the job and waits (bounded by
+    `killSettle`, without reaping) for the leader, then reports the error.
+  - No new dependency: `golang.org/x/sys/windows` is already a direct
+    requirement. Direct argv checks and shell commands both go through the
+    same `exec` path, so both are covered.
+- Tests:
+  - Windows (`processgroup_windows_test.go`): immediate descendant spawned with
+    `Track` held for 1s; cancellation before `Track` ended by `Kill` and by
+    `Seal`; resume failure; `Track` racing `Kill`/`Close`; a closed handle
+    refusing `Track` with the command never run.
+  - `TestRunnerAdmission_TrackFailureKillsAndReapsStartedProcess`,
+    `TestRunnerAdmission_CancelBetweenStartAndRegistration`, and
+    `TestRunnerCleanupHandoff_FailedTrackDoesNotHoldAdmissionOrRun` moved
+    unchanged from `runner_unix_test.go` to `runner_test.go`.
+  - `pidIsRunning` now also asks Windows for the exit code, because an open
+    handle keeps an exited process openable. On Unix the hook returns false.
+- Checks, Linux/WSL2, cached Go 1.26.8,
+  `GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off TMPDIR=/tmp/opencode`:
+  - Focused: the moved admission tests passed (`-race`); the barrier timeout,
+    concurrency, interruption-during-check, and compact-result tests passed.
+  - `GOOS={linux,windows,darwin} go vet ./...`: clean. `gofmt -l` on changed
+    Go files: clean. `go build ./cmd/proc-compose`: ok.
+    `GOOS={windows,darwin} GOARCH=amd64 go test -c` for runner, verify, ipc,
+    and session: compiled, **not executed**.
+  - Full `go test ./... -race -count=1 -timeout 600s`: run 1 **failed** in
+    `internal/runner` (51.3s); the failing test name was not captured.
+    Runs 2 and 3 passed every package. The failure did not reproduce in an
+    isolated runner run or in `-count=4` runner runs alongside a `-count=2`
+    verify and cmd load. It is unexplained and stays open; whether it
+    predates this pass is unknown.
+  - Process scans before and after every run: no test binaries or helpers.
+  - Not available locally: `golangci-lint`, `govulncheck`, native Windows and
+    macOS.
+- Remaining: originating-agent review, commit, push to PR #1, and a green CI
+  run on that commit (lint, vulncheck, Linux, macOS, Windows). Nothing was
+  committed, pushed, tagged, or released. No workflow or dependency changes.
+
+### 2026-10-13 — Review follow-up, lost exit status, native Windows runs
+
+- Source: same branch and HEAD; still uncommitted. Review findings P2
+  (unbounded collector) and P3 (premature native-CI claim) addressed.
+- **P2.** `collect()` could wait forever: its one-shot timer fired once, then
+  the loop blocked. It is now `collectResults`, which cancels and returns the
+  partial results on timeout. `TestCollectResults_TimeoutReturnsPartialResults`
+  covers 0, 1, and 2 arrivals. The old logic failed it (0 arrivals hung until
+  the 5s guard; 1 arrival returned a fabricated second result). The `<-b.left`
+  receives are bounded at 5s.
+- **P3.** The v1.5.3 notes now mark native Windows/macOS verification as
+  pending CI evidence.
+- **Earlier unexplained runner failure: found, product defect, pre-existing
+  in v1.5.2.** Reproduced once under load (runner `-count=5` beside a full
+  suite) as `TestRestart_RecoversFailedServiceInLiveDaemon`: "worker never
+  failed". The worker log said `exited`, not `exited: exit status 1`, so the
+  status was lost, not slow. Cause: at the end of `exec`, the reap result was
+  read only `if !reap.taken()`, and `taken()` means "published", not
+  "received". On the reap-free observer path (Linux, macOS) nothing had
+  received it yet, and an already-exited leader is often reaped before that
+  check. The exit status was dropped, so a command that exited non-zero was
+  reported as a clean exit. Present at `lifecycle.go:603` in v1.5.2.
+  - Fix: always `err = reap.recv()` there; `recv` is idempotent by contract.
+  - Regression `TestRun_FastFailureKeepsExitStatus` uses a new `reapStarted`
+    runner seam, next to `waitProcess`, to hold `exec` until the reap has
+    published. Before the fix it failed every run (`state=exited exit=0`);
+    without the seam, 3×40 iterations never hit the window unloaded.
+  - After the fix, the reproducing load pattern passed (runner ×5 plus a full
+    suite).
+- **Native Windows** (this host is Windows 10.0.26200; tests were
+  cross-compiled with Go 1.26.8 and run through WSL interop, **without
+  `-race`**, which needs cgo on Windows):
+  - Harness corrections, not product changes: run each binary by absolute
+    path (a relative `os.Args[0]` makes every helper re-exec fail with
+    `ErrDot`), and give `update` a cwd where `../../README.md` exists.
+  - `runner`: 127 pass, 0 fail, 10 skip. This includes every
+    containment-before-execution test, the moved admission and failed-`Track`
+    regressions, and `TestRun_FastFailureKeepsExitStatus`. The containment and
+    admission subset passed ×3.
+  - Found natively: `TestRunnerAdmission_CancelBetweenStartAndRegistration`
+    gated only `Terminate`, but Windows teardown has no graceful phase and
+    sends `Kill`. The fixture now gates the first teardown signal of either
+    kind.
+  - Found natively: `TestRun_TerminalReceiptFailureIsReportedAndSkipsPrune`
+    ran a bare `true`, which this host's PATH lacks. It now runs the test
+    binary with no helper mode, a portable `true`. `verify`: 23 pass, 0 fail,
+    1 skip (POSIX-shell diagnose test).
+  - ansi, config, daemon, doctor, ipc, logrotate, monitor, paths, session,
+    systemd, update: all pass.
+  - **Unavailable locally:** 9 `cmd/proc-compose` tests and 1 `bootstrap` test
+    run `go build`, and there is no Windows Go toolchain here (installing one
+    is out of scope). They need CI.
+  - **Open, pre-existing (v1.5.2), not fixed:**
+    `TestQuery_ConcurrentRotationNeverSilentlySkipsOrReplays` failed 2 of 31
+    native runs: `Query` returned `open …events.jsonl.3: Access is denied`
+    instead of its retryable "retry this query" error. The mechanism is not
+    established. A delete-pending hypothesis was tested and disproved: this
+    host removes a pinned file's name at once. This can make the CI Windows
+    job fail intermittently.
+  - Process scan (`tasklist`) afterwards: no test binaries left.
+- Linux, final tree: `GOOS={linux,windows,darwin} go vet ./...` clean; `gofmt`
+  clean; `git diff --check` clean; full `go test ./... -race -count=1`: all 16
+  packages pass; process scan clean. Retained JSON logs:
+  `/tmp/opencode/proc-compose-{runner-stress,fullrace-load}-20261013.jsonl`
+  (reproduction), `…-fixed-20261013.jsonl` (after the fix), and
+  `/tmp/opencode/proc-compose-fullrace-final-20261013.jsonl`. Native Windows
+  logs are under `%TEMP%\pcwin-20261013`.
+- Remaining: review; decide on the rotation flake and the version; commit;
+  push to PR #1; green CI on that commit, including the first macOS run and
+  the `go build`-dependent Windows tests.
+
+### 2026-10-13 — Windows journal rotation race: mechanism and fix
+
+- Source: same branch and HEAD; uncommitted. The second review also reproduced
+  the failure (2 of 20 native runs;
+  `/tmp/opencode/proc-compose-second-review-winrotation-current-20261013.log`)
+  and kept it release-blocking.
+- **Review P2 (reap hold).** The `reapStarted` hold in
+  `TestRun_FastFailureKeepsExitStatus` continued silently after 10s. It now
+  records the timeout and fails from the test goroutine. The run uses the
+  cancellable, bounded `runDone` cleanup pattern. Mutation check: a 1ns hold
+  failed the test with "publish-before-read ordering was not forced"; restored.
+- **Mechanism (measured, native Windows 10.0.26200, Go 1.26.8).** A temporary
+  diagnostic test, not committed and retained at
+  `/tmp/opencode/proc-compose-rotation-diag_windows_test.go.txt`, opened the
+  journal names with `openJournal`'s exact flags. It read the thread's NTSTATUS
+  (`RtlGetLastNtStatus`) right after each failed `CreateFile`, while a rotator
+  repeated `logrotate.rotate`'s operations and timestamped each one. It ran
+  once against the real `logrotate.Writer` too.
+  - Every failure, 749 mirror + 18 real + 475 + 621 in later runs, was on
+    `.3` with `0xC0000056 STATUS_DELETE_PENDING`, which Win32 reports as
+    `ERROR_ACCESS_DENIED`.
+  - Each failure fell inside the rotator's `remove .3` window (`os.Remove` is
+    `DeleteFile`). Within about 0.5ms the name resolved to
+    `0xC0000034 STATUS_OBJECT_NAME_NOT_FOUND`.
+  - So the error is an open racing an in-progress delete, not a permission
+    failure. `snapshotFiles` returned any open error other than not-exist
+    immediately, so the query failed instead of using its bounded,
+    identity-checked retry.
+  - The earlier delete-pending test was negative because the delete had
+    already completed before the open. The state exists only while the
+    deleting handle is open.
+- **Fix.** `openJournal` (Windows) reads the NTSTATUS only when `CreateFile`
+  fails with `ERROR_ACCESS_DENIED`, with the OS thread locked and ntdll
+  resolved first. `STATUS_DELETE_PENDING` becomes an error that counts as
+  `fs.ErrNotExist`; every other access-denied keeps its error.
+  `snapshotFiles` uses `errors.Is(err, fs.ErrNotExist)`. The existing
+  `os.SameFile` stability check still decides coherence: a name still being
+  deleted fails `os.Stat` and forces a bounded retry, then the documented
+  "retry this query" error. A new `.3` from the next rename does the same.
+  Unix is unchanged.
+- **Regressions** (`internal/logs/open_windows_test.go`; the delete-pending
+  state is made deterministic with a legacy `FileDispositionInfo` handle held
+  open):
+  - `TestOpenJournal_DeletePendingCountsAsNotExist` and
+    `TestQuery_DeletePendingBackupIsRetryable` failed before the fix with the
+    production error (`events.jsonl.3: Access is denied.`) and pass after it.
+  - `TestOpenJournal_GenuineAccessDeniedIsNotMasked` and
+    `TestQuery_PermissionFailureIsNotRetryable` (a directory where a backup is
+    expected) pass before and after: genuine access denial stays a hard,
+    non-retryable error.
+- **Native Windows repetitions (no `-race`):**
+  `TestQuery_ConcurrentRotationNeverSilentlySkipsOrReplays` passed 200 of 200
+  (before: 4 of 51 failed across both reviews, so about 16 failures were
+  expected in 200). The whole logs package passed `-count=20`.
+- **Linux:** `GOOS={linux,windows,darwin} go vet ./...` clean; `gofmt` and
+  `git diff --check` clean. `go test -race -count=1` on logs, logrotate,
+  runner, and cmd/proc-compose: all pass
+  (`/tmp/opencode/proc-compose-affected-race-20261013.jsonl`). Process scans
+  on Linux and Windows: no test processes left.
+- Remaining: review, commit, push to PR #1, and green CI: macOS, Windows with
+  `-race` and the `go build`-dependent tests, lint, and vulncheck.
+
 ## Recording future work
 
 For each implementation session or milestone update, append:

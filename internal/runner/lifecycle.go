@@ -683,9 +683,11 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	//   cmd.Wait() is what reaps, and reaping releases that reservation. It is
 	//   therefore the last step that touches the command.
 	pg.Withdraw()
-	// Receive the exit status exactly once. It may already have been taken above
-	// by a natural completion, in which case there is nothing left to receive and
-	// a second read would block forever.
+	// Receive the exit status. recv returns the same published result to every
+	// caller, so this is safe when a natural completion already received it
+	// above. It must not be skipped because the result is already published:
+	// on the reap-free observer path nothing has received it yet, and an exited
+	// leader is often collected before this point.
 	//
 	// When no reap is in flight — the reap-free observer path — this is the only
 	// reap, so it happens here, last.
@@ -699,7 +701,7 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 		case <-handoff:
 			return errCleanupHandoff
 		}
-	} else if !reap.taken() {
+	} else {
 		err = reap.recv()
 	}
 	code := 0
@@ -949,6 +951,9 @@ func (r *Runner) startReap(name, identity string, cmd *exec.Cmd, reap *singleRea
 	r.reapers = append(r.reapers, tracked)
 	r.reapersMu.Unlock()
 	reap.start(wait)
+	if r.reapStarted != nil {
+		r.reapStarted(reap)
+	}
 }
 
 // reportPendingReaps records every wait that remained unresolved at the

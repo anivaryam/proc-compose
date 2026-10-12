@@ -71,6 +71,7 @@ type Runner struct {
 	// wrap the existing group to hold the start-to-track admission boundary.
 	processGroupFactory func() ProcessGroup
 	waitProcess         func(*exec.Cmd) error // optional controlled wait seam; defaults to cmd.Wait
+	reapStarted         func(*singleReap)     // optional test seam, called after a reap starts
 	reapersMu           sync.Mutex
 	reapers             []*trackedReap
 	checksMu            sync.Mutex
@@ -219,7 +220,7 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 	store := newStateStore(procs)
 	r.store.Store(store)
 	if r.Project == nil {
-		r.Project = &ipc.Project{RunID: fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()), ConfigPath: r.ConfigPath}
+		r.Project = &ipc.Project{RunID: ipc.NewRunID(), ConfigPath: r.ConfigPath}
 	}
 	r.systemLog("info", "session.started", "session started")
 

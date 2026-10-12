@@ -5,8 +5,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"strconv"
 	"strings"
@@ -185,7 +187,9 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 				name = fmt.Sprintf("%s.%d", path, index)
 			}
 			file, err := openJournal(name)
-			if os.IsNotExist(err) {
+			// errors.Is, not os.IsNotExist: on Windows a name that rotation is
+			// deleting at this moment also reports as not existing.
+			if errors.Is(err, fs.ErrNotExist) {
 				observed[name] = nil
 				continue
 			}

@@ -3,6 +3,9 @@ package ipc
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -83,6 +86,26 @@ func (e *LogEntry) UnmarshalJSON(data []byte) error {
 		e.Line = *wire.LegacyLine
 	}
 	return nil
+}
+
+// lastRunNano is the timestamp part of the last run ID issued by this process.
+var lastRunNano atomic.Int64
+
+// NewRunID returns a run identifier, "<pid>-<unix nanoseconds>", that is unique
+// within this process. The wall clock cannot guarantee that alone: on Windows it
+// advances only on the clock interrupt, so two runs acquired in the same tick
+// would read the same nanoseconds. A reading at or before the last one issued
+// is moved just past it.
+func NewRunID() string { return newRunID(time.Now().UnixNano()) }
+
+func newRunID(now int64) string {
+	for {
+		last := lastRunNano.Load()
+		next := max(now, last+1)
+		if lastRunNano.CompareAndSwap(last, next) {
+			return fmt.Sprintf("%d-%d", os.Getpid(), next)
+		}
+	}
 }
 
 type Project struct {

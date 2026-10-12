@@ -390,7 +390,9 @@ func TestRun_InterruptionDuringCheck(t *testing.T) {
 
 func TestRun_TerminalReceiptFailureIsReportedAndSkipsPrune(t *testing.T) {
 	f := newFixture(t, serviceConfig)
-	opts := f.options(t, "persist", "true")
+	// Without a helper mode the test binary runs no tests and exits 0: a
+	// portable "true" that does not depend on POSIX tools being on PATH.
+	opts := f.options(t, "persist", checkArgv("", "")...)
 	writes := 0
 	opts.writeReceipt = func(path string, result *Result) error {
 		writes++
@@ -429,20 +431,211 @@ func TestRun_TerminalReceiptFailureIsReportedAndSkipsPrune(t *testing.T) {
 	}
 }
 
+// startupBarrier holds verify attempts after readiness, through the afterStartup
+// seam, until the controller releases them. If the controller has not released
+// them within timeout, the barrier cancels the context shared by every attempt,
+// so none of them can pass, and records the timeout for the test to report.
+type startupBarrier struct {
+	ctx        context.Context
+	abort      context.CancelFunc
+	timeout    time.Duration
+	arrived    chan time.Time
+	left       chan time.Time
+	release    chan struct{}
+	releaseNow func()
+	releasedAt atomic.Int64
+	timedOut   atomic.Bool
+}
+
+func newStartupBarrier(t *testing.T, parties int, timeout time.Duration) *startupBarrier {
+	ctx, abort := context.WithCancel(context.Background())
+	b := &startupBarrier{ctx: ctx, abort: abort, timeout: timeout,
+		arrived: make(chan time.Time, parties), left: make(chan time.Time, parties), release: make(chan struct{})}
+	b.releaseNow = sync.OnceFunc(func() {
+		b.releasedAt.Store(time.Now().UnixNano())
+		close(b.release)
+	})
+	// Cancelling, not releasing, on cleanup: a held attempt that outlives the
+	// test is interrupted rather than let through to its check.
+	t.Cleanup(abort)
+	return b
+}
+
+// hold is the afterStartup seam.
+func (b *startupBarrier) hold(*runner.Runner) {
+	b.arrived <- time.Now()
+	timer := time.NewTimer(b.timeout)
+	defer timer.Stop()
+	select {
+	case <-b.release:
+	case <-b.ctx.Done():
+	case <-timer.C:
+		b.timedOut.Store(true)
+		b.abort()
+	}
+	b.left <- time.Now()
+}
+
+// collectResults receives up to n results within timeout. On timeout it calls
+// abort and returns the results that did arrive, with ok false, so the caller
+// fails with partial diagnostics instead of waiting on attempts that may never
+// return.
+func collectResults(results <-chan *Result, n int, timeout time.Duration, abort func()) ([]*Result, bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	got := make([]*Result, 0, n)
+	for len(got) < n {
+		select {
+		case r := <-results:
+			got = append(got, r)
+		case <-timer.C:
+			abort()
+			return got, false
+		}
+	}
+	return got, true
+}
+
+func TestCollectResults_TimeoutReturnsPartialResults(t *testing.T) {
+	for _, arrived := range []int{0, 1, 2} {
+		t.Run(strconv.Itoa(arrived), func(t *testing.T) {
+			results := make(chan *Result, 2)
+			for i := range arrived {
+				results <- &Result{Session: strconv.Itoa(i)}
+			}
+			aborted := 0
+			done := make(chan struct{})
+			var got []*Result
+			var ok bool
+			go func() {
+				defer close(done)
+				got, ok = collectResults(results, 2, 50*time.Millisecond, func() { aborted++ })
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("collectResults did not return with %d of 2 results", arrived)
+			}
+			complete := arrived == 2
+			if ok != complete || len(got) != arrived {
+				t.Fatalf("collectResults = %d results, ok %t; want %d, ok %t", len(got), ok, arrived, complete)
+			}
+			if wantAborts := map[bool]int{true: 0, false: 1}[complete]; aborted != wantAborts {
+				t.Fatalf("abort called %d times, want %d", aborted, wantAborts)
+			}
+		})
+	}
+}
+
+// TestStartupBarrier_TimeoutCancelsTheAttempt exercises the barrier's timeout
+// path through a real attempt: never released, it must be interrupted rather
+// than proceed to a passing check.
+func TestStartupBarrier_TimeoutCancelsTheAttempt(t *testing.T) {
+	f := newFixture(t, serviceConfig)
+	withHelper(t, "sleep")
+	b := newStartupBarrier(t, 1, 300*time.Millisecond)
+	opts := f.options(t, "held", checkArgv("sleep", "10ms")...)
+	opts.afterStartup = b.hold
+	result := Run(b.ctx, opts)
+	if !b.timedOut.Load() {
+		t.Fatal("barrier did not record its timeout")
+	}
+	if result.Status == StatusPassed || result.Check.Status == StatusPassed {
+		t.Fatalf("attempt passed after its barrier timed out: status=%s check=%s", result.Status, result.Check.Status)
+	}
+	if result.Status != StatusInterrupted || result.Cleanup.Status != StatusPassed {
+		t.Fatalf("timed-out attempt = %s precedence=%s check=%s/%v errors=%v, cleanup %+v; want interrupted with clean cleanup", result.Status, result.Precedence, result.Check.Status, result.Check.ExitCode, result.Errors, result.Cleanup)
+	}
+}
+
 func TestRun_DistinctSessionsRunConcurrently(t *testing.T) {
 	f := newFixture(t, serviceConfig)
 	withHelper(t, "sleep")
+	// Both attempts must be past readiness, holding their leases with their
+	// stacks running, before either may run its check. Without this barrier one
+	// attempt can finish before the other acquires, and reusing its released
+	// port would then be legitimate.
+	const barrierTimeout = 15 * time.Second
+	b := newStartupBarrier(t, 2, barrierTimeout)
 	results := make(chan *Result, 2)
 	for _, name := range []string{"one", "two"} {
 		opts := f.options(t, name, checkArgv("sleep", "500ms")...)
-		go func() { results <- Run(context.Background(), opts) }()
+		opts.afterStartup = b.hold
+		go func() { results <- Run(b.ctx, opts) }()
 	}
-	a, b := <-results, <-results
-	if a.Status != StatusPassed || b.Status != StatusPassed {
-		t.Fatalf("concurrent = %s %v / %s %v", a.Status, a.Errors, b.Status, b.Errors)
+	value := func(s *string) string {
+		if s == nil {
+			return "<nil>"
+		}
+		return *s
 	}
-	if a.Endpoints["api.http"].Port == b.Endpoints["api.http"].Port || *a.RunID == *b.RunID {
-		t.Fatal("concurrent sessions shared an endpoint or run identity")
+	describe := func(r *Result) string {
+		if r == nil {
+			return "<no result>"
+		}
+		return fmt.Sprintf("session=%s status=%s run_id=%s endpoints=%v started=%s ready=%s check=%s..%s finished=%s errors=%v",
+			r.Session, r.Status, value(r.RunID), r.Endpoints, r.StartedAt, value(r.Startup.FinishedAt),
+			value(r.Check.StartedAt), value(r.Check.FinishedAt), value(r.FinishedAt), r.Errors)
+	}
+	// collect is bounded: attempts that do not finish fail the test with
+	// whatever did arrive instead of hanging it, and cancellation is the
+	// cleanup for the rest.
+	collect := func() (*Result, *Result, bool) {
+		got, ok := collectResults(results, 2, 2*time.Minute, b.abort)
+		got = append(got, nil, nil)
+		return got[0], got[1], ok
+	}
+
+	arrivals := 0
+	for arrivals < 2 {
+		select {
+		case <-b.arrived:
+			arrivals++
+		case <-time.After(barrierTimeout):
+			b.abort()
+			a, c, finished := collect()
+			t.Fatalf("attempts did not overlap (%d of 2 reached readiness; all results collected: %t):\n  %s\n  %s", arrivals, finished, describe(a), describe(c))
+		}
+	}
+	// Both are past readiness. Neither may leave the barrier, or finish, until
+	// the controller releases them.
+	select {
+	case at := <-b.left:
+		b.abort()
+		a, c, finished := collect()
+		t.Fatalf("an attempt left the barrier at %s before release (all results collected: %t):\n  %s\n  %s", at, finished, describe(a), describe(c))
+	case r := <-results:
+		b.abort()
+		t.Fatalf("an attempt finished before release:\n  %s", describe(r))
+	case <-time.After(200 * time.Millisecond):
+	}
+	b.releaseNow()
+	a, c, finished := collect()
+	if !finished {
+		t.Fatalf("attempts did not finish within 2m of release:\n  %s\n  %s", describe(a), describe(c))
+	}
+	if b.timedOut.Load() {
+		t.Fatalf("barrier timed out instead of being released:\n  %s\n  %s", describe(a), describe(c))
+	}
+	released := time.Unix(0, b.releasedAt.Load())
+	for i := range 2 {
+		select {
+		case at := <-b.left:
+			if at.Before(released) {
+				t.Fatalf("an attempt left the barrier at %s, before release at %s", at, released)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of 2 attempts recorded leaving the barrier after both finished", i)
+		}
+	}
+	if a == nil || c == nil || a.Status != StatusPassed || c.Status != StatusPassed {
+		t.Fatalf("concurrent attempts did not both pass:\n  %s\n  %s", describe(a), describe(c))
+	}
+	if a.Endpoints["api.http"].Port == c.Endpoints["api.http"].Port {
+		t.Errorf("overlapping sessions shared endpoint api.http:\n  %s\n  %s", describe(a), describe(c))
+	}
+	if a.RunID == nil || c.RunID == nil || *a.RunID == *c.RunID {
+		t.Errorf("overlapping sessions shared a run identity:\n  %s\n  %s", describe(a), describe(c))
 	}
 }
 

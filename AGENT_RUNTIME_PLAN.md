@@ -5,7 +5,7 @@ Status (reconciled 2026-10-13). Three facts are tracked separately:
 | Axis | Status | Evidence |
 |---|---|---|
 | Reviewed implementation acceptance (Linux scope) | **Accepted.** M0 accepted 2026-10-12. M1 and the M2–M6 code under review: the originating agent independently closed all five review findings (check quiescence, single cleanup deadline, structured invalid-session refusal, YAML merge diagnostics, read-only discovery) and every YAML follow-up (merge precedence, recursive merges, inherited quoted `<<`). | Record entries dated 2026-10-13 and the reconciliation entry |
-| Platform verification | **Linux native only.** Windows/macOS are cross-compiled and vetted, never executed for this work. Lint and vulncheck have not run on the changed code. No source-controlled ref contains the changes, so CI cannot have verified them. Windows regressions for the blocked-reap handoff, check quiescence, and the single cleanup budget now compile but have never run. The admission-race tests stay Unix-only because of a Windows containment gap. | [Native CI readiness](#native-ci-readiness) |
+| Platform verification | **Linux native only; release-gated on CI.** PR #1 run 38292246544 tested `60352dc`: Linux tests and vulncheck passed, lint and the Windows verify concurrency test failed, macOS was cancelled. The follow-up fixes (lint, run-ID uniqueness, barrier timeout, Windows containment before execution, interruption before check start) are uncommitted and pass the full Linux race suite; Windows/macOS are cross-compiled and vetted only. The admission-race and failed-`Track` regressions now run on every platform, but have never run natively on Windows. | [Native CI readiness](#native-ci-readiness) |
 | Measured product benefit | **Not established.** A tool-level pilot (18 trials) and two agent-in-the-loop runs (n=1 per cell) were recorded on 2026-10-12. The latest agent run showed one fewer tool call and 11–17% lower wall time per cell. With n=1, no retained transcripts, and no interventions to reduce, it does not establish causality or meet the 30% target. | Record pilot entries; [Pilot 2 protocol](#pilot-2-protocol) (proposed, not run) |
 
 M2–M6 remain first implementations and candidates, built ahead of pilot
@@ -731,19 +731,20 @@ Implemented: `compare --baseline DIR --candidate DIR [--repeat N]`, sequential s
 
 ## Native CI readiness
 
-Assessed read-only on 2026-10-13. Nothing was pushed or triggered.
+Assessed read-only on 2026-10-13, then refreshed after the PR #1 follow-up
+fixes the same day. Nothing was pushed or triggered.
 
 ### State of the checks for the reviewed changes
 
 | Check | Status for the reviewed working tree | Evidence |
 |---|---|---|
-| Linux native, full `go test ./... -race -count=1` | Passed on the five-fix state. **Not rerun** after the later finding-4 corrections, which reran only the `internal/config` and targeted `cmd/proc-compose` tests. | Record entries dated 2026-10-13 |
+| Linux native, full `go test ./... -race -count=1` | Passed on the final working tree (16 packages). The earlier intermittent runner failure was a lost exit status, fixed with a deterministic regression. | Record entry "Review follow-up, lost exit status, native Windows runs" |
 | `go vet`, GOOS linux/windows/darwin | Passed (static analysis only) | Same |
-| Windows native tests | **Unrun.** Cross-compiled only. | — |
-| macOS native tests | **Unrun.** Cross-compiled only. | — |
-| `golangci-lint` (CI `lint` job) | **Unrun.** Not installed locally, and not installed in this pass. | — |
-| `govulncheck` (CI `vulncheck` job) | **Unrun.** Not installed locally. | — |
-| CI run | **Unavailable.** The latest green CI run (38055522163, 2026-10-10) tested `3e7b389`, which contains none of this work. | `gh run view 38055522163` |
+| Windows native tests | **Failed on `60352dc`** (run 38292246544). Follow-up: run locally on Windows 10.0.26200 through WSL interop, without `-race`. All packages pass except 10 tests that need a Windows `go` toolchain (unavailable). The intermittent log-rotation failure (`STATUS_DELETE_PENDING`) is fixed: 200/200 native passes. CI still pending. | Same |
+| macOS native tests | **Cancelled** on `60352dc`; follow-up unrun. | Same |
+| `golangci-lint` (CI `lint` job) | **Failed on `60352dc`** (`ineffassign`, fixed by inspection). Not installed locally. | Same |
+| `govulncheck` (CI `vulncheck` job) | Passed on `60352dc`. Not installed locally. | Same |
+| CI run | **Pending.** Requires the reviewed follow-up commit to be pushed to PR #1. | — |
 
 ### What CI would exercise natively
 
@@ -754,12 +755,13 @@ and on a pull request targeting `main`. It has no `workflow_dispatch`.
 
 | Contract | Windows native | macOS native |
 |---|---|---|
-| Job Object seal, close, and pre-close observation (`TestWindowsJob_*`, 7 tests) | Runs | n/a |
+| Job Object seal, close, and pre-close observation (`TestWindowsJob_*`) | Runs | n/a |
 | Seal waits for an in-flight signal (`TestRunnerSweep_SealWaitsForSignalAndPreservesUnverifiedResult`) | Runs | Runs |
 | Verify operation: happy path, startup timeout, check failure/timeout, required-service exit and masking, interruption during check, receipt-write failure, concurrent sessions (`internal/verify/verify_test.go`) | Runs, except `TestDiagnose_ScopesToAttemptAndGroupsOutput` (POSIX shell) | Runs |
 | Blocked-reap handoff and check quiescence (`TestRunnerCleanupHandoff_SealsBeforeReturningAndQuiescesWorker`, `TestRunCheck_StackShutdownQuiescesActiveCheck`, `TestRunCheck_StackHandoffBoundsBlockedCheckReap`) | Runs (moved to the untagged `runner_test.go` on 2026-10-13; compiled, **never executed natively**) | Runs |
 | Single cleanup budget with a blocked check reap (`TestRun_BlockedCheckReapSpendsOneCleanupBudget`) | Runs (moved to the untagged `verify_test.go` on 2026-10-13; compiled, **never executed natively**) | Runs |
-| Admission race and failed `Track` (`TestRunnerAdmission_*`, `TestRunnerCleanupHandoff_FailedTrackDoesNotHoldAdmissionOrRun`) | **Not compiled**; stays `!windows` (see blocker 2) | Runs |
+| Admission race and failed `Track` (`TestRunnerAdmission_*`, `TestRunnerCleanupHandoff_FailedTrackDoesNotHoldAdmissionOrRun`) | Runs (moved to untagged `runner_test.go` after the containment fix; compiled, **never executed natively**) | Runs |
+| Containment before execution (`TestWindowsJob_ImmediateDescendantIsContained`, `_CancelBeforeTrackNeverRuns`, `_ResumeFailureEndsTheContainedCommand`, `_TrackRaceWithKillAndClose`, `_TrackRefusesAClosedHandle`) | Runs (compiled, **never executed natively**) | n/a |
 | Check-descendant cleanup and escaped descendants (`verify_unix_test.go`) | **Not compiled** (POSIX shell fixtures) | Runs; the escaped-descendant cases skip if `setsid(1)` is absent |
 | CLI exit codes and JSON contract (`TestVerifyCLI_ExitCodesAndJSONContract`) | Skipped (POSIX `sleep` fixture) | Runs |
 
@@ -767,41 +769,35 @@ Without `-v`, a green job does not show which tests skipped.
 
 ### Blockers
 
-1. **No source-controlled ref.** All of the work is uncommitted: 25 modified
-   files and 21 untracked files (18 Go source/test files and the 3 planning
-   documents). The ref CI needs is one commit on a branch from `3e7b389` that
-   contains all of them, opened as a pull request against `main`. CI then runs
-   on `refs/pull/<n>/merge`. While `main` is still `3e7b389`, that tree equals
-   the branch head. Record the head SHA, the merge SHA, and the run ID.
-2. **Windows coverage gap, partly closed on 2026-10-13.**
+1. **Follow-up not committed.** `60352dc` is on PR #1 (draft). The release
+   fixes are uncommitted and await originating-agent review; CI then needs one
+   follow-up commit pushed to `agent-runtime-verify`. Record the head SHA, the
+   merge SHA, and the run ID.
+2. **Windows coverage gap: product fix made, native proof pending.**
    - The blocked-reap handoff, check-quiescence, and single-cleanup-budget
-     regressions are now platform-neutral: they were moved unchanged to untagged
-     test files and use real Job Objects on Windows. Each still needs its first
-     native run. A green Windows job verifies them only if its log shows that
-     they ran.
-   - The admission-race and failed-`Track` tests stay Unix-only because of a
-     **pre-existing Windows containment gap**, unchanged from `3e7b389`. The
-     command starts unsuspended under `cmd /c` and joins its Job Object only
-     after `cmd.Start`, so a child spawned in that window is outside the job and
-     survives teardown. These fixtures would leak their helper. Closing the gap
-     needs a product change (for example, start suspended and assign before
-     resuming); that change is not proposed or made here.
-   - Until it is fixed and tested, Windows admission-race containment stays
-     **unverified**.
+     regressions are platform-neutral and use real Job Objects on Windows.
+   - The containment gap is fixed in the shared runner: Windows creates the
+     command with `CREATE_SUSPENDED`, assigns it to its Job Object, and only
+     then resumes it. Cancellation before `Track` leaves it suspended inside
+     the job for teardown; assignment or resume failure ends it before it runs.
+     The admission-race and failed-`Track` regressions now run on Windows.
+   - Until a native Windows job passes on the follow-up commit, Windows
+     containment stays **unverified**. A green Windows job verifies these only
+     if its log shows that they ran.
 3. **Skip visibility (optional).** The CI log cannot distinguish passed from
    skipped cleanup tests. See the proposed diff below.
-4. **Lint and vulncheck** have never run on the changed code, so the first CI
-   run may fail on `lint` for reasons unrelated to runtime behavior.
+4. **Lint** failed on `60352dc`; the fix is verified by inspection only. The
+   `lint` job installs `golangci-lint` `latest` with Go 1.25, so a new linter
+   release can change the result independently of this code.
 
 ### User actions to publish and trigger CI
 
-1. Review the working tree, then create a branch from `3e7b389` and commit the
-   modified and untracked files. Do not push to `main`: its push trigger would
-   also run CI, but it would land unreviewed code.
-2. Push the branch and open a pull request against `main` (`gh pr create --base main`).
-3. Watch it (`gh pr checks <n> --watch`), then record the head and merge SHAs,
+1. After originating-agent review, commit the follow-up on
+   `agent-runtime-verify` and push it to PR #1. Do not push to `main`.
+2. Watch it (`gh pr checks 1 --watch`), then record the head and merge SHAs,
    the run ID, and each job's conclusion in the record. Treat a passing
    Windows job as evidence only for the rows marked "Runs" above.
+3. Release readiness requires every job green on that reviewed commit.
 
 ### Proposed workflow change (not applied; awaiting approval)
 

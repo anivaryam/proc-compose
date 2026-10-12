@@ -33,7 +33,7 @@ type Plan struct {
 
 func Acquire(cfg *config.Config, configPath, hash, name string, filter []string) (_ *Plan, err error) {
 	p := &Plan{
-		Project:   &ipc.Project{Session: name, RunID: fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()), ConfigPath: configPath, Directory: paths.SessionDir(hash), Ports: make(map[string]map[string]int), URLs: make(map[string]map[string]string), JournalPath: paths.Journal(hash)},
+		Project:   &ipc.Project{Session: name, RunID: ipc.NewRunID(), ConfigPath: configPath, Directory: paths.SessionDir(hash), Ports: make(map[string]map[string]int), URLs: make(map[string]map[string]string), JournalPath: paths.Journal(hash)},
 		variables: make(map[string]string), preferred: make(map[string]map[string]int), resources: slices.Clone(cfg.Resources), names: config.SelectedNames(cfg, filter),
 	}
 	defer func() {

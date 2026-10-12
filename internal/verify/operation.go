@@ -656,11 +656,23 @@ func (a *attempt) recordCheck(check runner.CheckResult, parent, checkCtx context
 	interrupted := parent.Err() != nil
 	timedOut := !interrupted && errors.Is(checkCtx.Err(), context.DeadlineExceeded)
 	switch {
+	case !check.Started && interrupted && errors.Is(check.Err, context.Canceled):
+		// The interruption landed after readiness and refused the check before
+		// it started. That is the interruption itself, not a start failure.
+		a.interrupt = true
+		c.Status = StatusInterrupted
+		a.errs.Add(CodeInterrupted)
 	case !check.Started:
 		c.Status = StatusFailed
 		a.errs.Add(CodeCheckStartFailed)
 		if check.Err != nil {
 			fmt.Fprintf(a.opts.Log, "verify: check did not start: %v\n", check.Err)
+		}
+		if interrupted {
+			// A start failure coinciding with an interruption keeps both facts;
+			// interruption still sets the overall precedence.
+			a.interrupt = true
+			a.errs.Add(CodeInterrupted)
 		}
 	case interrupted:
 		a.interrupt = true

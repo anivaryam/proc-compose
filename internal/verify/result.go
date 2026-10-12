@@ -347,7 +347,7 @@ func Compact(result *Result) CompactError {
 	if status == StatusPassed {
 		status = StatusFailed
 	}
-	exit := result.ExitCode
+	var exit int
 	acquired := result.RunID != nil
 	switch {
 	case status == StatusInterrupted:
