@@ -3,6 +3,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"maps"
@@ -32,7 +33,7 @@ type Plan struct {
 
 func Acquire(cfg *config.Config, configPath, hash, name string, filter []string) (_ *Plan, err error) {
 	p := &Plan{
-		Project:   &ipc.Project{Session: name, RunID: fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()), ConfigPath: configPath, Directory: paths.SessionDir(hash), Ports: make(map[string]map[string]int), URLs: make(map[string]map[string]string), JournalPath: paths.Journal(hash)},
+		Project:   &ipc.Project{Session: name, RunID: ipc.NewRunID(), ConfigPath: configPath, Directory: paths.SessionDir(hash), Ports: make(map[string]map[string]int), URLs: make(map[string]map[string]string), JournalPath: paths.Journal(hash)},
 		variables: make(map[string]string), preferred: make(map[string]map[string]int), resources: slices.Clone(cfg.Resources), names: config.SelectedNames(cfg, filter),
 	}
 	defer func() {
@@ -175,20 +176,58 @@ func (p *Plan) expand(value string) (string, error) {
 	return value, nil
 }
 
-func (p *Plan) lease(label string) error {
+// LeaseError reports a lease already held by another owner. Label is the
+// leased identity, for example "instance:<hash>" or "tcp:127.0.0.1:3000".
+type LeaseError struct {
+	Label string
+	Err   error
+}
+
+func (e *LeaseError) Error() string {
+	return fmt.Sprintf("resource %q is owned by another session: %v", e.Label, e.Err)
+}
+
+func (e *LeaseError) Unwrap() error { return e.Err }
+
+// Instance reports whether the lease is the session identity itself, rather
+// than a named resource or endpoint.
+func (e *LeaseError) Instance() bool { return strings.HasPrefix(e.Label, "instance:") }
+
+func leasePath(label string) string {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(label))
-	path := filepath.Join(paths.LeaseDir(), fmt.Sprintf("%016x.lock", h.Sum64()))
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	return filepath.Join(paths.LeaseDir(), fmt.Sprintf("%016x.lock", h.Sum64()))
+}
+
+func (p *Plan) lease(label string) error {
+	file, err := os.OpenFile(leasePath(label), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
 	if err := lock(file); err != nil {
 		file.Close()
-		return fmt.Errorf("resource %q is owned by another session: %w", label, err)
+		return &LeaseError{Label: label, Err: err}
 	}
 	p.leases = append(p.leases, file)
 	return nil
+}
+
+// InstanceHeld observes whether some owner holds the session's instance lease.
+// When the lease is free it is taken and released immediately; this is an
+// observation for classification, never an acquisition that outlives the call.
+func InstanceHeld(hash string) (bool, error) {
+	file, err := os.OpenFile(leasePath("instance:"+hash), os.O_RDWR, 0600)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	if err := lock(file); err != nil {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (p *Plan) allocate(preferred int) (int, error) {
@@ -239,4 +278,25 @@ func Read(path string) (*ipc.Project, error) {
 		return nil, err
 	}
 	return &project, nil
+}
+
+// NewOwner describes the current process as a session's creator.
+func NewOwner(command, configPath string) *ipc.Owner {
+	return &ipc.Owner{PID: os.Getpid(), Command: command, Label: os.Getenv("PROC_COMPOSE_OWNER"), Worktree: Worktree(filepath.Dir(configPath)), StartedAt: time.Now().UTC()}
+}
+
+// Worktree returns the nearest ancestor of dir that contains a .git entry (a
+// repository or linked worktree), or "" when there is none.
+func Worktree(dir string) string {
+	for dir != "" {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+	return ""
 }

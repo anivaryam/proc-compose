@@ -3,6 +3,9 @@ package ipc
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,6 +49,7 @@ type LogEntry struct {
 	Version       int        `json:"schema_version,omitempty"`
 	ID            string     `json:"id,omitempty"`
 	RunID         string     `json:"run_id,omitempty"`
+	AttemptID     string     `json:"attempt_id,omitempty"` // verification attempt that owned this run, if any
 	Sequence      uint64     `json:"sequence,omitempty"`
 	Session       string     `json:"session,omitempty"`
 	Time          time.Time  `json:"time,omitempty"`
@@ -84,6 +88,26 @@ func (e *LogEntry) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// lastRunNano is the timestamp part of the last run ID issued by this process.
+var lastRunNano atomic.Int64
+
+// NewRunID returns a run identifier, "<pid>-<unix nanoseconds>", that is unique
+// within this process. The wall clock cannot guarantee that alone: on Windows it
+// advances only on the clock interrupt, so two runs acquired in the same tick
+// would read the same nanoseconds. A reading at or before the last one issued
+// is moved just past it.
+func NewRunID() string { return newRunID(time.Now().UnixNano()) }
+
+func newRunID(now int64) string {
+	for {
+		last := lastRunNano.Load()
+		next := max(now, last+1)
+		if lastRunNano.CompareAndSwap(last, next) {
+			return fmt.Sprintf("%d-%d", os.Getpid(), next)
+		}
+	}
+}
+
 type Project struct {
 	Session     string                       `json:"session,omitempty"`
 	RunID       string                       `json:"run_id"`
@@ -94,6 +118,18 @@ type Project struct {
 	Resources   []string                     `json:"resources,omitempty"`
 	LogPath     string                       `json:"log_path,omitempty"`
 	JournalPath string                       `json:"journal_path"`
+	Owner       *Owner                       `json:"owner,omitempty"`
+}
+
+// Owner describes who created a session, for human/agent handoff. It is
+// descriptive metadata, never cleanup authority: only the process holding the
+// session lease may stop what it started.
+type Owner struct {
+	PID       int       `json:"pid"`
+	Command   string    `json:"command"`            // "up" or "verify"
+	Label     string    `json:"label,omitempty"`    // PROC_COMPOSE_OWNER, e.g. an agent/task name
+	Worktree  string    `json:"worktree,omitempty"` // nearest ancestor containing .git, if any
+	StartedAt time.Time `json:"started_at"`
 }
 
 // CommandResult carries a runner's verdict for a command back to the

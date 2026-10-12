@@ -25,6 +25,9 @@ type Options struct {
 }
 
 type Verification struct {
+	ValidationStatus string `json:"validation_status"`
+	// Deprecated: retained for JSON compatibility; bootstrap verification never
+	// starts, readies, or stops application processes, so these remain false.
 	Started    bool   `json:"started"`
 	Ready      bool   `json:"ready"`
 	Stopped    bool   `json:"stopped"`

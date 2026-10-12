@@ -91,8 +91,22 @@ type ProcessGroup interface {
 	// leader is reaped. After it returns, Terminate and Kill refuse.
 	Withdraw()
 
+	// Seal ends signalling authority and releases platform resources. The
+	// observation includes identity captured before release invalidates it. State is
+	// the last observation made while containment is still queryable; on
+	// platforms where release destroys that evidence, it is deliberately not
+	// recomputed after sealing. A non-nil error means the seal was not clean.
+	Seal() (SealObservation, error)
+
 	// Close releases the group's resources.
 	Close() error
+}
+
+// SealObservation is the last state and stable operator-facing identity captured
+// while a process group's containment resources are still available.
+type SealObservation struct {
+	State    GroupState
+	Identity string
 }
 
 // GroupResult pairs a verdict about the group with the members that outlived it.
@@ -101,6 +115,8 @@ type GroupResult struct {
 	Name string
 	// PGID is the group's identifier, or 0 when the group was never established.
 	PGID int
+	// Identity is the immutable platform-specific identifier captured at seal.
+	Identity string
 	// State is what is known about the group after the attempt.
 	State GroupState
 	// Members describes processes that are still running and outside the
@@ -175,6 +191,9 @@ func unavailableReason() string {
 // describeGroup renders a group's identifier for an operator-facing message,
 // falling back to a placeholder when no identifier is available.
 func describeGroup(r GroupResult) string {
+	if r.Identity != "" && r.Identity != "unknown" {
+		return r.Identity
+	}
 	if r.PGID > 1 {
 		return identifyPID(r.PGID)
 	}
@@ -209,6 +228,15 @@ type singleReap struct {
 	done   chan struct{}
 	wait   func() error
 	result error
+}
+
+// trackedReap keeps an unresolved wait associated with the immutable process
+// identity captured before its group is sealed. The waiter itself only updates
+// singleReap and never mutates Runner state.
+type trackedReap struct {
+	process  string
+	identity string
+	reap     *singleReap
 }
 
 // start arranges for the wait to run on a goroutine and to publish its result

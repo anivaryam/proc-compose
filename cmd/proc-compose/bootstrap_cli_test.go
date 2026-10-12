@@ -33,15 +33,18 @@ func TestBootstrapJSON(t *testing.T) {
 		t.Fatalf("build failed: %v\n%s", err, out)
 	}
 
-	cmd := exec.Command(bin, "bootstrap", "--json")
+	cmd := exec.Command(bin, "bootstrap", "--verify", "--json")
 	cmd.Dir = tmp
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("bootstrap --json failed: %v\n%s", err, out)
+		t.Fatalf("bootstrap --verify --json failed: %v\n%s", err, out)
 	}
 	text := string(out)
-	if !strings.Contains(text, `"mode": "dry_run"`) || !strings.Contains(text, `"suggested_yaml"`) {
+	if !strings.Contains(text, `"mode": "verify"`) || !strings.Contains(text, `"validation_status": "passed"`) || !strings.Contains(text, `"started": false`) || !strings.Contains(text, `"ready": false`) || !strings.Contains(text, `"stopped": false`) {
 		t.Fatalf("unexpected JSON:\n%s", text)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "proc-compose.yml")); !os.IsNotExist(err) {
+		t.Fatalf("bootstrap --verify without --write must not create final config, stat err=%v", err)
 	}
 }
 

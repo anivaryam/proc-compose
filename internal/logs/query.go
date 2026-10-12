@@ -5,8 +5,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"strconv"
 	"strings"
@@ -29,6 +31,7 @@ type Options struct {
 	Search     string
 	Since      time.Time
 	RunID      string
+	AttemptID  string
 	Generation uint64
 }
 
@@ -184,7 +187,9 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 				name = fmt.Sprintf("%s.%d", path, index)
 			}
 			file, err := openJournal(name)
-			if os.IsNotExist(err) {
+			// errors.Is, not os.IsNotExist: on Windows a name that rotation is
+			// deleting at this moment also reports as not existing.
+			if errors.Is(err, fs.ErrNotExist) {
 				observed[name] = nil
 				continue
 			}
@@ -255,6 +260,7 @@ func matches(event ipc.LogEntry, opts Options) bool {
 		(opts.Code == "" || opts.Code == event.Code) &&
 		(opts.Stream == "" || opts.Stream == event.Stream) &&
 		(opts.RunID == "" || opts.RunID == event.RunID) &&
+		(opts.AttemptID == "" || opts.AttemptID == event.AttemptID) &&
 		(opts.Generation == 0 || opts.Generation == event.Generation) &&
 		(opts.Since.IsZero() || !event.Time.Before(opts.Since)) &&
 		(opts.Search == "" || strings.Contains(strings.ToLower(event.Line), strings.ToLower(opts.Search)))

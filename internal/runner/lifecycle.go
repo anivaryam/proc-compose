@@ -19,11 +19,14 @@ import (
 type processRunResult struct {
 	failed   bool
 	failFast bool
+	quiesced bool
 }
 
 // runProcess runs the lifecycle loop for a single process.
 // Returns failure metadata when the process ended in the "failed" state.
-func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store *stateStore) processRunResult {
+var errCleanupHandoff = errors.New("runner cleanup handoff")
+
+func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store *stateStore, handoff <-chan struct{}) processRunResult {
 	st := store.get(p.name)
 	backoff := time.Second
 
@@ -35,6 +38,8 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		}
 		r.processLog(p, "info", "dependency.wait", fmt.Sprintf("waiting for %s...", dep))
 		select {
+		case <-handoff:
+			return processRunResult{quiesced: true}
 		case <-ctx.Done():
 			depSt.mu.Lock()
 			depFailed := depSt.readyClosed && !depSt.readyOK
@@ -70,7 +75,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 	}
 
 	if p.proc.EffectiveMode() == config.ProcessModeTask {
-		return r.runTaskProcess(ctx, p, maxName, st)
+		return r.runTaskProcess(ctx, p, maxName, st, handoff)
 	}
 
 	for {
@@ -111,7 +116,11 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		})
 
 		startTime := time.Now()
-		err := r.exec(procCtx, p, maxName, st, onStart, onLine)
+		err := r.exec(procCtx, p, maxName, st, onStart, onLine, handoff)
+		if errors.Is(err, errCleanupHandoff) {
+			procCancel()
+			return processRunResult{quiesced: true}
+		}
 		procCancel() // clean up the restartCh goroutine
 
 		// Reset backoff if the process ran successfully for a meaningful duration.
@@ -123,15 +132,13 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		st.markReady(false)
 
 		// Check if parent context was cancelled (SIGTERM/SIGINT shutdown).
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil || r.stopping.Load() {
 			st.mu.Lock()
 			st.state = "exited"
 			st.mu.Unlock()
 			r.broadcastState(p, st)
 			r.processLog(p, "info", "process.stopped", "stopped")
 			return processRunResult{}
-		default:
 		}
 
 		// Check if this was a requested restart (not a natural exit).
@@ -180,7 +187,9 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 				st.state = "restarting"
 				st.mu.Unlock()
 				r.broadcastState(p, st)
-				time.Sleep(backoff)
+				if waitForCleanupHandoff(backoff, handoff) {
+					return processRunResult{quiesced: true}
+				}
 				continue
 			}
 			r.processLog(p, "info", "process.exited", "exited")
@@ -236,7 +245,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 	}
 }
 
-func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st *procState) processRunResult {
+func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st *procState, handoff <-chan struct{}) processRunResult {
 	st.mu.Lock()
 	st.startedAt = time.Now()
 	st.state = "starting"
@@ -245,7 +254,10 @@ func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st
 	st.mu.Unlock()
 	r.broadcastState(p, st)
 
-	err := r.exec(ctx, p, maxName, st, nil, nil)
+	err := r.exec(ctx, p, maxName, st, nil, nil, handoff)
+	if errors.Is(err, errCleanupHandoff) {
+		return processRunResult{quiesced: true}
+	}
 
 	st.mu.Lock()
 	st.pid = 0
@@ -358,9 +370,14 @@ func (r *Runner) buildReadinessCallbacks(
 // exec runs a single invocation of the process command.
 // onStart is called once after cmd.Start() succeeds (may be nil).
 // onLine is called for each stdout/stderr line (may be nil).
-func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procState, onStart func(), onLine func(string)) error {
-	shell, args := shellCommand(p.proc.Cmd)
-	cmd := exec.CommandContext(ctx, shell, args...)
+func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procState, onStart func(), onLine func(string), handoff <-chan struct{}) error {
+	var cmd *exec.Cmd
+	if len(p.argv) > 0 {
+		cmd = exec.CommandContext(ctx, p.argv[0], p.argv[1:]...)
+	} else {
+		shell, args := shellCommand(p.proc.Cmd)
+		cmd = exec.CommandContext(ctx, shell, args...)
+	}
 
 	// Per-process shutdown_timeout is the window between the graceful group
 	// signal and the forced group kill. Setting it on the group (not just on
@@ -368,7 +385,7 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	// get killed too.
 	grace := shutdownGrace(p.proc.ShutdownTimeout)
 
-	pg := newProcessGroup()
+	pg := r.createProcessGroup()
 	pg.Setup(cmd)
 	if p.proc.ShutdownTimeout > 0 {
 		cmd.WaitDelay = grace
@@ -392,23 +409,56 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
+	// Admission, start, tracking, and registry insertion are one transition with
+	// shutdown. If cancellation races Start, the group is still registered before
+	// shutdown can take its sealing snapshot; if admission already closed, nothing
+	// is launched.
+	r.lifecycleMu.Lock()
+	if r.stopping.Load() || ctx.Err() != nil {
+		r.lifecycleMu.Unlock()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		_ = pg.Close()
+		return context.Canceled
+	}
 	if err := cmd.Start(); err != nil {
+		r.lifecycleMu.Unlock()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		_ = pg.Close()
 		return fmt.Errorf("start: %w", err)
 	}
-
 	if err := pg.Track(cmd); err != nil {
 		if cmd.Process != nil {
 			if killErr := cmd.Process.Kill(); killErr != nil {
 				fmt.Fprintf(os.Stderr, "warning: failed to kill stray process: %v\n", killErr)
 			}
 		}
-		pg.Close()
+		observation, sealErr := pg.Seal()
+		reap := &singleReap{}
+		r.startReap(p.name, observation.Identity, cmd, reap)
+		r.lifecycleMu.Unlock()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		if observation.State != GroupEmpty || sealErr != nil {
+			r.recordUnverified(p.name, observation.Identity, fmt.Sprintf("%s: failed to establish process-group tracking; seal state=%s identity=%s error=%v", p.name, observation.State, observation.Identity, sealErr))
+		}
+		if handoff != nil {
+			select {
+			case <-reap.done:
+			case <-handoff:
+				return errCleanupHandoff
+			}
+		} else {
+			_ = reap.recv()
+		}
 		return fmt.Errorf("track: %w", err)
 	}
-
-	// Register the group so shutdown can verify and escalate against it even
-	// if this goroutine is parked below in the log scanner.
+	// Register before releasing lifecycleMu so shutdown's snapshot cannot miss
+	// a successfully started process.
+	groupIdentity := pg.Identify()
 	r.trackGroup(p.name, pg, grace)
+	r.lifecycleMu.Unlock()
 
 	st.mu.Lock()
 	st.pid = cmd.Process.Pid
@@ -441,8 +491,19 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		_ = cmd.Wait()
-		pg.Close()
+		reap := &singleReap{}
+		r.startReap(p.name, groupIdentity, cmd, reap)
+		if handoff != nil {
+			select {
+			case <-reap.done:
+			case <-handoff:
+				_ = stdout.Close()
+				_ = stderr.Close()
+				return errCleanupHandoff
+			}
+		} else {
+			_ = reap.recv()
+		}
 		return fmt.Errorf("observe leader exit: %w", obsErr)
 	}
 
@@ -473,11 +534,17 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	// collect the leader out from under the runner.
 	observeCh := make(chan exitObservation, 1)
 	obsStop := make(chan struct{})
+	stopObserver := sync.OnceFunc(func() { close(obsStop) })
+	var observeDone chan struct{}
 	// reap reports the command's exit status exactly once, whenever cmd.Wait is
 	// run on this goroutine's behalf.
 	var reap singleReap
 	if observer != nil {
-		go func() { observeCh <- observer.Observe(obsStop) }()
+		observeDone = make(chan struct{})
+		go func() {
+			defer close(observeDone)
+			observeCh <- observer.Observe(obsStop)
+		}()
 	} else {
 		// No reap-free observation: the exit can only be seen by reaping.
 		//
@@ -485,39 +552,55 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 		// its authority across the reap and is torn down all the same; elsewhere
 		// the reap is what releases the leader's reservation, so a natural
 		// completion can no longer signal anything.
-		reap.start(cmd.Wait)
+		r.startReap(p.name, groupIdentity, cmd, &reap)
 		if !durableContainment {
 			observation = exitUnsupported
 		}
+	}
+	finishHandoff := func() error {
+		closeStdout()
+		if observer != nil {
+			stopObserver()
+			<-observeDone
+		}
+		<-scanDone
+		if !reap.started() {
+			r.startReap(p.name, groupIdentity, cmd, &reap)
+		}
+		return errCleanupHandoff
 	}
 
 	cancelled := false
 	switch {
 	case observer != nil:
 		select {
+		case <-handoff:
+			return finishHandoff()
 		case <-ctx.Done():
 			cancelled = true
 		case observation = <-observeCh:
 		}
 	case durableContainment:
 		select {
+		case <-handoff:
+			return finishHandoff()
 		case <-ctx.Done():
 			cancelled = true
 		case <-reap.done:
 			// The leader is collected, but this platform's containment is a
 			// durable kernel handle, so authority is unaffected and the group
 			// is still torn down normally.
-			err = reap.recv()
 			observation = exitObserved
 		}
 	default:
 		select {
+		case <-handoff:
+			return finishHandoff()
 		case <-ctx.Done():
 			cancelled = true
 		case <-reap.done:
 			// The leader has been collected, so its identifier may already
 			// have been released. Nothing below may signal the group.
-			err = reap.recv()
 			observation = exitOwnershipLost
 		}
 	}
@@ -531,7 +614,7 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	if signallingEstablished(observation, cancelled) {
 		terminateGroup(pg, grace)
 	} else {
-		r.recordUnverified(fmt.Sprintf(
+		r.recordUnverified(p.name, groupIdentity, fmt.Sprintf(
 			"%s: the command leader's identity could not be established (%s), so no process "+
 				"group signal was sent; its descendants could not be terminated by proc-compose",
 			p.name, observation))
@@ -547,12 +630,15 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	// nil channel until the budget expired — adding the whole grace to every
 	// shutdown on that platform.
 	if observer != nil && observation == exitPending {
-		close(obsStop)
+		stopObserver()
 		// Only the fact that the observer finished matters here: teardown has
 		// already run, and every later step reads the process and the group
 		// rather than this result.
 		select {
 		case <-observeCh:
+			<-observeDone
+		case <-handoff:
+			return finishHandoff()
 		case <-time.After(grace + killSettle):
 			// The leader outlived a group-wide SIGKILL, which means it is
 			// unkillable rather than still ours to wait for. cmd.Wait below
@@ -574,6 +660,8 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	default:
 		select {
 		case <-scanDone:
+		case <-handoff:
+			return finishHandoff()
 		case <-time.After(killSettle):
 			escaped.Store(true)
 			closeStdout()
@@ -593,18 +681,26 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	//   cmd.Wait() is what reaps, and reaping releases that reservation. It is
 	//   therefore the last step that touches the command.
 	pg.Withdraw()
-	// Receive the exit status exactly once. It may already have been taken above
-	// by a natural completion, in which case there is nothing left to receive and
-	// a second read would block forever.
+	// Receive the exit status here, on every path. recv returns the same
+	// published result to every caller, and it must not be skipped because the
+	// result is already published: on the reap-free observer path nothing has
+	// received it yet, and an exited leader is often collected before this
+	// point.
 	//
 	// When no reap is in flight — the reap-free observer path — this is the only
 	// reap, so it happens here, last.
-	if reap.started() {
-		if !reap.taken() {
+	if !reap.started() {
+		r.startReap(p.name, groupIdentity, cmd, &reap)
+	}
+	if handoff != nil {
+		select {
+		case <-reap.done:
 			err = reap.recv()
+		case <-handoff:
+			return errCleanupHandoff
 		}
 	} else {
-		err = cmd.Wait()
+		err = reap.recv()
 	}
 	code := 0
 	var exitErr *exec.ExitError
@@ -618,19 +714,25 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	st.mu.Unlock()
 
 	// Verify now that every signal has been sent and the leader is collected.
+	r.lifecycleMu.Lock()
+	if handoff != nil && r.sealing.Load() {
+		r.lifecycleMu.Unlock()
+		return errCleanupHandoff
+	}
 	if state := pg.State(); state != GroupEmpty {
 		// Something is still running. SIGKILL cannot be caught, so a surviving
 		// member is either wedged in uninterruptible sleep or escaped the group
 		// entirely; either way it is not ours to signal any more. Report it.
-		r.recordSurvivor(p.name, survivorsError(groupResult(p.name, pg, state)))
+		r.recordSurvivor(p.name, groupIdentity, survivorsError(groupResult(p.name, pg, state)))
 		// Keep the group registered so the stack-level sweep can still name
 		// it; Close would discard the only handle the operator could use.
+		r.lifecycleMu.Unlock()
 		return err
 	}
 	if escaped.Load() {
 		// Distinct from a group survivor: the evidence we have only ever
 		// covered the original group, and something outlived it.
-		r.recordUnverified(fmt.Sprintf(
+		r.recordUnverified(p.name, groupIdentity, fmt.Sprintf(
 			"%s: a descendant still held the command's output after the process group was "+
 				"force-killed, so it had left the group and its termination could not be "+
 				"verified; check for detached children of %s", p.name, p.name))
@@ -638,16 +740,22 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 
 	r.untrackGroup(p.name, pg)
 	pg.Close()
+	r.lifecycleMu.Unlock()
 	return err
 }
 
 // groupResult describes a group for an operator-facing report.
 func groupResult(name string, pg ProcessGroup, state GroupState) []GroupResult {
 	return []GroupResult{{
-		Name:  name,
-		PGID:  groupPGID(pg),
-		State: state,
+		Name:     name,
+		PGID:     groupPGID(pg),
+		Identity: pg.Identify(),
+		State:    state,
 	}}
+}
+
+func sealedGroupResult(name string, observation SealObservation) []GroupResult {
+	return []GroupResult{{Name: name, Identity: observation.Identity, State: observation.State}}
 }
 
 // ── process-group registry ───────────────────────────────────────────────────
@@ -686,7 +794,7 @@ func (r *Runner) trackGroup(name string, pg ProcessGroup, _ time.Duration) {
 	// behind was already reported then; report it again if it is still there, so a
 	// restart can never silently forget a live process from an older group.
 	if state := prev.State(); state != GroupEmpty {
-		r.recordSurvivor(name, fmt.Errorf("previous incarnation: %w",
+		r.recordSurvivor(name, prev.Identify(), fmt.Errorf("previous incarnation: %w",
 			survivorsError(groupResult(name, prev, state))))
 	}
 	prev.Close()
@@ -728,7 +836,8 @@ func (r *Runner) takeGroups() map[string]ProcessGroup {
 
 // recordSurvivor notes a managed process that could not be terminated, so the
 // stop reports it instead of reporting success.
-func (r *Runner) recordSurvivor(name string, err error) {
+func (r *Runner) recordSurvivor(name, identity string, err error) {
+	r.recordUnresolved(name, identity)
 	r.recordShutdownProblem(fmt.Sprintf("could not terminate %s: %v", name, err))
 }
 
@@ -736,8 +845,39 @@ func (r *Runner) recordSurvivor(name string, err error) {
 // established at all — for example a descendant that left the process group.
 // It is deliberately a separate concept from a group member that survived
 // SIGKILL: the difference is whether proc-compose had any means to reach it.
-func (r *Runner) recordUnverified(msg string) {
+func (r *Runner) recordUnverified(name, identity, msg string) {
+	r.recordUnresolved(name, identity)
 	r.recordShutdownProblem(msg)
+}
+
+// UnresolvedProcess names a managed process whose termination or reaping could
+// not be established. Identity is the platform identifier captured while it was
+// still owned, or "unavailable".
+type UnresolvedProcess struct {
+	Name     string `json:"name"`
+	Identity string `json:"identity"`
+}
+
+func (r *Runner) recordUnresolved(name, identity string) {
+	if identity == "" || identity == "unknown" {
+		identity = "unavailable"
+	}
+	r.stopMu.Lock()
+	defer r.stopMu.Unlock()
+	for _, existing := range r.unresolved {
+		if existing.Name == name && existing.Identity == identity {
+			return
+		}
+	}
+	r.unresolved = append(r.unresolved, UnresolvedProcess{Name: name, Identity: identity})
+}
+
+// Unresolved returns every process recorded as surviving or unverified by the
+// most recent run, in recording order.
+func (r *Runner) Unresolved() []UnresolvedProcess {
+	r.stopMu.Lock()
+	defer r.stopMu.Unlock()
+	return append([]UnresolvedProcess(nil), r.unresolved...)
 }
 
 // recordShutdownProblem appends to the shutdown verdict and surfaces it on the
@@ -762,9 +902,13 @@ func (r *Runner) sweepGroups(runCtx context.Context) {
 	if runCtx.Err() == nil {
 		return
 	}
+	// Close admission before atomically taking the registry. Launchers hold the
+	// same lock through Start, Track, and registration.
+	r.lifecycleMu.Lock()
 	r.stopping.Store(true)
-
+	r.sealing.Store(true)
 	groups := r.takeGroups()
+	r.lifecycleMu.Unlock()
 	names := make([]string, 0, len(groups))
 	for name := range groups {
 		names = append(names, name)
@@ -773,14 +917,76 @@ func (r *Runner) sweepGroups(runCtx context.Context) {
 
 	for _, name := range names {
 		pg := groups[name]
-		// Every group reaching here was torn down and reaped by its own exec, so
-		// it can no longer be signalled: its identifier is not provably ours.
-		// Judging it is still worthwhile — it is how a survivor that outlived the
-		// stack-wide cancellation gets into the verdict at all.
-		if state := pg.State(); state != GroupEmpty {
-			r.recordSurvivor(name, survivorsError(groupResult(name, pg, state)))
+		// Seal remaining authority before Run returns. On Windows, this preserves
+		// the final membership observation before kill-on-close invalidates it.
+		observation, sealErr := pg.Seal()
+		if observation.State != GroupEmpty {
+			r.recordSurvivor(name, observation.Identity, survivorsError(sealedGroupResult(name, observation)))
 		}
-		pg.Close()
+		if sealErr != nil {
+			r.recordUnverified(name, observation.Identity, fmt.Sprintf("%s: process-group seal failed: %v", name, sealErr))
+		}
+	}
+}
+
+func (r *Runner) createProcessGroup() ProcessGroup {
+	if r.processGroupFactory != nil {
+		return r.processGroupFactory()
+	}
+	return newProcessGroup()
+}
+
+func (r *Runner) startReap(name, identity string, cmd *exec.Cmd, reap *singleReap) {
+	if reap.started() {
+		return
+	}
+	wait := cmd.Wait
+	if waitProcess := r.waitProcess; waitProcess != nil {
+		wait = func() error { return waitProcess(cmd) }
+	}
+	tracked := &trackedReap{process: name, identity: identity, reap: reap}
+	r.reapersMu.Lock()
+	r.reapers = append(r.reapers, tracked)
+	r.reapersMu.Unlock()
+	reap.start(wait)
+	if r.reapStarted != nil {
+		r.reapStarted(reap)
+	}
+}
+
+// reportPendingReaps records every wait that remained unresolved at the
+// operation boundary. Reaper goroutines publish only to their own singleReap;
+// they never update this registry or Runner state after Run returns.
+func (r *Runner) reportPendingReaps() {
+	r.reapersMu.Lock()
+	var pending []*trackedReap
+	keep := r.reapers[:0]
+	for _, tracked := range r.reapers {
+		if tracked.reap.taken() {
+			continue
+		}
+		pending = append(pending, tracked)
+		keep = append(keep, tracked)
+	}
+	r.reapers = keep
+	r.reapersMu.Unlock()
+	for _, tracked := range pending {
+		r.recordUnverified(tracked.process, tracked.identity, fmt.Sprintf("%s: process leader %s was not reaped before cleanup handoff", tracked.process, tracked.identity))
+	}
+}
+
+func waitForCleanupHandoff(delay time.Duration, handoff <-chan struct{}) bool {
+	if handoff == nil {
+		time.Sleep(delay)
+		return false
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-handoff:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -809,8 +1015,10 @@ func (r *Runner) Shutdown(force bool) (<-chan struct{}, <-chan error, error) {
 	if cancel == nil || stopped == nil || verdict == nil {
 		return nil, nil, fmt.Errorf("no stack is running")
 	}
+	// Close launch and replacement admission before any force signal or context
+	// cancellation. The same lock spans every Start-to-registry transition.
+	r.closeAdmission()
 	if force {
-		r.stopping.Store(true)
 		// Kill every live group now so nothing has to wait out its own
 		// shutdown_timeout. The groups stay registered: the sweep still has to
 		// verify that the kill worked, and an unverified kill is exactly the

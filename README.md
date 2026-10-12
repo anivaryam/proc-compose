@@ -152,6 +152,90 @@ optional supervisor HTTP server also exposes `/ready` alongside `/health`.
 
 See [milestone acceptance and verification](SESSION_LOGS_MILESTONE.md).
 
+### Verified development runs
+
+`verify` turns "start the stack, run the tests, clean up" into one owned
+operation with a receipt:
+
+```sh
+proc-compose --session checkout-fix verify --json -- npm run test:smoke
+proc-compose verify api -- go test ./e2e/...           # select api + its dependencies
+proc-compose verify --check-timeout 2m -- sh -c 'npm test && npm run lint'
+```
+
+It validates the config, acquires a fresh session (refusing one that is already
+running instead of reusing or stopping it), starts the selected processes,
+waits for readiness, runs the check, stops everything it started, and records a
+receipt under the session runtime directory. The check after `--` is executed
+directly, never through an implicit shell. It inherits your environment plus
+`PROC_COMPOSE_SESSION`, `PROC_COMPOSE_SESSION_DIR`, `PROC_COMPOSE_RUN_ID`, and
+`PROC_COMPOSE_PORT_<PROCESS>_<PORT>` / `PROC_COMPOSE_URL_<PROCESS>_<PORT>` for
+every declared named port.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Startup, check, and verified cleanup all passed; receipt persisted |
+| 1 | Startup/readiness, check, required process, cleanup, or receipt failure |
+| 2 | Usage, invalid config, or occupied session — nothing was started |
+| 130 | Interrupted (cleanup still ran) |
+
+With `--json`, stdout is exactly one JSON object (`kind: verify.response`, at
+most 64 KiB; or `verify.compact_error` if the full result cannot fit). Process
+output is kept in the journal only (read it with `why --attempt`); add
+`--stream-logs` to also stream it to stderr, as human mode does. Each phase (`startup`, `check`, `cleanup`) keeps its own
+status, so a passing check cannot hide a crashed service or an unverified
+cleanup. A service without a readiness probe is reported as
+`not_configured`/unprobed rather than ready. Source revision and dirty state are
+recorded as provenance only (`loaded_code_proven: false`). Default budgets are
+startup 120s, check 10m, and an independent 30s cleanup (unmeasured policy
+defaults; override with `--startup-timeout`, `--check-timeout`,
+`--cleanup-timeout`). The cleanup budget starts once, at the first trigger
+(check deadline, interruption, or failure), and covers check teardown, stack
+teardown, and sealing together.
+
+```sh
+proc-compose attempts                      # receipts for this session, newest first
+proc-compose attempts latest --json        # one receipt (state classified from evidence)
+proc-compose why --attempt latest --json   # that attempt's own events, grouped, bounded
+proc-compose sessions                      # every session: owner, URLs, latest attempt, stop command
+proc-compose compare --baseline ../main --candidate . -- npm run test:smoke
+proc-compose config check --json           # structured config diagnostics with line/column
+proc-compose config plan --json            # resolved startup order (a plan, not a run)
+proc-compose config schema                 # versioned JSON Schema for proc-compose.yml
+```
+
+Receipts and journals live in the runtime directory and may disappear at
+logout or reboot. `why --attempt` reads only events stamped with that attempt
+and reports missing or rotated history explicitly; it shows temporal order, not
+causes. `sessions` only reads metadata (set `PROC_COMPOSE_OWNER` to label who
+started a session); retained environments are the ones started with
+`up --silent`, and are stopped with the command it prints. `compare` runs the
+same check against two worktrees with separate sessions and reports outcome
+differences; it neither isolates external data nor attributes differences to
+the code change.
+
+#### Recipes
+
+CI (GitHub Actions step):
+
+```yaml
+- name: Verified smoke test
+  run: proc-compose verify --json -- npm run test:smoke > verify.json
+- if: always()
+  uses: actions/upload-artifact@v4
+  with: { name: verify-receipt, path: verify.json }
+```
+
+Agent tool action or worktree setup script:
+
+```sh
+proc-compose -f "$PWD/proc-compose.yml" --session "task-$TASK_ID" verify --json -- npm test
+# on failure: proc-compose -f "$PWD/proc-compose.yml" --session "task-$TASK_ID" why --attempt latest --json
+```
+
+Design notes: [strategy](AGENT_RUNTIME_STRATEGY.md),
+[plan](AGENT_RUNTIME_PLAN.md), [decisions and progress](AGENT_RUNTIME_RECORD.md).
+
 ## Install
 
 **With [brokit](https://github.com/anivaryam/brokit)** (recommended — handles install, update, and uninstall across the whole tool family in one command):
@@ -276,11 +360,11 @@ If `merge:` is configured but merge-port is not on PATH, `up`, `validate`, and `
 
 ## Quick Start
 
-The fastest path is `bootstrap`: it scans your project, proposes a config, and can verify that the generated config parses through `proc-compose` before writing anything.
+The fastest path is `bootstrap`: it scans your project, proposes a config, and can validate the generated config through a proc-compose dry run before writing anything. This does not start application processes or establish readiness.
 
 ```sh
 proc-compose bootstrap          # inspect generated config
-proc-compose bootstrap --verify # verify generated config without writing
+proc-compose bootstrap --verify # validate generated config (dry run; no processes started)
 proc-compose bootstrap --write  # create proc-compose.yml when none exists
 proc-compose up                 # start the stack
 ```
@@ -340,7 +424,7 @@ Daemon commands (`status`, `logs`, `monitor`, `restart`, `reload`, `stop`) talk 
 ## CLI Usage
 
 ```
-proc-compose bootstrap [--write] [--verify] [--json]    Generate and optionally verify setup
+proc-compose bootstrap [--write] [--verify] [--json]    Generate setup and optionally validate config (dry run)
 proc-compose doctor [--write] [--json]                  Scan project and diagnose setup
 proc-compose init [--template T]                        Generate starter config
 proc-compose validate                                   Parse config without starting
@@ -353,6 +437,12 @@ proc-compose restart <process>                          Restart one running proc
 proc-compose reload                                     Reload config and restart changed processes
 proc-compose stop [--timeout N] [--force]               Stop daemon gracefully (or SIGKILL)
 proc-compose list                                       List config processes
+proc-compose verify [processes...] -- PROGRAM [ARG...]  Owned stack + check + verified cleanup + receipt
+proc-compose attempts [id|latest] [--json]              List or show verification receipts
+proc-compose why <process> | --attempt <id|latest>      Bounded failure evidence (live, retained, or one attempt)
+proc-compose sessions [--live] [--json]                 Discover sessions, owners, URLs, latest attempt
+proc-compose compare --baseline D --candidate D -- CMD  Run one check against two worktrees
+proc-compose config check|plan|schema [--json]          Structured config diagnostics, startup plan, schema
 proc-compose man [--dir DIR]                            Generate man pages
 proc-compose uninstall --name <n>                       Remove systemd unit
 proc-compose completion <shell>                         Generate shell completion (bash/zsh/fish/powershell)
@@ -385,7 +475,7 @@ Important flags (up):
 Important flags (bootstrap):
       --write              Create proc-compose.yml when no config exists
       --force              Overwrite an existing config when used with --write
-      --verify             Verify generated config through proc-compose
+      --verify             Validate generated config with a dry run; does not start processes
       --json               Emit machine-readable JSON
 
 Flags (stop):
@@ -574,11 +664,11 @@ When you pass `-f path/to/proc-compose.yml`, `doctor` scans and resolves relativ
 proc-compose bootstrap                  # dry run: show generated config
 proc-compose bootstrap --write          # create proc-compose.yml when none exists
 proc-compose bootstrap --write --force  # overwrite an existing generated or stale config
-proc-compose bootstrap --verify         # test generated config without writing it
+proc-compose bootstrap --verify         # validate generated config without writing it (dry run)
 proc-compose bootstrap --write --verify # write, then verify
 ```
 
-`bootstrap` builds on `doctor`: it scans the repo, proposes a config, and can verify the config through proc-compose. The default mode is safe and read-only. Use `--write` to create `proc-compose.yml`; it refuses to overwrite existing configs unless you also pass `--force`. Use `--verify` without `--write` to validate a temporary generated config without creating the final file; use `--write --verify` to verify the file it wrote.
+`bootstrap` builds on `doctor`: it scans the repo, proposes a config, and can validate the config through `proc-compose up --dry-run`. This checks configuration and process selection only; it does not start application processes or establish readiness. The default mode is safe and read-only. Use `--write` to create `proc-compose.yml`; it refuses to overwrite existing configs unless you also pass `--force`. Use `--verify` without `--write` to validate a temporary generated config without creating the final file; use `--write --verify` to validate the file it wrote. `--verify` exits nonzero if validation fails.
 
 Like `doctor`, `bootstrap -f path/to/proc-compose.yml` scans and writes relative to that config file's directory.
 

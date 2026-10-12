@@ -3,13 +3,17 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/kolesnikovae/go-winjob"
+	"golang.org/x/sys/windows"
 )
 
 // waitDelay bounds how long os/exec waits for a cancelled command on Windows.
@@ -23,6 +27,10 @@ const waitDelay = 5 * time.Second
 // implementation has no notion of an unreaped leader, why Withdraw is a no-op —
 // the handle keeps its authority for as long as it is open — and why Close is the
 // last-resort backstop, because the job carries KillOnJobClose.
+//
+// Containment comes before execution: Setup creates the command suspended, and
+// Track resumes it only after it is in the job. A process that spawns a child as
+// its first action therefore cannot place that child outside the job.
 //
 // Handle lifetime: mu is held for the whole of every handle-dependent operation,
 // not merely long enough to copy the pointer. Terminate and QueryCounters both
@@ -40,7 +48,15 @@ type windowsProcessGroup struct {
 	// exists but was never assigned holds nothing, so terminating it would report
 	// work that was never done.
 	tracked bool
+	// cancelled records that cancellation reached Kill before Track. The command
+	// is still suspended then and has run no code, so Track contains it without
+	// resuming it and the lifecycle's teardown terminates the job.
+	cancelled bool
 }
+
+// resumeCommand resumes a command created suspended. It is a variable so tests
+// can make the resume fail after the command has been assigned to the job.
+var resumeCommand = resumeSuspendedProcess
 
 func newProcessGroup() ProcessGroup {
 	job, err := winjob.Create("", winjob.WithKillOnJobClose())
@@ -48,6 +64,11 @@ func newProcessGroup() ProcessGroup {
 }
 
 func (pg *windowsProcessGroup) Setup(cmd *exec.Cmd) {
+	// Keep any attributes the caller set; only the creation flag is added.
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED
 	// cmd.Cancel must be set before cmd.Start; assigning it later is a silent
 	// no-op and falls back to os.Process.Kill, bypassing the Job Object.
 	cmd.Cancel = func() error {
@@ -56,7 +77,8 @@ func (pg *windowsProcessGroup) Setup(cmd *exec.Cmd) {
 	cmd.WaitDelay = waitDelay
 }
 
-// Track adds the started command to the job.
+// Track adds the started, still suspended command to the job and then resumes
+// it, so the command runs only once it is contained.
 //
 // The lock covers the Assign call as well as the reads, so a concurrent Close
 // cannot release the handle while Assign is using it.
@@ -78,10 +100,81 @@ func (pg *windowsProcessGroup) Track(cmd *exec.Cmd) error {
 		}
 		return fmt.Errorf("track: job object is closed")
 	}
+	// The command is still suspended, so a failed Assign leaves a process that
+	// has run no code and has no descendants; the caller kills it through its
+	// own handle.
 	if err := pg.job.Assign(cmd.Process); err != nil {
 		return fmt.Errorf("track: assign to job object: %w", err)
 	}
 	pg.tracked = true
+	if pg.cancelled {
+		// Cancellation already arrived. Leave the command suspended inside the
+		// job: it never runs, and teardown terminates the job.
+		return nil
+	}
+	if err := resumeCommand(cmd.Process.Pid); err != nil {
+		// The command is in the job but never ran. End it now, and wait for it,
+		// so the seal that follows observes an empty job rather than a member
+		// that is only on its way out.
+		termErr := pg.job.Terminate()
+		waitErr := waitProcessExit(cmd.Process.Pid, killSettle)
+		return fmt.Errorf("track: resume suspended command: %w", errors.Join(err, termErr, waitErr))
+	}
+	return nil
+}
+
+// resumeSuspendedProcess resumes the threads of a process created with
+// CREATE_SUSPENDED. os/exec closes the primary thread handle that CreateProcess
+// returns, so the thread is found by its owning process in a thread snapshot.
+// The caller still holds the process handle, so the PID cannot be reused, and a
+// suspended process's threads cannot exit on their own.
+func resumeSuspendedProcess(pid int) error {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return fmt.Errorf("thread snapshot: %w", err)
+	}
+	defer windows.CloseHandle(snapshot)
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	resumed := 0
+	for err = windows.Thread32First(snapshot, &entry); err == nil; err = windows.Thread32Next(snapshot, &entry) {
+		if entry.OwnerProcessID != uint32(pid) {
+			continue
+		}
+		thread, openErr := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+		if openErr != nil {
+			return fmt.Errorf("open thread %d: %w", entry.ThreadID, openErr)
+		}
+		_, resumeErr := windows.ResumeThread(thread)
+		windows.CloseHandle(thread)
+		if resumeErr != nil {
+			return fmt.Errorf("resume thread %d: %w", entry.ThreadID, resumeErr)
+		}
+		resumed++
+	}
+	if !errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+		return fmt.Errorf("enumerate threads: %w", err)
+	}
+	if resumed == 0 {
+		return fmt.Errorf("no thread found for process %d", pid)
+	}
+	return nil
+}
+
+// waitProcessExit waits up to timeout for pid to exit without reaping it, so
+// the lifecycle's own reap still collects the exit status.
+func waitProcessExit(pid int, timeout time.Duration) error {
+	process, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
+	if err != nil {
+		return fmt.Errorf("open process %d: %w", pid, err)
+	}
+	defer windows.CloseHandle(process)
+	event, err := windows.WaitForSingleObject(process, uint32(timeout.Milliseconds()))
+	if err != nil {
+		return fmt.Errorf("wait for process %d: %w", pid, err)
+	}
+	if event != windows.WAIT_OBJECT_0 {
+		return fmt.Errorf("process %d did not exit within %s", pid, timeout)
+	}
 	return nil
 }
 
@@ -96,19 +189,56 @@ func (pg *windowsProcessGroup) Kill() error {
 	if pg.job == nil || !pg.tracked {
 		// Nothing is assigned to this container. os/exec treats
 		// os.ErrProcessDone as "nothing left to interrupt" and carries on, which
-		// is the same outcome an untracked Unix group reports.
+		// is the same outcome an untracked Unix group reports. A command started
+		// but not yet tracked is still suspended; recording the request makes
+		// Track contain it without letting it run.
+		pg.cancelled = true
 		return os.ErrProcessDone
 	}
 	return pg.job.Terminate()
 }
 
-// Withdraw records that the runner has finished signalling.
+// Withdraw is retained as the pre-reap lifecycle boundary. Windows containment
+// remains authoritative until Seal/Close releases the Job Object.
 //
 // Nothing is closed here. The job handle must stay open until the process has
 // been verified and the group's verdict recorded, because the kernel keeps
 // tracking membership through the handle regardless of whether the command
 // leader has exited.
 func (pg *windowsProcessGroup) Withdraw() {}
+
+// Seal observes membership and closes the Job Object while holding the same
+// lock used by Terminate, State, Track, and Close. Close is kill-on-close, so
+// the returned state is the last truthful observation before that action; a
+// post-close query would only report that the handle is unavailable.
+func (pg *windowsProcessGroup) Seal() (SealObservation, error) {
+	pg.mu.Lock()
+	defer pg.mu.Unlock()
+	state := GroupUnavailable
+	identity := "unknown"
+	var stateErr error
+	if pg.job != nil {
+		identity = "job object"
+		if !pg.tracked {
+			state = GroupEmpty
+		} else {
+			var counters winjob.Counters
+			if err := pg.job.QueryCounters(&counters); err != nil {
+				stateErr = err
+			} else if counters.ActiveProcesses == 0 {
+				state = GroupEmpty
+			} else {
+				state = GroupOwned
+			}
+		}
+	}
+	if pg.job == nil {
+		return SealObservation{State: state, Identity: identity}, pg.createErr
+	}
+	closeErr := pg.job.Close()
+	pg.job = nil
+	return SealObservation{State: state, Identity: identity}, errors.Join(stateErr, closeErr)
+}
 
 // State reports what the kernel knows about the job.
 func (pg *windowsProcessGroup) State() GroupState {

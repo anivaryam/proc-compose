@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -46,6 +47,7 @@ Coding agents:
   proc-compose status --json           # readiness and resolved session metadata
   proc-compose logs api --json --max-bytes 8192
   proc-compose why api --json          # bounded failure evidence
+  proc-compose verify --json -- npm test   # owned stack + check + verified cleanup
   Use -f and --session consistently; see agent-guide for cursors and cleanup.
 
 Config discovery:
@@ -289,6 +291,7 @@ auto-injection — see:
 			}
 			defer plan.Close()
 			cfg = plan.Config
+			plan.Project.Owner = session.NewOwner("up", absConfig)
 			plan.Project.LogPath = logFile
 			if logFile != "" {
 				logFile, err = filepath.Abs(logFile)
@@ -835,9 +838,11 @@ sections. Suitable for CI and pre-commit checks.`,
 	// ── bootstrap ─────────────────────────────────────────────────────────────
 	bootstrapCmd := &cobra.Command{
 		Use:   "bootstrap",
-		Short: "Generate and optionally verify proc-compose setup",
-		Long: `Scan the project, propose a config, and (optionally) verify the
-generated config through proc-compose. Safe and read-only by default.
+		Short: "Generate setup and optionally validate its config",
+		Long: `Scan the project, propose a config, and (optionally) validate the
+generated config with proc-compose up --dry-run. Verification checks configuration
+only; it does not start application processes or establish readiness. Safe and
+read-only by default.
 
 When -f is set, bootstrap scans and resolves paths relative to that
 file's directory; otherwise it works in the current directory.
@@ -848,7 +853,7 @@ See: https://github.com/anivaryam/proc-compose#bootstrap-a-working-setup`,
 		Example: `  proc-compose bootstrap                  # show generated config without changing files
   proc-compose bootstrap --write          # create proc-compose.yml when missing
   proc-compose bootstrap --write --force  # overwrite existing config
-  proc-compose bootstrap --verify         # verify generated config through proc-compose
+  proc-compose bootstrap --verify         # validate generated config (dry run; no processes started)
   proc-compose bootstrap --write --verify # write and verify setup
   proc-compose bootstrap --json           # machine-readable report`,
 		SilenceUsage:  true,
@@ -881,7 +886,7 @@ See: https://github.com/anivaryam/proc-compose#bootstrap-a-working-setup`,
 	}
 	bootstrapCmd.Flags().BoolVar(&bootstrapWrite, "write", false, "create proc-compose.yml when no config exists")
 	bootstrapCmd.Flags().BoolVar(&bootstrapForce, "force", false, "overwrite existing config when used with --write")
-	bootstrapCmd.Flags().BoolVar(&bootstrapVerify, "verify", false, "verify generated config through proc-compose")
+	bootstrapCmd.Flags().BoolVar(&bootstrapVerify, "verify", false, "validate generated config with a dry run; does not start processes")
 	bootstrapCmd.Flags().BoolVar(&bootstrapJSON, "json", false, "emit machine-readable JSON")
 
 	// ── doctor ────────────────────────────────────────────────────────────────
@@ -934,23 +939,27 @@ See: https://github.com/anivaryam/proc-compose#diagnose-or-generate-config`,
 	if err := uninstallCmd.MarkFlagRequired("name"); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to mark --name as required: %v\n", err)
 	}
-	rootCmd.AddCommand(upCmd, monitorCmd, stopCmd, listCmd, initCmd, restartCmd, reloadCmd, uninstallCmd, logsCmd, manCmd, statusCmd, validateCmd, bootstrapCmd, doctorCmd, newWhyCommand(&configFile), newAgentGuideCommand())
+	rootCmd.AddCommand(upCmd, monitorCmd, stopCmd, listCmd, initCmd, restartCmd, reloadCmd, uninstallCmd, logsCmd, manCmd, statusCmd, validateCmd, bootstrapCmd, doctorCmd, newWhyCommand(&configFile), newAgentGuideCommand(), newVerifyCommand(&configFile), newConfigCommand(&configFile), newAttemptsCommand(&configFile), newSessionsCommand(), newCompareCommand(&configFile))
 
 	// The update notice runs before every command's own work, so it is
 	// printed above the output it refers to and never after a TUI has taken
 	// over the screen. Cobra returns for --help and --version before any run
 	// hook, so those never reach it.
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
-		if sessionName != "" {
-			if err := validateUnitName(sessionName); err != nil {
-				return fmt.Errorf("invalid --session: %w", err)
-			}
+		// Commands that promise a structured result report this refusal
+		// themselves; they silence cobra's printing to keep stdout clean.
+		if err := validateSessionFlag(); err != nil && cmd.Annotations[structuredUsageAnnotation] == "" {
+			return err
 		}
 		printUpdateNotice(cmd, version, stderrIsTerminal())
 		return nil
 	}
 
 	if err := rootCmd.Execute(); err != nil {
+		var coded exitCodeError
+		if errors.As(err, &coded) {
+			os.Exit(coded.code)
+		}
 		os.Exit(1)
 	}
 }

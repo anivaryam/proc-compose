@@ -23,14 +23,34 @@ const pidIDType = 1
 //
 // waitid(WNOWAIT) needs no such lookup: it observes the exit directly and leaves
 // the leader waitable, so a later cmd.Wait still reports a real exit status. The
-// only Darwin-specific concern left is that waitid may report a stopped child even
-// with only WEXITED requested; Observe ignores the payload and returns on any
-// successful return, and a spurious return for a stopped child would make the
-// later reap fail loudly rather than silently corrupt signalling authority.
+// observer polls with WNOHANG, so it tells an exit from "nothing yet" by si_pid,
+// which must therefore be read at Darwin's offset (see waitSiginfo). Darwin's
+// waitid may also report a stopped child with only WEXITED requested; a spurious
+// observation for a stopped child would make the later reap fail loudly rather
+// than silently corrupt signalling authority.
 func observeLeaderExitPlatform(pid int) (exitObserver, error) {
 	obs := &reapFreeObserver{pid: pid}
 	if err := obs.probe(); err != nil {
 		return nil, err
 	}
 	return obs, nil
+}
+
+// waitSiginfo is Darwin's siginfo_t, laid out so that si_pid can be read.
+//
+// Unlike Linux, Darwin has no padding before si_pid: it is at offset 12, and
+// offset 16 is si_uid. With Linux's layout, macOS CI (run 38306358474) never
+// observed an exit, so every naturally exiting command ran until its deadline.
+// The layout matches the Go
+// runtime's own definition in runtime/defs_darwin_amd64.go and
+// defs_darwin_arm64.go (Go 1.26.8). The buffer is 128 bytes, larger than
+// Darwin's 104-byte siginfo_t.
+type waitSiginfo struct {
+	Signo  int32
+	Errno  int32
+	Code   int32
+	Pid    int32
+	Uid    uint32
+	Status int32
+	_      [104]byte
 }

@@ -27,36 +27,200 @@ import (
 
 // startGroupForJobTest starts cmdStr in its own Job Object and returns the group
 // plus the Cmd.
-//
-// Cleanup releases the job before killing the command: closing the last job
-// handle terminates everything still assigned to it, which is what makes a failing
-// assertion unable to leak a process.
 func startGroupForJobTest(t *testing.T, cmdStr string) (*windowsProcessGroup, *exec.Cmd) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "cmd", "/c", cmdStr)
+	t.Cleanup(cancel)
+	pg, cmd := startSuspendedForJobTest(t, exec.CommandContext(ctx, "cmd", "/c", cmdStr))
+	if err := pg.Track(cmd); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	return pg, cmd
+}
+
+// startSuspendedForJobTest prepares cmd through a new group and starts it, but
+// does not track it, so the command is created suspended and outside the job.
+//
+// Cleanup releases the job before killing the command through its own handle:
+// closing the last job handle terminates everything still assigned to it, and the
+// handle kill covers a command that was never assigned, which is what makes a
+// failing assertion unable to leak a process.
+func startSuspendedForJobTest(t *testing.T, cmd *exec.Cmd) (*windowsProcessGroup, *exec.Cmd) {
+	t.Helper()
 	pg := newProcessGroup().(*windowsProcessGroup)
 	pg.Setup(cmd)
 	if err := cmd.Start(); err != nil {
-		cancel()
+		_ = pg.Close()
 		t.Fatalf("start: %v", err)
 	}
-	if err := pg.Track(cmd); err != nil {
-		cancel()
-		_ = pg.Close()
-		t.Fatalf("track: %v", err)
-	}
 	t.Cleanup(func() {
-		// Release the job first: KillOnJobClose terminates any remaining member.
 		_ = pg.Close()
-		cancel()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
-		}
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
 	})
 	return pg, cmd
+}
+
+// directHelper builds a command that runs the test helper directly, with no
+// shell in between, so the leader is the helper itself.
+func directHelper(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRunnerHelperProcess$", "--", helperSentinel, encodeHelperArgs(args...))
+}
+
+// assertNotExecuted fails if marker appears within the observation window. A
+// suspended command cannot write it, however long it is held.
+func assertNotExecuted(t *testing.T, marker string, what string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatalf("%s ran before it was contained", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// waitProcessGone fails unless pid stops executing within timeout.
+func waitProcessGone(t *testing.T, pid int, what string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for windowsProcessRunning(pid) {
+		if !time.Now().Before(deadline) {
+			t.Fatalf("%s (PID %d) is still running after %s", what, pid, timeout)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestWindowsJob_ImmediateDescendantIsContained is the containment-before-
+// execution regression. The leader spawns a long-lived child as its first action
+// and exits. Track is held for a second after Start, the window in which the
+// child used to be created outside the job; terminating the job must still reach
+// it.
+func TestWindowsJob_ImmediateDescendantIsContained(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	pg, cmd := startSuspendedForJobTest(t, directHelper(context.Background(), "spawn-job-child", pidFile))
+	assertNotExecuted(t, pidFile, "leader")
+	if err := pg.Track(cmd); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	child := waitForJobChildPID(t, pidFile)
+	defer func() { _ = exec.Command("taskkill", "/F", "/PID", strconv.Itoa(child)).Run() }()
+	if !windowsProcessRunning(child) {
+		t.Fatalf("child (PID %d) is not running before the job is terminated; the fixture proves nothing", child)
+	}
+	if err := pg.Kill(); err != nil {
+		t.Fatalf("Kill() = %v", err)
+	}
+	waitProcessGone(t, child, "immediate descendant", 30*time.Second)
+	waitWhileLive(pg, 30*time.Second)
+	if got := pg.State(); got != GroupEmpty {
+		t.Fatalf("State() after terminating the job = %v, want %v", got, GroupEmpty)
+	}
+}
+
+// TestWindowsJob_CancelBeforeTrackNeverRuns covers cancellation that lands
+// between creation and containment. The command must be contained without ever
+// running, and the owned job handle must end it, through Kill or through the
+// kill-on-close of Seal.
+func TestWindowsJob_CancelBeforeTrackNeverRuns(t *testing.T) {
+	for _, end := range []string{"kill", "seal"} {
+		t.Run(end, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "ran")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			pg, cmd := startSuspendedForJobTest(t, directHelper(ctx, "touch-block", marker))
+			cancel()
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				pg.mu.Lock()
+				cancelled := pg.cancelled
+				pg.mu.Unlock()
+				if cancelled {
+					break
+				}
+				if !time.Now().Before(deadline) {
+					t.Fatal("context cancellation never reached the group's Cancel")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := pg.Track(cmd); err != nil {
+				t.Fatalf("Track() after cancellation = %v, want the command contained", err)
+			}
+			if got := pg.State(); got != GroupOwned {
+				t.Fatalf("State() of the contained command = %v, want %v", got, GroupOwned)
+			}
+			assertNotExecuted(t, marker, "cancelled command")
+			switch end {
+			case "kill":
+				if err := pg.Kill(); err != nil {
+					t.Fatalf("Kill() = %v", err)
+				}
+				waitWhileLive(pg, 30*time.Second)
+				if got := pg.State(); got != GroupEmpty {
+					t.Fatalf("State() after Kill = %v, want %v", got, GroupEmpty)
+				}
+			case "seal":
+				observation, err := pg.Seal()
+				if err != nil || observation.State != GroupOwned {
+					t.Fatalf("Seal() = %+v, %v; want the suspended member observed before release", observation, err)
+				}
+			}
+			waitProcessGone(t, cmd.Process.Pid, "cancelled command", 30*time.Second)
+		})
+	}
+}
+
+// TestWindowsJob_ResumeFailureEndsTheContainedCommand covers a command that was
+// assigned but could not be resumed. Track must fail, the command must never
+// have run, and the job must already be empty for the seal that follows.
+func TestWindowsJob_ResumeFailureEndsTheContainedCommand(t *testing.T) {
+	resumeErr := errors.New("controlled resume failure")
+	defer func(previous func(int) error) { resumeCommand = previous }(resumeCommand)
+	resumeCommand = func(int) error { return resumeErr }
+
+	marker := filepath.Join(t.TempDir(), "ran")
+	pg, cmd := startSuspendedForJobTest(t, directHelper(context.Background(), "touch-block", marker))
+	if err := pg.Track(cmd); !errors.Is(err, resumeErr) {
+		t.Fatalf("Track() = %v, want the resume failure", err)
+	}
+	if windowsProcessRunning(cmd.Process.Pid) {
+		t.Fatalf("command (PID %d) still running after Track reported the resume failure", cmd.Process.Pid)
+	}
+	observation, err := pg.Seal()
+	if err != nil || observation.State != GroupEmpty {
+		t.Fatalf("Seal() = %+v, %v; want an empty job", observation, err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("command ran although it was never resumed")
+	}
+}
+
+// TestWindowsJob_TrackRaceWithKillAndClose races containment against signalling
+// and release on a suspended command. Whatever the order, the handle is never
+// used after release, and the command ends: through the job, through
+// kill-on-close, or through the caller's own handle when Track fails.
+func TestWindowsJob_TrackRaceWithKillAndClose(t *testing.T) {
+	for i := 0; i < 8; i++ {
+		pg, cmd := startSuspendedForJobTest(t, directHelper(context.Background(), "sleep", "120s"))
+		var wg sync.WaitGroup
+		var trackErr error
+		wg.Add(3)
+		go func() { defer wg.Done(); trackErr = pg.Track(cmd) }()
+		go func() { defer wg.Done(); _ = pg.Kill() }()
+		go func() { defer wg.Done(); _ = pg.Close() }()
+		wg.Wait()
+		if trackErr != nil {
+			// The lifecycle kills a command whose Track failed through its own
+			// handle; do the same here.
+			_ = cmd.Process.Kill()
+		}
+		if got := pg.State(); got != GroupUnavailable {
+			t.Fatalf("State() after Close = %v, want %v", got, GroupUnavailable)
+		}
+		waitProcessGone(t, cmd.Process.Pid, "raced command", 30*time.Second)
+	}
 }
 
 // TestWindowsJob_HandleOutlivesLeader covers the handle half of successful
@@ -161,7 +325,8 @@ func TestWindowsJob_AuthoritySurvivesLeaderExit(t *testing.T) {
 // State() must stay unverifiable rather than claiming an empty group.
 func TestWindowsJob_UnavailableContainmentIsReported(t *testing.T) {
 	// A group that was never created models a failed job object creation.
-	pg := &windowsProcessGroup{createErr: errors.New("job object could not be created")}
+	createErr := errors.New("job object could not be created")
+	pg := &windowsProcessGroup{createErr: createErr}
 
 	self, err := os.FindProcess(os.Getpid())
 	if err != nil {
@@ -181,15 +346,21 @@ func TestWindowsJob_UnavailableContainmentIsReported(t *testing.T) {
 	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("Kill() with no containment = %v, want os.ErrProcessDone", err)
 	}
-	if err := pg.Close(); err != nil {
-		t.Fatalf("Close() with no containment = %v, want nil", err)
+	observation, err := pg.Seal()
+	if !errors.Is(err, createErr) {
+		t.Fatalf("Seal() error = %v, want job creation error", err)
+	}
+	if observation.State != GroupUnavailable || observation.Identity != "unknown" {
+		t.Fatalf("Seal() observation = %+v, want unavailable state and unknown identity", observation)
 	}
 }
 
 // TestWindowsJob_TrackRefusesAClosedHandle covers the other containment failure:
-// the job was created but is no longer usable.
+// the job was created but is no longer usable. The command is still suspended
+// then, so it has run no code, and the caller's own handle ends it.
 func TestWindowsJob_TrackRefusesAClosedHandle(t *testing.T) {
-	pg, cmd := startGroupForJobTest(t, helperCmd("sleep", "30s"))
+	marker := filepath.Join(t.TempDir(), "ran")
+	pg, cmd := startSuspendedForJobTest(t, directHelper(context.Background(), "touch-block", marker))
 	if err := pg.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -203,6 +374,11 @@ func TestWindowsJob_TrackRefusesAClosedHandle(t *testing.T) {
 	if err := pg.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
+	assertNotExecuted(t, marker, "uncontained command")
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill through the owned handle: %v", err)
+	}
+	waitProcessGone(t, cmd.Process.Pid, "uncontained command", 30*time.Second)
 }
 
 // TestWindowsJob_ConcurrentUseAndClose is the handle-lifetime regression.
@@ -266,6 +442,29 @@ func TestWindowsJob_WithdrawDoesNotReleaseAuthority(t *testing.T) {
 	}
 	if pg.Identify() == "unknown" {
 		t.Fatal("Identify() after Withdraw = unknown, want the job to still be identified")
+	}
+}
+
+func TestWindowsJob_SealPreservesPreCloseObservation(t *testing.T) {
+	pg, _ := startGroupForJobTest(t, "ping -n 30 127.0.0.1 >NUL")
+	if got := pg.State(); got != GroupOwned {
+		t.Fatalf("State() before Seal = %v, want owned", got)
+	}
+	observation, err := pg.Seal()
+	if err != nil {
+		t.Fatalf("Seal() = %v", err)
+	}
+	if observation.State != GroupOwned {
+		t.Fatalf("Seal() observation = %v, want pre-close owned state", observation.State)
+	}
+	if observation.Identity != "job object" {
+		t.Fatalf("Seal() identity = %q, want pre-close job identity", observation.Identity)
+	}
+	if got := pg.State(); got != GroupUnavailable {
+		t.Fatalf("State() after Seal = %v, want unavailable rather than false emptiness", got)
+	}
+	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Kill after Seal = %v, want os.ErrProcessDone", err)
 	}
 }
 
@@ -437,4 +636,11 @@ func windowsProcessRunning(pid int) bool {
 		return false
 	}
 	return code == stillActive
+}
+
+// pidHasExited lets the shared pidIsRunning helper tell an exited process from a
+// running one on Windows, where an open handle keeps the process object, and
+// therefore OpenProcess, alive after exit.
+func pidHasExited(pid int) bool {
+	return !windowsProcessRunning(pid)
 }

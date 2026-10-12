@@ -65,6 +65,9 @@ func (r *Runner) readOutput(p procInfo, stream string, input io.Reader, onLine f
 			if onLine != nil {
 				onLine(raw)
 			}
+			if p.capture != nil {
+				p.capture(stream, raw)
+			}
 			retained, total = retained[:0], 0
 		}
 		if err != nil && err != bufio.ErrBufferFull {
@@ -128,12 +131,10 @@ func (r *Runner) systemLog(level, code, message string) {
 // once per sink; files, agents, and the monitor observe the same identity.
 func (r *Runner) emit(p procInfo, entry ipc.LogEntry) {
 	entry.Process = p.name
-	if store := r.store.Load(); store != nil {
-		if st := store.get(p.name); st != nil {
-			st.mu.Lock()
-			entry.PID, entry.Generation = st.pid, st.generation
-			st.mu.Unlock()
-		}
+	if st := r.stateFor(p.name); st != nil {
+		st.mu.Lock()
+		entry.PID, entry.Generation = st.pid, st.generation
+		st.mu.Unlock()
 	}
 	if entry.State != nil {
 		entry.PID, entry.Generation = entry.State.PID, entry.State.Generation
@@ -145,6 +146,7 @@ func (r *Runner) emit(p procInfo, entry ipc.LogEntry) {
 	if r.Project != nil {
 		entry.RunID, entry.Session = r.Project.RunID, r.Project.Session
 	}
+	entry.AttemptID = r.AttemptID
 	entry.ID = fmt.Sprintf("%s:%d", entry.RunID, entry.Sequence)
 	data, err := json.Marshal(entry)
 	if err != nil {

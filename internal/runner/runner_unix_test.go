@@ -3,9 +3,13 @@
 package runner
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -101,11 +105,88 @@ func TestProcessGroup_WithdrawStopsSignalling(t *testing.T) {
 	}
 }
 
+func TestProcessGroup_SealClosesSignalAuthority(t *testing.T) {
+	pg, cmd := startTrackedGroup(t, helperCmd("sleep", "120s"))
+	if err := pg.Kill(); err != nil {
+		t.Fatalf("Kill before Seal = %v", err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("Wait() = nil after forced termination, want a killed-process result")
+	}
+
+	observation, err := pg.Seal()
+	if err != nil {
+		t.Fatalf("Seal() = %v", err)
+	}
+	if observation.State != GroupEmpty {
+		t.Fatalf("Seal() observed %v, want empty after termination", observation.State)
+	}
+	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Kill after Seal = %v, want os.ErrProcessDone", err)
+	}
+}
+
+func TestProcessGroup_SealPreservesSurvivorIdentity(t *testing.T) {
+	// Replace the shell with the helper so test cleanup owns the group leader
+	// itself; sealing withdraws group signaling, so a forked helper would escape
+	// leader-only cleanup.
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", "exec "+helperCmd("sleep", "120s"))
+	pg := newProcessGroup()
+	pg.Setup(cmd)
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start: %v", err)
+	}
+	if err := pg.Track(cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		cancel()
+		t.Fatalf("track: %v", err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill() // direct owned handle; never use the withdrawn PGID
+			_, _ = cmd.Process.Wait()
+			if pidIsRunning(pid) {
+				t.Errorf("seal fixture process %d still running after direct kill and wait", pid)
+			}
+		}
+		cancel()
+		_ = pg.Close()
+	})
+	wantIdentity := strconv.Itoa(cmd.Process.Pid)
+
+	observation, err := pg.Seal()
+	if err != nil {
+		t.Fatalf("Seal() = %v", err)
+	}
+	if observation.State != GroupOwned {
+		t.Fatalf("Seal() state = %v, want an unverified owned group", observation.State)
+	}
+	if observation.Identity != wantIdentity {
+		t.Fatalf("Seal() identity = %q, want preserved group ID %q", observation.Identity, wantIdentity)
+	}
+	if got := survivorsError(sealedGroupResult("survivor", observation)); got == nil || !strings.Contains(got.Error(), wantIdentity) {
+		t.Fatalf("survivor result = %v, want preserved group ID %s", got, wantIdentity)
+	}
+	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Kill after Seal = %v, want os.ErrProcessDone", err)
+	}
+}
+
+// pidHasExited is the Windows liveness refinement for pidIsRunning. On Unix the
+// /proc zombie check in pidIsTerminatedUnreaped already covers it.
+func pidHasExited(int) bool { return false }
+
 // TestObserveLeaderExit_SetupDoesNotBlockOnARunningCommand pins correction 1:
 // setup must return promptly for a long-running service, and must report that
 // the leader has not exited yet rather than waiting for it.
 func TestObserveLeaderExit_SetupDoesNotBlockOnARunningCommand(t *testing.T) {
-	_, cmd := startTrackedGroup(t, helperCmd("sleep", "120s"))
+	// Replace the shell with the helper so fixture cleanup owns and reaps the
+	// exact process being observed rather than orphaning a shell child.
+	_, cmd := startTrackedGroup(t, "exec "+helperCmd("sleep", "120s"))
 
 	done := make(chan struct{})
 	var obs exitObserver

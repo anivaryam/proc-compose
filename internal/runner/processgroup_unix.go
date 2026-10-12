@@ -70,6 +70,16 @@ func (pg *unixProcessGroup) Withdraw() {
 	pg.withdrawn = true
 }
 
+// Seal withdraws signal authority before observing and releasing the group.
+// Withdraw and every signal share mu, so the observation cannot race a signal
+// that was admitted before the seal.
+func (pg *unixProcessGroup) Seal() (SealObservation, error) {
+	pg.Withdraw()
+	state := pg.State()
+	observation := SealObservation{State: state, Identity: pg.Identify()}
+	return observation, pg.Close()
+}
+
 func (pg *unixProcessGroup) State() GroupState {
 	pg.mu.Lock()
 	pgid := pg.pgid

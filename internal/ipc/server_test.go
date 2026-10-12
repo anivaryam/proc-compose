@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -270,5 +271,41 @@ func TestClient_SendWithoutDeadlineIsUnchanged(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Send() never reached the reader")
+	}
+}
+
+// TestNewRunID_UniqueWhenTheClockDoesNotAdvance pins run-ID uniqueness within a
+// process. Every call reads the same wall-clock value, as two acquisitions in
+// one Windows clock tick do; formatting the clock alone gave both the same ID.
+func TestNewRunID_UniqueWhenTheClockDoesNotAdvance(t *testing.T) {
+	const now = int64(1_791_813_600_000_000_000)
+	const workers, perWorker = 8, 64
+	ids := make(chan string, workers*perWorker)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range perWorker {
+				ids <- newRunID(now)
+			}
+		}()
+	}
+	wg.Wait()
+	close(ids)
+	seen := make(map[string]bool, workers*perWorker)
+	prefix := strconv.Itoa(os.Getpid()) + "-"
+	for id := range ids {
+		if seen[id] {
+			t.Fatalf("duplicate run ID %q from a clock that did not advance", id)
+		}
+		seen[id] = true
+		nanos, err := strconv.ParseInt(strings.TrimPrefix(id, prefix), 10, 64)
+		if !strings.HasPrefix(id, prefix) || err != nil || nanos < now {
+			t.Fatalf("run ID %q is not %s<nanoseconds at or after the clock>", id, prefix)
+		}
+	}
+	if earlier := newRunID(now - 1); seen[earlier] {
+		t.Fatalf("clock moving backwards reused run ID %q", earlier)
 	}
 }

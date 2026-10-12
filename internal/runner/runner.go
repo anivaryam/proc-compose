@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -23,19 +24,26 @@ import (
 
 // Runner starts and manages all configured processes.
 type Runner struct {
-	Config        *config.Config
-	ConfigPath    string // absolute path to config file (used for reload)
-	Filter        []string
-	LogFile       io.Writer   // if non-nil, all output is also written here (no ANSI)
-	IPC           *ipc.Server // if non-nil, state + log events are broadcast to monitors
-	NoColor       bool        // disable ANSI color output (also set via NO_COLOR env var)
-	Verbose       bool        // enable verbose debug output
-	LogFormat     string      // output format: "text" (default) or "json"
-	HealthPort    int         // if > 0, HTTP server listens on this port for /health
-	Silent        bool        // suppress startup banner (daemon child sets this)
-	Output        io.Writer   // nil uses stdout; daemon children use their rotating output file
-	Journal       io.Writer   // canonical JSON-lines events, independently of human output
-	Project       *ipc.Project
+	Config     *config.Config
+	ConfigPath string // absolute path to config file (used for reload)
+	Filter     []string
+	LogFile    io.Writer   // if non-nil, all output is also written here (no ANSI)
+	IPC        *ipc.Server // if non-nil, state + log events are broadcast to monitors
+	NoColor    bool        // disable ANSI color output (also set via NO_COLOR env var)
+	Verbose    bool        // enable verbose debug output
+	LogFormat  string      // output format: "text" (default) or "json"
+	HealthPort int         // if > 0, HTTP server listens on this port for /health
+	Silent     bool        // suppress startup banner (daemon child sets this)
+	Output     io.Writer   // nil uses stdout; daemon children use their rotating output file
+	Journal    io.Writer   // canonical JSON-lines events, independently of human output
+	// CleanupHandoffTimeout opts into sealing groups and quiescing lifecycle
+	// workers after this independent shutdown budget. Zero preserves legacy Run
+	// behavior and waits for every lifecycle goroutine.
+	CleanupHandoffTimeout time.Duration
+	Project               *ipc.Project
+	// AttemptID stamps every journal event of this run with the owning
+	// verification attempt, so diagnosis can scope evidence to one attempt.
+	AttemptID     string
 	ResolveConfig func(*config.Config) (*config.Config, error)
 	logMu         sync.Mutex
 	sequence      uint64
@@ -59,11 +67,29 @@ type Runner struct {
 	// here is persisted, and nothing outlives the process.
 	groupsMu sync.Mutex
 	groups   map[string]ProcessGroup
+	// processGroupFactory defaults to the platform implementation. Tests can
+	// wrap the existing group to hold the start-to-track admission boundary.
+	processGroupFactory func() ProcessGroup
+	waitProcess         func(*exec.Cmd) error // optional controlled wait seam; defaults to cmd.Wait
+	reapStarted         func(*singleReap)     // optional test seam, called after a reap starts
+	reapersMu           sync.Mutex
+	reapers             []*trackedReap
+	checksMu            sync.Mutex
+	checks              map[string]*procState // one-shot checks run against this stack
+	// Check admission and quiescence for the current run, guarded by
+	// lifecycleMu. Checks are runner-owned like managed processes: Run cancels
+	// them when the stack stops and returns only after each has finished.
+	activeChecks int
+	checksClosed bool
+	checkWG      *sync.WaitGroup
+	checkCtx     context.Context // cancelled when the run stops admitting checks
+	checkHandoff <-chan struct{} // the run's cleanup handoff; nil without a handoff budget
 
 	// stopping is set once the run context is cancelled, so every process
 	// goroutine learns that shutdown is in progress and treats leftovers in
 	// its group as orphans to terminate rather than as backgrounded work.
 	stopping atomic.Bool
+	sealing  atomic.Bool // terminal cleanup has begun taking/sealing the group snapshot
 
 	// stopCancel cancels the run context. It is stored (rather than captured)
 	// because the shutdown request arrives on the IPC command goroutine.
@@ -72,11 +98,14 @@ type Runner struct {
 	stopped      chan struct{}
 	stopVerdict  chan error // buffered; carries the verdict to a waiting client
 	stopProblems []string
+	unresolved   []UnresolvedProcess
 
 	// stopAck keeps the daemon alive until an in-flight "shutdown" command has
 	// had its verdict written to the client. Run's exit seals and drains it.
-	stopAck     ackBarrier
-	lifecycleMu sync.Mutex // serializes restart admission with terminal-stack exit
+	stopAck              ackBarrier
+	lifecycleMu          sync.Mutex      // serializes launch/restart admission with shutdown
+	runCtx               context.Context // guarded by lifecycleMu; detects cancellation before watcher closes admission
+	admissionWatcherDone chan struct{}
 }
 
 // ackBarrier holds Run's exit until every in-flight shutdown command has
@@ -158,6 +187,11 @@ type procInfo struct {
 	name       string
 	proc       config.Process
 	colorIndex int
+	// argv, when set, is executed directly without shell parsing. Only one-shot
+	// checks use it; configured processes keep their shell-string semantics.
+	argv []string
+	// capture, when set, receives every complete output line with its stream.
+	capture func(stream, line string)
 }
 
 func (r *Runner) Run(ctx context.Context) (result error) {
@@ -186,7 +220,7 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 	store := newStateStore(procs)
 	r.store.Store(store)
 	if r.Project == nil {
-		r.Project = &ipc.Project{RunID: fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()), ConfigPath: r.ConfigPath}
+		r.Project = &ipc.Project{RunID: ipc.NewRunID(), ConfigPath: r.ConfigPath}
 	}
 	r.systemLog("info", "session.started", "session started")
 
@@ -203,6 +237,12 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 	}
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
+	// IPC commands are served until Run returns, not only until the run is
+	// cancelled: a client that asks during teardown, including a stop, must get
+	// the daemon's answer rather than the server's 30s timeout. Registered
+	// before endRun's defer, so it runs after endRun.
+	commandsCtx, stopCommands := context.WithCancel(context.Background())
+	defer stopCommands()
 	// The shutdown handle must exist before any command can be dispatched:
 	// handleCommands is the only caller of Shutdown, and a command that arrived
 	// first would otherwise see a half-initialised runner.
@@ -217,21 +257,39 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 		}
 	}()
 
+	var metricsDone chan struct{}
 	if r.IPC != nil {
 		for _, st := range store.snapshot() {
 			r.IPC.SetState(st)
 		}
-		go r.handleCommands(store)
-		go r.collectMetrics(runCtx, store, procs)
+		go r.handleCommands(commandsCtx, store)
+		metricsDone = make(chan struct{})
+		go func() {
+			defer close(metricsDone)
+			r.collectMetrics(runCtx, store, procs)
+		}()
 	}
 
+	handoff := make(chan struct{})
+	if r.CleanupHandoffTimeout <= 0 {
+		handoff = nil
+	}
+	checkCtx, cancelChecks := context.WithCancel(runCtx)
+	defer cancelChecks()
+	checkWG := &sync.WaitGroup{}
+	r.lifecycleMu.Lock()
+	r.checkCtx, r.checkHandoff, r.checkWG, r.checksClosed = checkCtx, handoff, checkWG, false
+	r.lifecycleMu.Unlock()
 	var wg sync.WaitGroup
 	for _, p := range procs {
 		wg.Add(1)
 		go func(p procInfo) {
 			defer wg.Done()
 			for {
-				result := r.runProcess(runCtx, p, maxName, store)
+				result := r.runProcess(runCtx, p, maxName, store, handoff)
+				if result.quiesced {
+					return
+				}
 				if result.failFast {
 					cancelRun()
 				}
@@ -240,12 +298,17 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 				st.mu.Lock()
 				st.active = len(st.restartCh) > 0 && runCtx.Err() == nil
 				st.mu.Unlock()
-				if r.IPC != nil && !store.anyActive() {
+				// A running check keeps the stack open: its owner ends the run
+				// explicitly, so the check is never sealed while still running.
+				if r.IPC != nil && !store.anyActive() && r.activeChecks == 0 {
 					r.stopping.Store(true)
 					cancelRun()
 				}
+				// That holds without IPC as well. Returning here would let the
+				// last worker finish, and finishing workers cancel running checks.
+				checkRunning := r.activeChecks > 0
 				r.lifecycleMu.Unlock()
-				if r.IPC == nil || p.proc.EffectiveMode() == config.ProcessModeTask || runCtx.Err() != nil {
+				if (r.IPC == nil && !checkRunning) || p.proc.EffectiveMode() == config.ProcessModeTask || runCtx.Err() != nil {
 					return
 				}
 				// A terminal service remains controllable while another process
@@ -267,13 +330,66 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 		}(p)
 	}
 
-	wg.Wait()
+	workersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		// Checks join the same quiescence: once no worker remains, refuse new
+		// checks, cancel running ones, and wait until each has finished its
+		// teardown and published its final state. Every Add happened under
+		// lifecycleMu before checksClosed, so this Wait cannot race an Add.
+		r.lifecycleMu.Lock()
+		r.checksClosed = true
+		r.lifecycleMu.Unlock()
+		cancelChecks()
+		checkWG.Wait()
+		close(workersDone)
+	}()
+	handedOff := false
+	if handoff == nil {
+		<-workersDone
+	} else {
+		select {
+		case <-workersDone:
+		case <-runCtx.Done():
+			timer := time.NewTimer(r.CleanupHandoffTimeout)
+			select {
+			case <-workersDone:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			case <-timer.C:
+				// Seal every group before releasing workers to the handoff path.
+				r.sweepGroups(runCtx)
+				close(handoff)
+				handedOff = true
+				<-workersDone // return only after every runner worker is quiescent
+			}
+		}
+	}
 
 	// Every per-process goroutine has returned, but that only proves each
 	// command's group *leader* exited. During shutdown, sweep whatever is still
 	// tracked so the daemon never exits — and never lets `stop` report success
 	// — while a managed process is still running.
-	r.sweepGroups(runCtx)
+	if !handedOff {
+		r.sweepGroups(runCtx)
+	}
+	r.reportPendingReaps()
+	// Stop and join runner-owned auxiliary workers before computing the final
+	// result, so none can mutate state or emit events after Run returns.
+	cancelRun()
+	r.lifecycleMu.Lock()
+	watcherDone := r.admissionWatcherDone
+	r.lifecycleMu.Unlock()
+	if watcherDone != nil {
+		<-watcherDone
+	}
+	if metricsDone != nil {
+		<-metricsDone
+	}
 
 	// ctx.Err() != nil means a signal triggered shutdown — not a failure.
 	var runErr error
@@ -300,7 +416,11 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 // Shutdown uses. It must run before the IPC command loop starts, so a
 // "shutdown" command can never observe a half-initialised runner.
 func (r *Runner) beginRun(runCtx context.Context, cancel context.CancelFunc) {
+	r.lifecycleMu.Lock()
 	r.stopping.Store(false)
+	r.sealing.Store(false)
+	r.runCtx = runCtx
+	r.lifecycleMu.Unlock()
 	r.stopMu.Lock()
 	r.stopCancel = cancel
 	r.stopped = make(chan struct{})
@@ -308,15 +428,38 @@ func (r *Runner) beginRun(runCtx context.Context, cancel context.CancelFunc) {
 	// client is waiting for it.
 	r.stopVerdict = make(chan error, 1)
 	r.stopProblems = nil
+	r.unresolved = nil
 	r.stopMu.Unlock()
 
 	// Mark shutdown as in progress the moment the run context is cancelled.
 	// A signal (Ctrl+C, `stop`) cancels the parent context directly, so this
 	// is the only place that observes it.
+	done := make(chan struct{})
+	r.lifecycleMu.Lock()
+	r.admissionWatcherDone = done
+	r.lifecycleMu.Unlock()
 	go func() {
+		defer close(done)
 		<-runCtx.Done()
-		r.stopping.Store(true)
+		r.closeAdmission()
 	}()
+}
+
+// closeAdmission prevents new process starts and replacement requests. A
+// launcher holds lifecycleMu from cmd.Start through group registration, so
+// after this transition every successfully started process is already visible
+// to cleanup.
+func (r *Runner) closeAdmission() {
+	r.lifecycleMu.Lock()
+	r.stopping.Store(true)
+	r.lifecycleMu.Unlock()
+}
+
+// launchAdmissionClosedLocked reports explicit shutdown or parent cancellation.
+// The caller must hold lifecycleMu; checking the context closes the small window
+// between cancellation and the watcher acquiring the lock.
+func (r *Runner) launchAdmissionClosedLocked() bool {
+	return r.stopping.Load() || (r.runCtx != nil && r.runCtx.Err() != nil)
 }
 
 // endRun publishes the shutdown verdict and unblocks anyone waiting on it.
@@ -388,8 +531,19 @@ func (r *Runner) resolve() []procInfo {
 // goroutines, replying via cmd.Reply so the IPC server can ack the client
 // with a real verdict. Every code path must reply (or send a default error
 // on unknown actions); otherwise the server's 30s wait timer fires.
-func (r *Runner) handleCommands(store *stateStore) {
-	for cmd := range r.IPC.Commands() {
+func (r *Runner) handleCommands(ctx context.Context, store *stateStore) {
+	commands := r.IPC.Commands()
+	for {
+		var cmd ipc.Command
+		select {
+		case <-ctx.Done():
+			return
+		case next, ok := <-commands:
+			if !ok {
+				return
+			}
+			cmd = next
+		}
 		var res ipc.CommandResult
 		// holdsBarrier is the single source of truth for acquire/release pairing
 		// here. Anything that acquires the barrier in one place and releases it
@@ -456,7 +610,13 @@ func (r *Runner) handleCommands(store *stateStore) {
 func (r *Runner) requestRestart(st *procState) ipc.CommandResult {
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
-	if r.stopping.Load() {
+	return r.requestRestartLocked(st)
+}
+
+// requestRestartLocked is requestRestart with lifecycleMu already held. Reload
+// uses it to make config replacement and restart admission one transition.
+func (r *Runner) requestRestartLocked(st *procState) ipc.CommandResult {
+	if r.launchAdmissionClosedLocked() {
 		return ipc.CommandResult{Status: "error", Message: "daemon is shutting down"}
 	}
 	st.mu.Lock()
@@ -583,7 +743,7 @@ func (r *Runner) serveHealth(ln net.Listener, store *stateStore) {
 		}
 	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 		// Always surface errors here — bind already succeeded so anything
 		// reaching this branch is a runtime serve failure (clients dropped,
 		// listener torn down) that operators want to see.

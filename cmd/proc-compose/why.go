@@ -9,6 +9,7 @@ import (
 	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/logs"
 	"github.com/anivaryam/proc-compose/internal/session"
+	"github.com/anivaryam/proc-compose/internal/verify"
 	"github.com/spf13/cobra"
 )
 
@@ -23,14 +24,36 @@ type explanation struct {
 
 func newWhyCommand(configFile *string) *cobra.Command {
 	var machine bool
+	var attempt string
 	command := &cobra.Command{
-		Use:          "why <process>",
-		Short:        "Explain observed process failures and dependency blockers",
-		Long:         "Explain observed process failures and dependency blockers using live state or retained journal evidence. JSON output is a bounded evidence packet, not an inferred business-level diagnosis. Run proc-compose agent-guide for the machine-readable workflow.",
-		Example:      "  proc-compose why api --json\n  proc-compose --session feature why worker",
-		Args:         cobra.ExactArgs(1),
+		Use:     "why <process> | why --attempt <id|latest> [process...]",
+		Short:   "Explain observed process failures and dependency blockers",
+		Long:    "Explain observed process failures and dependency blockers using live state or retained journal evidence. JSON output is a bounded evidence packet, not an inferred business-level diagnosis. Run proc-compose agent-guide for the machine-readable workflow.",
+		Example: "  proc-compose why api --json\n  proc-compose --session feature why worker\n  proc-compose why --attempt latest --json",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if attempt != "" {
+				return nil
+			}
+			return cobra.ExactArgs(1)(cmd, args)
+		},
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if attempt != "" {
+				_, hash, _, _, err := resolveConfigPaths(*configFile)
+				if err != nil {
+					return err
+				}
+				receipt, _, err := loadAttempt(hash, attempt)
+				if err != nil {
+					return err
+				}
+				diagnosis := verify.Diagnose(receipt, classifyAttempt(receipt, hash, true), args)
+				if machine {
+					return json.NewEncoder(cmd.OutOrStdout()).Encode(diagnosis)
+				}
+				printDiagnosis(cmd.OutOrStdout(), diagnosis)
+				return nil
+			}
 			_, hash, socket, pidPath, err := resolveLiveDaemonPaths(*configFile)
 			if err != nil {
 				return err
@@ -120,6 +143,7 @@ func newWhyCommand(configFile *string) *cobra.Command {
 		},
 	}
 	command.Flags().BoolVar(&machine, "json", false, "emit a bounded evidence packet for coding agents")
+	command.Flags().StringVar(&attempt, "attempt", "", "explain one verification attempt (receipt id or latest) using only its own events")
 	return command
 }
 
