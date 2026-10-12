@@ -73,7 +73,16 @@ type fixture struct {
 
 func newFixture(t *testing.T, body string) fixture {
 	t.Helper()
-	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	// The session socket lives in the runtime dir. t.TempDir embeds the test
+	// name, and on macOS that path exceeds the 104-byte socket limit, so verify
+	// would run without IPC there. A short directory keeps every platform on
+	// the same path; the IPC-less mode is covered by the runner's own tests.
+	runtimeDir, err := os.MkdirTemp("", "pc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(runtimeDir) })
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	dir := t.TempDir()
 	f := fixture{dir: dir, config: filepath.Join(dir, "proc-compose.yml"), pidFile: filepath.Join(dir, "api.pid")}
 	body = strings.ReplaceAll(body, "{{BIN}}", os.Args[0])

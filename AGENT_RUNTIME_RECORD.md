@@ -1332,6 +1332,43 @@ reviewed Linux scope.)
   - **macOS behavior is not verified locally** (no Mac here); it needs the
     next CI run.
 
+### 2026-10-13 — CI run on `e6ef735`: macOS IPC-less check cancellation
+
+- CI run 38308218236 on `e6ef735`: lint and vulncheck passed. On macOS every
+  package passed, including runner (48.6s) and cmd, which hung before, except
+  `TestRun_RequiredServiceExitDuringCheck` ("check failed overall failed").
+  Fail-fast then cancelled Linux and Windows.
+- **Cause, reproduced on Linux.**
+  - The verify fixture set `XDG_RUNTIME_DIR` to `t.TempDir()`. On the macOS
+    runner that path, plus the test name, plus `/pc-<hash>.sock`, exceeds the
+    104-byte `sun_path` limit.
+  - `ipc.Server.Listen` then fails (`bind: invalid argument`, confirmed with a
+    temporary probe on Linux past 108 bytes). `verify` continues with
+    `r.IPC = nil`.
+  - Without IPC, a terminal service's worker returned, and the last worker
+    finishing cancels running checks. The check was killed and reported as
+    `failed`. That breaks the runner's own invariant, "a running check keeps
+    the stack open", which was enforced only when IPC was present.
+  - Linux reproduction: the same test passes with `TMPDIR=/tmp/opencode` and
+    fails identically with a 64-character `TMPDIR`.
+- **Fix.**
+  - Runner: a worker stays alive while a check is running, with or without
+    IPC. When no check is running, IPC-less behavior is unchanged.
+  - Regression `TestRunCheck_ServiceFailureDoesNotCancelRunningCheckWithoutIPC`
+    extends `startCheckStack` into `startCheckStackWith`. Before the fix it
+    failed with a signal-killed check; after it, it passed ×3 on Linux with
+    `-race` and natively on Windows.
+  - The verify fixture now uses a short `os.MkdirTemp("", "pc")` runtime dir,
+    so macOS verify tests run with IPC as they do elsewhere. The IPC-less path
+    stays covered by the runner regression.
+- **Checks.**
+  - `GOOS={linux,windows,darwin,freebsd} go vet ./...` clean; darwin
+    amd64/arm64 runner and verify tests compile.
+  - Verify package passes under both the short and the 64-char `TMPDIR`.
+  - Native Windows: runner 128/0, verify 23/0.
+  - Full Linux `-race`: 16/16. Process scans on Linux and Windows: clean.
+  - macOS needs the next CI run.
+
 ## Recording future work
 
 For each implementation session or milestone update, append:

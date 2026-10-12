@@ -3018,7 +3018,14 @@ func helperArgv(args ...string) []string {
 
 func startCheckStack(t *testing.T) (*Runner, context.CancelFunc, func() error) {
 	t.Helper()
-	r := makeRunner(map[string]config.Process{"api": {Cmd: helperCmd("sleep", "60s"), Restart: "never"}})
+	return startCheckStackWith(t, config.Process{Cmd: helperCmd("sleep", "60s"), Restart: "never"})
+}
+
+// startCheckStackWith runs a one-service stack with no IPC server, as verify does
+// when its socket cannot be bound, and waits for the service to be ready.
+func startCheckStackWith(t *testing.T, api config.Process) (*Runner, context.CancelFunc, func() error) {
+	t.Helper()
+	r := makeRunner(map[string]config.Process{"api": api})
 	r.NoColor, r.Silent, r.Output = true, true, io.Discard
 	r.CleanupHandoffTimeout = 10 * time.Second
 	ctx, cancel := context.WithCancel(context.Background())
@@ -3064,6 +3071,61 @@ func TestRunCheck_DirectArgvAndOutputCapture(t *testing.T) {
 	cancel()
 	if err := wait(); err != nil {
 		t.Fatalf("stack cleanup after check = %v", err)
+	}
+}
+
+// TestRunCheck_ServiceFailureDoesNotCancelRunningCheckWithoutIPC pins that a
+// running check keeps the stack open with or without an IPC server. Without one,
+// the failed service's worker used to return, the last worker finishing cancelled
+// running checks, and verify reported a check it had killed as failed. macOS CI
+// hit this because the test socket path exceeded the platform limit, so verify
+// ran without IPC.
+func TestRunCheck_ServiceFailureDoesNotCancelRunningCheckWithoutIPC(t *testing.T) {
+	trigger := filepath.Join(t.TempDir(), "fail")
+	r, cancel, wait := startCheckStackWith(t, config.Process{Cmd: serviceHelperCmd("fail-after-file", trigger, "60s"), Restart: "never"})
+	if r.IPC != nil {
+		t.Fatal("fixture has an IPC server; the IPC-less path would not be exercised")
+	}
+	results := make(chan CheckResult, 1)
+	go func() {
+		results <- r.RunCheck(context.Background(), CheckSpec{Name: "verify:check", Argv: helperArgv("sleep", "1500ms"), Cleanup: 5 * time.Second})
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		r.lifecycleMu.Lock()
+		active := r.activeChecks
+		r.lifecycleMu.Unlock()
+		if active > 0 {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("check was never admitted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := os.WriteFile(trigger, []byte("fail"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.State == "failed" }, 10*time.Second) {
+		t.Fatalf("service never failed: %+v", snapshotOf(r, "api"))
+	}
+	select {
+	case result := <-results:
+		t.Fatalf("check ended before its own completion once the service failed: %+v", result)
+	default:
+	}
+	var result CheckResult
+	select {
+	case result = <-results:
+	case <-time.After(20 * time.Second):
+		t.Fatal("check did not finish")
+	}
+	if result.Err != nil || !result.Started || result.ExitCode == nil || *result.ExitCode != 0 {
+		t.Fatalf("check result after the service failed = %+v, want its own clean exit", result)
+	}
+	cancel()
+	if err := wait(); err != nil && err.Error() == "runner did not stop" {
+		t.Fatal(err)
 	}
 }
 

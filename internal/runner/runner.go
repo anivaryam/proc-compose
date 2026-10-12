@@ -298,8 +298,11 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 					r.stopping.Store(true)
 					cancelRun()
 				}
+				// That holds without IPC as well. Returning here would let the
+				// last worker finish, and finishing workers cancel running checks.
+				checkRunning := r.activeChecks > 0
 				r.lifecycleMu.Unlock()
-				if r.IPC == nil || p.proc.EffectiveMode() == config.ProcessModeTask || runCtx.Err() != nil {
+				if (r.IPC == nil && !checkRunning) || p.proc.EffectiveMode() == config.ProcessModeTask || runCtx.Err() != nil {
 					return
 				}
 				// A terminal service remains controllable while another process
