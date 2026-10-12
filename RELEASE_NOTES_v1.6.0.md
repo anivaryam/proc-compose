@@ -1,12 +1,8 @@
-# v1.5.3 — Verified runs and Windows containment
+# v1.6.0 — Verified runs and Windows containment
 
 This release adds the `verify` workflow and related agent-runtime commands, and
 fixes process containment on Windows. Existing configurations and default
 sessions remain supported.
-
-> Maintainer decision pending: these notes describe new CLI commands. Under
-> semantic versioning that is a minor release (v1.6.0), not a patch. v1.5.2
-> also shipped features as a patch; choose the version before tagging.
 
 ## New
 
@@ -48,9 +44,8 @@ sessions remain supported.
 
 - `verify` and the agent-runtime commands are first implementations; measured
   benefit for coding agents is not yet established.
-- CI verification is **pending**. Locally the fixes passed natively on Linux
-  (with the race detector) and on Windows (without it); macOS was only
-  cross-compiled. Replace this line with the CI run ID and job results of the
-  green release-candidate commit before publishing.
+- Released from a commit whose CI passed on native Linux, macOS, and Windows
+  runners (tests with the race detector), plus lint and vulncheck; see the
+  checks on pull request #1.
 - `stop --timeout` is still ignored on Windows, and Windows has no graceful
   signal phase.
