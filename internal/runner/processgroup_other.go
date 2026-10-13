@@ -5,7 +5,7 @@ package runner
 // groupMembers cannot enumerate process-group membership on this platform.
 //
 // proc-compose ships, tests and documents Linux, macOS and Windows only: the
-// README platform matrix, the release build matrix and the CI test matrix all
+// platform matrix in docs/platforms.md, the release build matrix and the CI test matrix all
 // cover exactly those three. Reaching this file means the tree was cross
 // compiled for a platform outside the support contract, so there is no released
 // behaviour to preserve here and the honest answer is that membership is

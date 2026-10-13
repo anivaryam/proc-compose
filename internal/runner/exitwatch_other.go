@@ -8,7 +8,7 @@ import "errors"
 // command leader's exit without reaping it.
 //
 // proc-compose ships, tests and documents Linux, macOS and Windows only: the
-// README platform matrix, the release build matrix and the CI test matrix cover
+// platform matrix in docs/platforms.md, the release build matrix and the CI test matrix cover
 // exactly those three. Nothing here is a released behaviour for another platform,
 // so the caller falls back to detecting exit by reaping — which is what
 // proc-compose has always done — rather than terminating process groups it cannot
@@ -19,7 +19,7 @@ var errObservationUnsupported = errors.New("exit observation without reaping is 
 // leader's exit without reaping it.
 //
 // proc-compose ships, tests and documents Linux, macOS and Windows only: the
-// README platform matrix, the release build matrix and the CI test matrix cover
+// platform matrix in docs/platforms.md, the release build matrix and the CI test matrix cover
 // exactly those three. Nothing here is a released behaviour for another
 // platform, so the caller falls back to detecting exit by reaping — which is
 // what proc-compose has always done — rather than terminating process groups it

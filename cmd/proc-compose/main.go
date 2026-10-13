@@ -144,7 +144,7 @@ has something to manage after tasks finish.
 
 merge: and tunnel patterns, restart policies, readiness probes, env
 auto-injection — see:
-  https://github.com/anivaryam/proc-compose#configuration`,
+  https://github.com/anivaryam/proc-compose/blob/main/docs/configuration.md`,
 		Example: `  proc-compose up                                # start all processes
   proc-compose up frontend backend               # start subset (deps auto-included)
   proc-compose up --dry-run                      # validate + list, do not start
@@ -424,7 +424,7 @@ Keys:
 NO_COLOR=1 disables colour output in the TUI as well as the runner.
 
 Screenshots and full key reference:
-  https://github.com/anivaryam/proc-compose#monitor-a-running-daemon`,
+  https://github.com/anivaryam/proc-compose/blob/main/docs/cli.md#monitor-a-running-daemon`,
 		Example:       "  proc-compose monitor           # open TUI\n  proc-compose monitor -f myapp.yml   # monitor specific config",
 		SilenceUsage:  true,
 		SilenceErrors: false,
@@ -557,7 +557,7 @@ with "up --survive --install --name <n>", then run daemon-reload.
 Linux with systemd user services only. The --name flag is required and
 must match the name passed to --install.
 
-See: https://github.com/anivaryam/proc-compose#auto-restart-on-reboot---survive`,
+See: https://github.com/anivaryam/proc-compose/blob/main/docs/cli.md#auto-restart-on-reboot---survive`,
 		Example:       "  proc-compose uninstall --name myapp",
 		SilenceUsage:  true,
 		SilenceErrors: false,
@@ -849,7 +849,7 @@ file's directory; otherwise it works in the current directory.
 --write refuses to overwrite an existing config unless --force is
 passed as well.
 
-See: https://github.com/anivaryam/proc-compose#bootstrap-a-working-setup`,
+See: https://github.com/anivaryam/proc-compose/blob/main/docs/cli.md#bootstrap-a-working-setup`,
 		Example: `  proc-compose bootstrap                  # show generated config without changing files
   proc-compose bootstrap --write          # create proc-compose.yml when missing
   proc-compose bootstrap --write --force  # overwrite existing config
@@ -904,7 +904,7 @@ gaps, restart loops, merge-port setup, and missing binaries.
 When -f is set, scans relative to that config file's directory.
 --write only creates proc-compose.yml when no config exists.
 
-See: https://github.com/anivaryam/proc-compose#diagnose-or-generate-config`,
+See: https://github.com/anivaryam/proc-compose/blob/main/docs/cli.md#diagnose-or-generate-config`,
 		Example: `  proc-compose doctor          # report detected services and config issues
   proc-compose doctor --write  # create proc-compose.yml when missing
   proc-compose doctor --json   # machine-readable report`,

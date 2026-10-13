@@ -426,11 +426,11 @@ func TestQuoteArg(t *testing.T) {
 	}
 }
 
-// TestDocumentedCommandsMatchTheNotice pins the README to the commands the
-// notice prints. They are maintained in separate files, so the agreement
+// TestDocumentedCommandsMatchTheNotice pins the installation guide to the
+// commands the notice prints. They are maintained in separate files, so the agreement
 // between them needs a test rather than a promise.
 func TestDocumentedCommandsMatchTheNotice(t *testing.T) {
-	readme := readReadme(t)
+	readme := readInstallGuide(t)
 
 	for _, want := range []string{
 		InstallScriptURL,
@@ -440,16 +440,16 @@ func TestDocumentedCommandsMatchTheNotice(t *testing.T) {
 		UpdateCommand,
 	} {
 		if !strings.Contains(readme, want) {
-			t.Errorf("README does not document %q, which the update notice prints", want)
+			t.Errorf("installation guide does not document %q, which the update notice prints", want)
 		}
 	}
 	if strings.Contains(readme, "PROC_COMPOSE_INSTALL_DIR=<dir> curl") {
-		t.Error("README sets PROC_COMPOSE_INSTALL_DIR for curl, not for the installer")
+		t.Error("installation guide sets PROC_COMPOSE_INSTALL_DIR for curl, not for the installer")
 	}
 	// The positive form is the real parity check: with the assignment after the
 	// pipe it is present, and flipping it back would make this fail.
 	if runtime.GOOS != "windows" && !strings.Contains(readme, "| PROC_COMPOSE_INSTALL_DIR=") {
-		t.Error("README does not show PROC_COMPOSE_INSTALL_DIR on the installer side of the pipe")
+		t.Error("installation guide does not show PROC_COMPOSE_INSTALL_DIR on the installer side of the pipe")
 	}
 }
 
@@ -521,11 +521,11 @@ func readRecord(t *testing.T, path string) string {
 	return string(data)
 }
 
-func readReadme(t *testing.T) string {
+func readInstallGuide(t *testing.T) string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "installation.md"))
 	if err != nil {
-		t.Fatalf("read README: %v", err)
+		t.Fatalf("read installation guide: %v", err)
 	}
 	return string(data)
 }

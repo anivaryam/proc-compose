@@ -23,7 +23,7 @@ import (
 	"github.com/anivaryam/proc-compose/internal/session"
 )
 
-// Policy defaults (unmeasured; see AGENT_RUNTIME_RECORD.md D4) and bounds.
+// Policy defaults (unmeasured) and bounds.
 const (
 	DefaultStartupTimeout = 120 * time.Second
 	DefaultCheckTimeout   = 10 * time.Minute
