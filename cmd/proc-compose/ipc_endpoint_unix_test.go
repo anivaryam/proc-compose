@@ -5,7 +5,9 @@ package main
 import (
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -34,4 +36,13 @@ func testTempDir(t *testing.T) string {
 func testEndpointForTest(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(testTempDir(t), "d.sock")
+}
+
+// startInOwnProcessGroup starts cmd as the leader of its own process group, the
+// way the runner launches a managed command, so a test can stand in for a
+// group a crashed daemon left behind. It reports false where that shape does
+// not exist.
+func startInOwnProcessGroup(cmd *exec.Cmd) (bool, error) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return true, cmd.Start()
 }

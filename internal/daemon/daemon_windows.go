@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -55,3 +56,10 @@ func procStartTime(pid int) (uint64, error) {
 	}
 	return uint64(creation.HighDateTime)<<32 | uint64(creation.LowDateTime), nil
 }
+
+// ProcStat is Linux-only.
+func ProcStat(int) (ProcInfo, error) { return ProcInfo{}, errors.ErrUnsupported }
+
+// HostIdentity has nothing to report on Windows, which records no process
+// groups.
+func HostIdentity() Host { return Host{} }

@@ -45,11 +45,16 @@ type Runner struct {
 	// verification attempt, so diagnosis can scope evidence to one attempt.
 	AttemptID     string
 	ResolveConfig func(*config.Config) (*config.Config, error)
-	logMu         sync.Mutex
-	sequence      uint64
-	maxName       int
-	logErr        error
-	lastStates    map[string]ipc.ProcState
+	RecordPath    string // daemon PID file that records launched process groups (Unix); empty disables recording
+	// TeardownDeadline, when set, returns a time the teardown phase must end
+	// by, earlier than its fixed budget would; verify passes its cleanup
+	// deadline minus the seal reserve.
+	TeardownDeadline func() time.Time
+	logMu            sync.Mutex
+	sequence         uint64
+	maxName          int
+	logErr           error
+	lastStates       map[string]ipc.ProcState
 
 	store atomic.Pointer[stateStore] // set during Run for command dispatch
 
@@ -63,10 +68,22 @@ type Runner struct {
 	// goroutine is still parked in cmd.Wait: a descendant that escapes the
 	// log pipe can keep a command alive long after its goroutine would
 	// otherwise return. Entries live only for the duration of one run
-	// iteration and are dropped as soon as the group is torn down — nothing
-	// here is persisted, and nothing outlives the process.
+	// iteration and are dropped as soon as the group is torn down. The map
+	// itself is not persisted; the on-disk record of launched groups is kept
+	// separately in records.
 	groupsMu sync.Mutex
 	groups   map[string]ProcessGroup
+	// records mirrors, in RecordPath, every launched group that has not been
+	// proven empty. It is a superset of the live groups: an entry is written
+	// before the command starts and leaves only once its group is proven
+	// empty, so a crash at any point leaves a record that covers whatever is
+	// still running. recordMu is separate from groupsMu so that the synced
+	// write never holds the registry lock. recordOn is false when RecordPath
+	// is empty, on Windows, after the run's initial record failed, or once
+	// the PID file has disappeared or come to name another daemon mid-run.
+	recordMu sync.Mutex
+	records  []*recEntry
+	recordOn bool
 	// processGroupFactory defaults to the platform implementation. Tests can
 	// wrap the existing group to hold the start-to-track admission boundary.
 	processGroupFactory func() ProcessGroup
@@ -99,6 +116,15 @@ type Runner struct {
 	stopVerdict  chan error // buffered; carries the verdict to a waiting client
 	stopProblems []string
 	unresolved   []UnresolvedProcess
+	// teardownResults is the teardown phase's outcome for the current run,
+	// one entry per teardown process in run order.
+	teardownResults []TeardownResult
+	// teardownOpen admits teardown launches during the teardown phase. It is
+	// guarded by lifecycleMu, like the admission it overrides.
+	teardownOpen bool
+	// teardownBudget replaces the fixed teardown budget when non-zero (test
+	// seam).
+	teardownBudget time.Duration
 
 	// stopAck keeps the daemon alive until an in-flight "shutdown" command has
 	// had its verdict written to the client. Run's exit seals and drains it.
@@ -183,6 +209,20 @@ func (r *Runner) getProc(name string) (config.Process, bool) {
 	return p, ok
 }
 
+// refreshProc loads the current definition of p, which a reload may have
+// replaced, for its next incarnation and records it in the state store, so the
+// store snapshot and broadcastState describe the same definition.
+func (r *Runner) refreshProc(p *procInfo) {
+	updated, ok := r.getProc(p.name)
+	if !ok {
+		return
+	}
+	p.proc = updated
+	if store := r.store.Load(); store != nil {
+		store.setProc(p.name, updated)
+	}
+}
+
 type procInfo struct {
 	name       string
 	proc       config.Process
@@ -192,6 +232,20 @@ type procInfo struct {
 	argv []string
 	// capture, when set, receives every complete output line with its stream.
 	capture func(stream, line string)
+	// teardown marks a mode: teardown process run by the teardown phase. Such
+	// a launch is admitted while teardownOpen although shutdown has closed
+	// admission, and the terminal sweep's sealing flag does not hand it off.
+	teardown bool
+	// quiet marks a runner-internal execution, a ready_when.cmd or
+	// health_when.cmd probe, that is not a managed process: emit drops every
+	// event for it (output, lifecycle, errors) and its state is never
+	// broadcast, so it stays out of the event stream, the IPC state cache and
+	// status. Its process group is still tracked, recorded and sealed, and an
+	// escape from it is still reported. It is recorded for crash recovery like
+	// any launch, because a probe group can outlive a crashed daemon; for a
+	// health_when.cmd that costs three PID-file writes per check (pending,
+	// tracked, dropped), at most three a second at the 1s interval floor.
+	quiet bool
 }
 
 func (r *Runner) Run(ctx context.Context) (result error) {
@@ -266,7 +320,7 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 		metricsDone = make(chan struct{})
 		go func() {
 			defer close(metricsDone)
-			r.collectMetrics(runCtx, store, procs)
+			r.collectMetrics(runCtx, store)
 		}()
 	}
 
@@ -317,9 +371,7 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 				case <-runCtx.Done():
 					return
 				case <-st.restartCh:
-					if updated, ok := r.getProc(p.name); ok {
-						p.proc = updated
-					}
+					r.refreshProc(&p)
 					st.resetReady()
 					st.mu.Lock()
 					st.restarts++
@@ -378,6 +430,9 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 		r.sweepGroups(runCtx)
 	}
 	r.reportPendingReaps()
+	// Teardown runs once every managed process is verified gone, while the
+	// session's leases and ports are still held.
+	r.runTeardown(handedOff, len(procs))
 	// Stop and join runner-owned auxiliary workers before computing the final
 	// result, so none can mutate state or emit events after Run returns.
 	cancelRun()
@@ -405,11 +460,12 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 	}
 	if stopErr := r.ShutdownResult(); stopErr != nil {
 		if runErr != nil {
-			return fmt.Errorf("%v; %w", runErr, stopErr)
+			runErr = fmt.Errorf("%v; %w", runErr, stopErr)
+		} else {
+			runErr = stopErr
 		}
-		return stopErr
 	}
-	return runErr
+	return errors.Join(runErr, r.TeardownError())
 }
 
 // beginRun publishes the cancellation handle and the completion channel that
@@ -429,6 +485,7 @@ func (r *Runner) beginRun(runCtx context.Context, cancel context.CancelFunc) {
 	r.stopVerdict = make(chan error, 1)
 	r.stopProblems = nil
 	r.unresolved = nil
+	r.teardownResults = nil
 	r.stopMu.Unlock()
 
 	// Mark shutdown as in progress the moment the run context is cancelled.
@@ -443,6 +500,7 @@ func (r *Runner) beginRun(runCtx context.Context, cancel context.CancelFunc) {
 		<-runCtx.Done()
 		r.closeAdmission()
 	}()
+	r.beginRecord()
 }
 
 // closeAdmission prevents new process starts and replacement requests. A
@@ -470,12 +528,15 @@ func (r *Runner) launchAdmissionClosedLocked() bool {
 // of anything that could not be terminated, so it must be on the wire before
 // main tears the IPC server down.
 func (r *Runner) endRun() {
-	verdict := r.ShutdownResult()
-	if verdict == nil {
+	termination := r.ShutdownResult()
+	if termination == nil {
 		r.systemLog("info", "shutdown.verified", "managed process cleanup verified")
 	} else {
-		r.systemLog("error", "shutdown.unverified", verdict.Error())
+		r.systemLog("error", "shutdown.unverified", termination.Error())
 	}
+	// The published verdict also carries teardown failures, each line marked
+	// with ipc.TeardownPrefix; termination alone stays in ShutdownResult.
+	verdict := errors.Join(termination, r.TeardownError())
 
 	// Publish first, drain second.
 	//
@@ -705,16 +766,19 @@ func (r *Runner) serveHealth(ln net.Listener, store *stateStore) {
 			Name     string `json:"name"`
 			State    string `json:"state"`
 			Restarts int    `json:"restarts"`
+			Health   string `json:"health,omitempty"`
 		}
 		status := make([]procStatus, 0, len(procs))
 		allHealthy := true
 		for _, p := range procs {
-			status = append(status, procStatus{Name: p.Name, State: p.State, Restarts: p.Restarts})
+			status = append(status, procStatus{Name: p.Name, State: p.State, Restarts: p.Restarts, Health: p.Health})
 			healthy := false
 			if p.Mode == config.ProcessModeTask {
 				healthy = p.State == "completed"
 			} else {
-				healthy = p.State == "running" || p.State == "restarting"
+				// A service whose health_when is failing is unhealthy even
+				// while it runs; /ready keeps reporting the startup latch.
+				healthy = (p.State == "running" || p.State == "restarting") && p.Health != "unhealthy"
 			}
 			if !healthy {
 				allHealthy = false
@@ -753,13 +817,9 @@ func (r *Runner) serveHealth(ln net.Listener, store *stateStore) {
 
 // collectMetrics periodically gathers CPU and memory metrics for all running
 // processes and broadcasts updated state to connected monitors.
-func (r *Runner) collectMetrics(ctx context.Context, store *stateStore, procs []procInfo) {
+func (r *Runner) collectMetrics(ctx context.Context, store *stateStore) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	procMap := make(map[string]procInfo, len(procs))
-	for _, p := range procs {
-		procMap[p.name] = p
-	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -767,7 +827,9 @@ func (r *Runner) collectMetrics(ctx context.Context, store *stateStore, procs []
 		case <-ticker.C:
 			running := store.updateMetrics()
 			for _, name := range running {
-				if p, ok := procMap[name]; ok {
+				// The store holds the definition of the running incarnation,
+				// not the one loaded at startup.
+				if p, ok := store.info(name); ok {
 					st := store.get(name)
 					if st != nil {
 						r.broadcastState(p, st)

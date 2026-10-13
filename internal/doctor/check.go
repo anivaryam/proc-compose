@@ -87,7 +87,9 @@ func checkExistingConfig(report *Report, root string) {
 	ports := map[int]string{}
 	for name, proc := range cfg.Processes {
 		port := processPort(proc)
-		if port == 0 {
+		// A teardown process runs after the stack stopped; a PORT in its env
+		// names a service to reach, not a port it binds.
+		if port == 0 || proc.Mode == config.ProcessModeTeardown {
 			continue
 		}
 		if other, ok := ports[port]; ok {

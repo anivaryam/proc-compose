@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -20,6 +21,8 @@ import (
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/paths"
+	"github.com/anivaryam/proc-compose/internal/runner"
+	"github.com/anivaryam/proc-compose/internal/session"
 	"github.com/anivaryam/proc-compose/internal/update"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -54,22 +57,20 @@ func validateUninstallPlatform(goos string) error {
 	return nil
 }
 
-// preflightCheck verifies no daemon is already running for this config and
-// that the ports required by the merge section are all available.
+// preflightCheck verifies no daemon is already running for this config, that
+// no crashed run left process groups that may still be running, and that the
+// ports required by the merge section are all available.
 // A clear, actionable error is returned if anything is wrong.
-func preflightCheck(pidPath, socketPath string, cfg *config.Config) error {
-	// Is a daemon already running for this config?
-	if alive, pid := daemon.IsAliveFromPIDFile(pidPath); alive {
-		return fmt.Errorf(
-			"proc-compose is already running for this config (PID %d)\n"+
-				"  stop it first:  proc-compose stop\n"+
-				"  or monitor it:  proc-compose monitor",
-			pid,
-		)
-	}
-	// Stale or missing PID file (crashed daemon, reused PID, never started) — clean up.
-	if _, err := os.Stat(pidPath); err == nil {
-		daemon.Cleanup(pidPath, socketPath)
+//
+// It runs without the session lease, as an early answer for the user, so it
+// changes nothing: stale state is removed only by acquireRun, under the lease.
+// Removing it here could delete the PID file of another `up` that took the
+// lease and wrote its file while this check ran.
+func preflightCheck(pidPath string, cfg *config.Config) error {
+	// A live daemon, or a crashed one whose recorded groups may still run,
+	// refuses the start.
+	if err := runner.CheckCrashedRun(pidPath); err != nil {
+		return err
 	}
 
 	if cfg.Merge == nil {
@@ -95,6 +96,23 @@ func preflightCheck(pidPath, socketPath string, cfg *config.Config) error {
 		return fmt.Errorf("%s", msg)
 	}
 	return nil
+}
+
+// acquireRun takes the session for `up` and then, under its instance lease,
+// runs the authoritative crashed-run check: a crashed run's record is never
+// overwritten while its groups may run, and stale state is removed. The check
+// lives here so that no caller can hold the plan without having passed it. On
+// refusal the plan is closed and the lease released.
+func acquireRun(cfg *config.Config, absConfig, hash, sessionName string, args []string, pidPath, socketPath string) (*session.Plan, error) {
+	plan, err := session.Acquire(cfg, absConfig, hash, sessionName, args)
+	if err != nil {
+		return nil, err
+	}
+	if err := runner.ResolveCrashedRun(pidPath, socketPath); err != nil {
+		plan.Close()
+		return nil, err
+	}
+	return plan, nil
 }
 
 type mergePortRole struct {
@@ -375,6 +393,10 @@ func stopDaemon(socketPath, pidPath string, pid int, proc *os.Process, force boo
 		// message rather than being buried in it.
 		if waitProcessGone(pid, remainingUntil(deadline, exitBudget)) {
 			daemon.Cleanup(pidPath, socketPath)
+			if teardownOnly(res.detail) {
+				return fmt.Errorf("stopped daemon (PID %d); termination was verified, but teardown did not pass:\n  %s",
+					pid, strings.ReplaceAll(res.detail, "\n", "\n  "))
+			}
 			return fmt.Errorf("stopped daemon (PID %d), but termination was NOT fully verified:\n  %s", pid, res.detail)
 		}
 		return fmt.Errorf("daemon (PID %d) is still running %s after reporting that termination was "+
@@ -388,6 +410,44 @@ func stopDaemon(socketPath, pidPath string, pid int, proc *os.Process, force boo
 				"         signalling the daemon directly — its managed processes are NOT verified.\n", res.detail)
 		return signalDaemonUnverified(pidPath, socketPath, pid, proc, force, deadline)
 	}
+}
+
+// teardownOnly reports whether every line of a shutdown verdict reports a
+// teardown process: the managed processes were verified terminated.
+func teardownOnly(detail string) bool {
+	if detail == "" {
+		return false
+	}
+	for _, line := range strings.Split(detail, "\n") {
+		if !strings.HasPrefix(line, ipc.TeardownPrefix) {
+			return false
+		}
+	}
+	return true
+}
+
+// stopBudget is the stop budget: timeout, plus the teardown budget when
+// timeout was not set explicitly and the session metadata at metaPath
+// declares teardown processes, which run after termination is verified.
+func stopBudget(metaPath string, timeout time.Duration, explicit bool) time.Duration {
+	if explicit {
+		return timeout
+	}
+	if project, err := session.Read(metaPath); err == nil && len(project.Teardown) > 0 {
+		return timeout + runner.TeardownBudget
+	}
+	return timeout
+}
+
+// teardownNotRun is the note a crash report carries when the session
+// declared teardown processes: the daemon died before it could run them. It
+// is empty when none was declared.
+func teardownNotRun(hash string) string {
+	project, err := session.Read(paths.Metadata(hash))
+	if err != nil || len(project.Teardown) == 0 {
+		return ""
+	}
+	return "teardown did not run: " + strings.Join(project.Teardown, ", ")
 }
 
 // requestShutdown asks the daemon to stop itself and waits, under deadline, for
@@ -454,6 +514,135 @@ func requestShutdown(socketPath string, force bool, deadline time.Time) stopResu
 				detail: fmt.Sprintf("daemon rejected the shutdown request: %s", ev.AckDetail)}
 		}
 	}
+}
+
+// stopDeadDaemon handles a PID file whose daemon is gone — it crashed or was
+// killed before it could run its shutdown. pid is 0 when the PID file could not
+// be parsed.
+//
+// On Unix the PID file records the process groups the daemon launched. Under
+// the session's instance lease, each recorded group is proven empty, proven
+// ours and terminated (Linux only), or reported unknown; see
+// runner.RecoverGroups. Success, which removes the PID file, needs every group
+// proven empty. Without a record (an older daemon, or recording disabled) or
+// with an unreadable file nothing can be proven, so this fails and keeps the
+// PID file. Force then clears a readable file without a record with a warning,
+// as before records existed; an unreadable file may have held a record, so
+// force clears it but still fails. With a record, force SIGKILLs proven groups
+// instead of waiting, and a group still unproven clears the state but fails
+// with the evidence.
+//
+// Windows is the exception: every managed tree runs in a kill-on-close Job
+// Object whose handle only the daemon held, so the kernel ended them with it.
+//
+// On every platform, a session that declared teardown processes is told they
+// did not run: a daemon that died never reached its teardown phase.
+func stopDeadDaemon(pidPath, socketPath, hash string, pid int, force bool, timeout time.Duration) error {
+	label := fmt.Sprintf("daemon (PID %d)", pid)
+	if pid == 0 {
+		label = "daemon (unreadable PID file)"
+	}
+	notRun := teardownNotRun(hash)
+	// withNote adds the teardown note to a crash verdict; a success prints it
+	// as a warning instead.
+	withNote := func(err error) error {
+		if notRun == "" {
+			return err
+		}
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", notRun)
+			return nil
+		}
+		return fmt.Errorf("%w\n  %s", err, notRun)
+	}
+	if runtime.GOOS == "windows" {
+		daemon.Cleanup(pidPath, socketPath)
+		fmt.Printf("%s is no longer running; its managed processes ended with its job objects\n", label)
+		return withNote(nil)
+	}
+	release, err := session.LeaseInstance(hash)
+	if err != nil {
+		var lease *session.LeaseError
+		if errors.As(err, &lease) {
+			return fmt.Errorf("another proc-compose command owns this session; nothing was signalled.\n" +
+				"  rerun stop once it has finished")
+		}
+		return fmt.Errorf("cannot take the session lease, so nothing was signalled: %w", err)
+	}
+	defer release()
+
+	// The PID file may have changed hands before the lease was taken.
+	if alive, livePID := daemon.IsAliveFromPIDFile(pidPath); alive {
+		return fmt.Errorf("a daemon (PID %d) is now running for this config; rerun stop", livePID)
+	}
+	rec, err := daemon.ReadRecord(pidPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("no running proc-compose found for this config (tried %s)", sanitizePath(pidPath))
+	}
+	if err != nil || rec.Groups == nil {
+		return withNote(stopUnrecordedDeadDaemon(pidPath, socketPath, label, force, err != nil))
+	}
+
+	mode := runner.RecoverGraceful
+	if force {
+		mode = runner.RecoverForce
+	}
+	results := runner.RecoverGroups(*rec.Groups, rec.Host, mode, time.Now().Add(timeout))
+	evidence := runner.FormatRecovery(results)
+	verified := true
+	for _, r := range results {
+		if r.Outcome != runner.OutcomeEmpty && r.Outcome != runner.OutcomeTerminated {
+			verified = false
+		}
+	}
+	if verified {
+		daemon.Cleanup(pidPath, socketPath)
+		if evidence != "" {
+			fmt.Println(evidence)
+		}
+		fmt.Printf("%s had exited without a shutdown verdict; every recorded process group is verified empty\n", label)
+		return withNote(nil)
+	}
+	if !force {
+		return withNote(fmt.Errorf("%s exited without a shutdown verdict, and some of its process groups are NOT verified\n"+
+			"  as terminated and may still be running:\n%s\n"+
+			"  inspect for leftovers: ps -eo pid,ppid,pgid,args\n"+
+			"  then clear the stale daemon state: proc-compose stop --force", label, indentLines(evidence)))
+	}
+	daemon.Cleanup(pidPath, socketPath)
+	return withNote(fmt.Errorf("%s exited without a shutdown verdict; cleared the stale daemon state, but some of its\n"+
+		"  process groups are NOT verified as terminated and may still be running:\n%s\n"+
+		"  inspect for leftovers: ps -eo pid,ppid,pgid,args", label, indentLines(evidence)))
+}
+
+// stopUnrecordedDeadDaemon is the crash path for a PID file that names no
+// process groups or cannot be read: nothing can be proven, so without force it
+// fails and keeps the file. Force clears the stale state; for a readable legacy
+// file it only warns, as before records existed, but an unreadable file may
+// have held a group record, so its groups are unknown and force still fails.
+func stopUnrecordedDeadDaemon(pidPath, socketPath, label string, force, unreadable bool) error {
+	if !force {
+		return fmt.Errorf("%s is no longer running and exited without a shutdown verdict;\n"+
+			"  its managed processes were NOT verified as terminated and may still be running.\n"+
+			"  inspect for leftovers: ps -eo pid,ppid,pgid,args\n"+
+			"  then clear the stale daemon state: proc-compose stop --force", label)
+	}
+	daemon.Cleanup(pidPath, socketPath)
+	if unreadable {
+		return fmt.Errorf("%s exited without a shutdown verdict; cleared the stale daemon state, but its\n"+
+			"  managed processes are NOT verified as terminated and may still be running.\n"+
+			"  inspect for leftovers: ps -eo pid,ppid,pgid,args", label)
+	}
+	fmt.Fprintf(os.Stderr,
+		"warning: %s exited without a shutdown verdict; its managed processes were NOT verified\n"+
+			"         as terminated. Cleared the stale daemon state.\n"+
+			"         inspect for leftovers: ps -eo pid,ppid,pgid,args\n", label)
+	return nil
+}
+
+// indentLines indents each line of s for inclusion in a multi-line message.
+func indentLines(s string) string {
+	return "    " + strings.ReplaceAll(s, "\n", "\n    ")
 }
 
 // signalDaemonUnverified is the compatibility fallback for daemons that cannot

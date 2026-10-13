@@ -43,8 +43,10 @@ See [Process modes](docs/configuration.md#process-modes).
 ## Ordered startup and readiness
 
 `depends_on` holds a process until its dependencies are ready. Readiness comes
-from an `http` (2xx response), `tcp` (connect succeeds), or `log` (regex match)
-probe, with a configurable `ready_timeout`.
+from an `http` (2xx response), `tcp` (connect succeeds), `cmd` (command exits
+0), or `log` (regex match) probe, with a configurable `ready_timeout`. After
+that, an optional `health_when` probe (`http`, `tcp`, or `cmd`) keeps checking
+the service and either reports it unhealthy or restarts it.
 
 ```yaml
 processes:
@@ -59,7 +61,8 @@ processes:
       http: http://localhost:3000/health
 ```
 
-See [Readiness probes](docs/configuration.md#readiness-probes).
+See [Readiness probes](docs/configuration.md#readiness-probes) and
+[Health checks](docs/configuration.md#health-checks).
 
 ## Restart policies
 

@@ -3,17 +3,26 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/daemon"
+	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
 // TestProcessGroup_LeaderExitKeepsSignallingAuthority is the ownership
@@ -561,4 +570,1512 @@ func TestSignallingEstablished_OwnershipLostRevokesAuthority(t *testing.T) {
 		t.Fatal("signallingEstablished(exitObserved, running) = false; a zombie leader still " +
 			"reserves its process-group ID")
 	}
+}
+
+// recordFixture writes a PID file for this test process, as `up` does before
+// Run, and returns its path for Runner.RecordPath.
+func recordFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pc-test.pid")
+	if err := daemon.WritePID(path, os.Getpid(), filepath.Join(dir, "pc-test.sock")); err != nil {
+		t.Fatalf("WritePID: %v", err)
+	}
+	return path
+}
+
+// recordedGroups returns the process-group record in the PID file; a missing
+// record fails the test, because nil means "nothing was recorded at all".
+func recordedGroups(t *testing.T, path string) []daemon.Group {
+	t.Helper()
+	rec, err := daemon.ReadRecord(path)
+	if err != nil {
+		t.Fatalf("ReadRecord: %v", err)
+	}
+	if rec.Groups == nil {
+		t.Fatalf("PID file %s has no process-group record", path)
+	}
+	return *rec.Groups
+}
+
+// leaderStartFor is what the record must hold for a live leader: its procfs
+// start time where the platform has one, 0 elsewhere.
+func leaderStartFor(pid int) uint64 {
+	info, err := daemon.ProcStat(pid)
+	if err != nil {
+		return 0
+	}
+	return info.StartTime
+}
+
+// TestGroupRecord_PendingBeforeStartThenTrackedThenDropped follows one launch
+// through the record: a pending entry exists before the command could have been
+// tracked, the tracked entry names the leader and its start time, and a group
+// proven empty at shutdown leaves the record.
+func TestGroupRecord_PendingBeforeStartThenTrackedThenDropped(t *testing.T) {
+	recordPath := recordFixture(t)
+	r := makeRunner(map[string]config.Process{"api": {
+		Cmd: serviceHelperCmd("sleep", "120s"), Restart: "never", ShutdownTimeout: shutdownGraceForTest,
+	}})
+	r.RecordPath = recordPath
+	group := &admissionGateProcessGroup{
+		ProcessGroup:     newProcessGroup(),
+		trackStarted:     make(chan struct{}),
+		trackRelease:     make(chan struct{}),
+		terminateStarted: make(chan struct{}),
+		terminateRelease: make(chan struct{}),
+		closed:           make(chan struct{}),
+	}
+	close(group.terminateRelease)
+	r.processGroupFactory = func() ProcessGroup { return group }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { _ = r.Run(ctx); close(runDone) }()
+	release := sync.OnceFunc(func() { close(group.trackRelease) })
+	t.Cleanup(func() {
+		release()
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	})
+
+	select {
+	case <-group.trackStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("launch never reached Track")
+	}
+	pid := group.pid
+	trackProcessForCleanup(t, pid, "api")
+	if got, want := recordedGroups(t, recordPath), []daemon.Group{{Name: "api"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("record after Start, before tracking = %+v, want pending %+v", got, want)
+	}
+
+	release()
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.State == "running" }, 10*time.Second) {
+		t.Fatal("api never reached running")
+	}
+	want := []daemon.Group{{Name: "api", PGID: pid, LeaderStart: leaderStartFor(pid)}}
+	if got := recordedGroups(t, recordPath); !reflect.DeepEqual(got, want) {
+		t.Fatalf("record while running = %+v, want %+v", got, want)
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("runner did not finish shutting down")
+	}
+	if got := recordedGroups(t, recordPath); len(got) != 0 {
+		t.Fatalf("record after a verified stop = %+v, want empty", got)
+	}
+	assertTerminated(t, pid, "api", 15*time.Second)
+}
+
+// TestGroupRecord_ProbeGroupRecorded pins that a quiet ready_when.cmd probe
+// is still a managed process for crash recovery: while an attempt runs, its
+// "<name>:probe" group is in the PID-file record with its leader, so a stop
+// after a daemon crash can find it, and it leaves the record once proven
+// empty at shutdown.
+func TestGroupRecord_ProbeGroupRecorded(t *testing.T) {
+	recordPath := recordFixture(t)
+	pidFile := filepath.Join(t.TempDir(), "probe.pid")
+	r := makeRunner(map[string]config.Process{"worker": {
+		Cmd:             serviceHelperCmd("sleep", "120s"),
+		ReadyTimeout:    -1,
+		ReadyWhen:       &config.ReadyWhen{Cmd: serviceHelperCmd("pid-block", pidFile)},
+		ShutdownTimeout: shutdownGraceForTest,
+	}})
+	r.RecordPath = recordPath
+	r.Output = io.Discard
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- r.Run(ctx) }()
+	stopped := false
+	t.Cleanup(func() {
+		if stopped {
+			return
+		}
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(30 * time.Second):
+			t.Error("runner did not stop")
+		}
+	})
+
+	pid, ok := waitForPIDFile(t, pidFile, 10*time.Second)
+	if !ok {
+		t.Fatal("probe never started")
+	}
+	trackProcessForCleanup(t, pid, "probe")
+	want := daemon.Group{Name: "worker:probe", PGID: pid, LeaderStart: leaderStartFor(pid)}
+	var got []daemon.Group
+	found := false
+	for deadline := time.Now().Add(5 * time.Second); !found && time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		got = recordedGroups(t, recordPath)
+		for _, g := range got {
+			if g == want {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("record while the probe runs = %+v, want it to include %+v", got, want)
+	}
+
+	cancel()
+	stopped = true
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("runner did not finish shutting down")
+	}
+	if got := recordedGroups(t, recordPath); len(got) != 0 {
+		t.Fatalf("record after a verified stop = %+v, want empty", got)
+	}
+	assertTerminated(t, pid, "probe", 15*time.Second)
+}
+
+// stuckOwnedProcessGroup models a group whose member survives every signal:
+// the real group is used for setup, tracking and signals, but it always reports
+// a live member.
+type stuckOwnedProcessGroup struct{ ProcessGroup }
+
+func (g *stuckOwnedProcessGroup) State() GroupState { return GroupOwned }
+func (g *stuckOwnedProcessGroup) Seal() (SealObservation, error) {
+	observation, err := g.ProcessGroup.Seal()
+	observation.State = GroupOwned
+	return observation, err
+}
+
+// TestGroupRecord_SurvivorStaysRecorded: a group that could not be proven empty
+// keeps its entry after the run, so a later stop still knows about it.
+func TestGroupRecord_SurvivorStaysRecorded(t *testing.T) {
+	recordPath := recordFixture(t)
+	r := makeRunner(map[string]config.Process{"wedged": {
+		Cmd: serviceHelperCmd("exit", "0"), Restart: "never", ShutdownTimeout: shutdownGraceForTest,
+	}})
+	r.RecordPath = recordPath
+	r.processGroupFactory = func() ProcessGroup { return &stuckOwnedProcessGroup{ProcessGroup: newProcessGroup()} }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- r.Run(ctx) }()
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		cancel()
+		<-runDone
+		t.Fatal("run with a survivor did not finish")
+	}
+	pid := snapshotOf(r, "wedged").PID
+	if pid <= 0 {
+		t.Fatal("wedged never started")
+	}
+	got := recordedGroups(t, recordPath)
+	if len(got) != 1 || got[0].Name != "wedged" || got[0].PGID != pid {
+		t.Fatalf("record after an unverified teardown = %+v, want the wedged group (pgid %d) kept", got, pid)
+	}
+}
+
+// TestGroupRecord_PopulatedPreviousIncarnationKept: a restart drops the
+// previous incarnation's entry only when that group is proven empty; a
+// populated one stays, so two entries can share a name.
+func TestGroupRecord_PopulatedPreviousIncarnationKept(t *testing.T) {
+	recordPath := recordFixture(t)
+	r := &Runner{RecordPath: recordPath}
+	r.beginRecord()
+
+	launch := func(pg ProcessGroup, pid int) {
+		t.Helper()
+		entry, err := r.recordPending("web", pg)
+		if err != nil {
+			t.Fatalf("recordPending: %v", err)
+		}
+		r.recordTracked(entry, pid)
+		r.trackGroup("web", pg, 0)
+	}
+	populated := &unstoppableProcessGroup{}
+	launch(populated, 41234)
+	launch(newProcessGroup(), 41235)
+	got := recordedGroups(t, recordPath)
+	if len(got) != 2 || got[0].PGID != 41234 || got[1].PGID != 41235 || got[0].Name != "web" || got[1].Name != "web" {
+		t.Fatalf("record after restarting over a populated group = %+v, want both web entries", got)
+	}
+
+	// The second incarnation's group is empty (never established), so the next
+	// restart drops it and keeps the populated one.
+	launch(newProcessGroup(), 41236)
+	got = recordedGroups(t, recordPath)
+	if len(got) != 2 || got[0].PGID != 41234 || got[1].PGID != 41236 {
+		t.Fatalf("record after restarting over an empty group = %+v, want pgids 41234 and 41236", got)
+	}
+}
+
+// TestGroupRecord_PendingWriteFailureRefusesLaunch: when the pending entry
+// cannot be persisted, the command is never started.
+func TestGroupRecord_PendingWriteFailureRefusesLaunch(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	recordPath := recordFixture(t)
+	recordDir := filepath.Dir(recordPath)
+	fixtures := t.TempDir()
+	stubborn := writeScript(t, fixtures, "stubborn.sh", stubbornScript)
+	commandPID := filepath.Join(fixtures, "command.pid")
+	t.Cleanup(func() { _ = os.Chmod(recordDir, 0o700) })
+
+	r := makeRunner(map[string]config.Process{"api": {Cmd: stubborn + " " + commandPID, Restart: "never"}})
+	r.RecordPath = recordPath
+	r.processGroupFactory = func() ProcessGroup {
+		// The run has already written its empty record (W1); the directory
+		// becomes unwritable before this launch's pending entry.
+		if err := os.Chmod(recordDir, 0o500); err != nil {
+			t.Errorf("chmod: %v", err)
+		}
+		return newProcessGroup()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- r.Run(ctx) }()
+	var err error
+	select {
+	case err = <-runErr:
+	case <-time.After(15 * time.Second):
+	}
+	// Checked first so a launch that wrongly happened is always cleaned up.
+	if pid, ok := waitForPIDFile(t, commandPID, 200*time.Millisecond); ok {
+		trackProcessForCleanup(t, pid, "unrecorded command")
+		t.Fatalf("command started (PID %d) although its record could not be written", pid)
+	}
+	if err == nil {
+		t.Fatal("Run did not fail although the launch could not be recorded")
+	}
+	state := snapshotOf(r, "api")
+	if state.State != "failed" || !strings.Contains(state.LastError, "record") {
+		t.Fatalf("api = %+v, want failed with a record error", state)
+	}
+	if got := recordedGroups(t, recordPath); len(got) != 0 {
+		t.Fatalf("record = %+v, want the run's empty record unchanged", got)
+	}
+}
+
+// TestGroupRecord_UnrecordableHealthCheckIsNotAFailure: a health_when.cmd
+// check that the supervisor refuses to launch, because its pending entry
+// cannot be persisted, is not a health verdict. With health_action: restart
+// it must not mark the service unhealthy and kill it through the restart
+// policy; the refusal is logged once as a skipped check instead, and the
+// verdict reads unknown until checks run again.
+func TestGroupRecord_UnrecordableHealthCheckIsNotAFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	recordPath := recordFixture(t)
+	recordDir := filepath.Dir(recordPath)
+	t.Cleanup(func() { _ = os.Chmod(recordDir, 0o700) })
+	r := makeRunner(map[string]config.Process{"api": {
+		Cmd:             serviceHelperCmd("sleep", "120s"),
+		HealthWhen:      &config.ReadyWhen{Cmd: "exit 0"},
+		HealthInterval:  1,
+		HealthAction:    config.HealthActionRestart,
+		Restart:         "on-failure",
+		MaxRestarts:     1,
+		ShutdownTimeout: shutdownGraceForTest,
+	}})
+	r.RecordPath = recordPath
+	var journal bytes.Buffer
+	r.Output, r.Journal = io.Discard, &journal
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- r.Run(ctx) }()
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancel()
+			select {
+			case <-runDone:
+			case <-time.After(15 * time.Second):
+				t.Error("runner did not stop")
+			}
+		})
+	}
+	t.Cleanup(stop)
+
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Health == "healthy" && s.PID > 0 }, 10*time.Second) {
+		t.Fatalf("api never became healthy: %+v", snapshotOf(r, "api"))
+	}
+	before := snapshotOf(r, "api")
+	trackProcessForCleanup(t, before.PID, "api")
+	if err := os.Chmod(recordDir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	// Well past healthThreshold refused checks at a 1s interval.
+	time.Sleep(time.Duration(healthThreshold+2) * time.Second)
+	after := snapshotOf(r, "api")
+	if err := os.Chmod(recordDir, 0o700); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	// No check backs the earlier verdict any more, so it is unknown, with the
+	// launch error as health_error; the incarnation itself is untouched.
+	if after.State != "running" || after.PID != before.PID || after.Restarts != 0 || after.Health != "unknown" || !strings.Contains(after.HealthError, "health check not run") {
+		t.Fatalf("api after refused health checks = %+v, want the same incarnation with an unknown verdict (was %+v)", after, before)
+	}
+	// The verdict comes back once checks run again.
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Health == "healthy" && s.HealthError == "" }, 10*time.Second) {
+		t.Fatalf("api never became healthy again: %+v", snapshotOf(r, "api"))
+	}
+	stop()
+
+	skipped := 0
+	for _, event := range journalEvents(t, &journal) {
+		switch event.Code {
+		case "health.check_failed", "health.unhealthy":
+			t.Fatalf("a refused health check was counted as a failure: %+v", event)
+		case "health.check_skipped":
+			skipped++
+			if event.Level != "warn" || !strings.Contains(event.Line, "record process group") {
+				t.Fatalf("health.check_skipped = %+v, want a warn naming the record error", event)
+			}
+		}
+	}
+	if skipped != 1 {
+		t.Fatalf("health.check_skipped events = %d, want one for the repeated refusal", skipped)
+	}
+}
+
+// TestGroupRecord_UnrecordableRunStillLaunches: when the run's initial record
+// cannot be written (no PID file), recording is disabled for the run and
+// launches proceed; nothing is created in its place.
+func TestGroupRecord_UnrecordableRunStillLaunches(t *testing.T) {
+	recordPath := filepath.Join(t.TempDir(), "missing.pid")
+	r := makeRunner(map[string]config.Process{"api": {
+		Cmd: serviceHelperCmd("sleep", "120s"), Restart: "never", ShutdownTimeout: shutdownGraceForTest,
+	}})
+	r.RecordPath = recordPath
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- r.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	})
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.State == "running" && s.PID > 0 }, 10*time.Second) {
+		t.Fatalf("api did not launch with recording disabled: %+v", snapshotOf(r, "api"))
+	}
+	trackProcessForCleanup(t, snapshotOf(r, "api").PID, "api")
+	if _, err := os.Stat(recordPath); !os.IsNotExist(err) {
+		t.Fatalf("a disabled record created %s: %v", recordPath, err)
+	}
+}
+
+// TestGroupRecord_PIDFileRemovedMidRunStillLaunches: a PID file that
+// disappears after the run's initial record (a removed runtime or temp
+// directory) disables recording instead of refusing every later launch, and
+// nothing is recreated in its place. A PID file that another daemon has
+// recreated in the meantime (after `$XDG_RUNTIME_DIR` was removed at logout)
+// disables recording the same way and is left exactly as that daemon wrote it.
+func TestGroupRecord_PIDFileRemovedMidRunStillLaunches(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		replaced bool
+	}{
+		{name: "removed"},
+		{name: "replaced by another daemon", replaced: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recordPath := recordFixture(t)
+			otherPID := os.Getppid() // a live pid that is not this process
+			r := makeRunner(map[string]config.Process{"api": {
+				Cmd: serviceHelperCmd("sleep", "120s"), Restart: "never", ShutdownTimeout: shutdownGraceForTest,
+			}})
+			r.RecordPath = recordPath
+			var mutate sync.Once
+			r.processGroupFactory = func() ProcessGroup {
+				// The run has already written its empty record (W1); the PID
+				// file is lost before this launch's pending entry.
+				mutate.Do(func() {
+					if err := os.Remove(recordPath); err != nil && !os.IsNotExist(err) {
+						t.Errorf("remove PID file: %v", err)
+					}
+					if tc.replaced {
+						if err := daemon.WritePID(recordPath, otherPID, recordPath+".other.sock"); err != nil {
+							t.Errorf("recreate PID file: %v", err)
+						}
+					}
+				})
+				return newProcessGroup()
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			runDone := make(chan error, 1)
+			go func() { runDone <- r.Run(ctx) }()
+			var stopOnce sync.Once
+			stop := func() {
+				stopOnce.Do(func() {
+					cancel()
+					select {
+					case <-runDone:
+					case <-time.After(15 * time.Second):
+						t.Error("runner did not stop")
+					}
+				})
+			}
+			t.Cleanup(stop)
+			if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.State == "running" && s.PID > 0 }, 10*time.Second) {
+				t.Fatalf("api launch was refused after the PID file was lost: %+v", snapshotOf(r, "api"))
+			}
+			trackProcessForCleanup(t, snapshotOf(r, "api").PID, "api")
+			r.recordMu.Lock()
+			on := r.recordOn
+			r.recordMu.Unlock()
+			if on {
+				t.Fatal("recording still enabled after the PID file was lost")
+			}
+			if !tc.replaced {
+				if _, err := os.Stat(recordPath); !os.IsNotExist(err) {
+					t.Fatalf("a lost record recreated %s: %v", recordPath, err)
+				}
+				return
+			}
+			rec, err := daemon.ReadRecord(recordPath)
+			if err != nil {
+				t.Fatalf("ReadRecord: %v", err)
+			}
+			if rec.PID != otherPID || rec.Groups != nil {
+				t.Fatalf("other daemon's PID file = %+v, want pid %d and no groups written over it", rec, otherPID)
+			}
+			other, err := os.ReadFile(recordPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Shutdown drops the api entry (W7/W9); that write must not land either.
+			stop()
+			after, err := os.ReadFile(recordPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(other) {
+				t.Fatalf("shutdown rewrote the other daemon's PID file:\nbefore %s\nafter  %s", other, after)
+			}
+		})
+	}
+}
+
+// ownedAfterFailedTrack fails Track and then, like a group with a member that
+// outlived the leader's kill, reports itself still owned when sealed.
+type ownedAfterFailedTrack struct{ *failedTrackProcessGroup }
+
+func (g ownedAfterFailedTrack) Seal() (SealObservation, error) {
+	observation, err := g.failedTrackProcessGroup.Seal()
+	observation.State = GroupOwned
+	return observation, err
+}
+
+// TestGroupRecord_FailedTrackDropsOnlyProvenEmpty (W4): when Track fails after
+// Start, the pending entry leaves the record only if Seal proves the group
+// empty; an owned group keeps it.
+func TestGroupRecord_FailedTrackDropsOnlyProvenEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		owned bool
+		want  []daemon.Group
+	}{
+		{name: "empty group dropped", owned: false, want: []daemon.Group{}},
+		{name: "owned group kept", owned: true, want: []daemon.Group{{Name: "api"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recordPath := recordFixture(t)
+			r := makeRunner(map[string]config.Process{"api": {Cmd: serviceHelperCmd("sleep", "120s"), Restart: "never"}})
+			r.RecordPath = recordPath
+			group := &failedTrackProcessGroup{ProcessGroup: newProcessGroup(), sealed: make(chan struct{})}
+			if tc.owned {
+				r.processGroupFactory = func() ProcessGroup { return ownedAfterFailedTrack{group} }
+			} else {
+				r.processGroupFactory = func() ProcessGroup { return group }
+			}
+			runDone := make(chan error, 1)
+			go func() { runDone <- r.Run(context.Background()) }()
+			var runErr error
+			select {
+			case runErr = <-runDone:
+			case <-time.After(15 * time.Second):
+				if group.cmd != nil && group.cmd.Process != nil {
+					_ = group.cmd.Process.Kill()
+				}
+				<-runDone
+				t.Fatal("Run did not finish after Track failure")
+			}
+			if group.cmd == nil || group.cmd.Process == nil {
+				t.Fatal("Track failure did not observe the started process")
+			}
+			// exec kills and reaps the started process before Run returns.
+			if pidIsRunning(group.cmd.Process.Pid) {
+				_ = group.cmd.Process.Kill()
+				t.Fatalf("failed-Track process %d survived Run", group.cmd.Process.Pid)
+			}
+			if runErr == nil {
+				t.Fatal("Run succeeded although Track failed")
+			}
+			if got := recordedGroups(t, recordPath); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("record after failed Track = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGroupRecord_SweepKeepsUnprovenGroups (W9): the shutdown sweep drops the
+// entry of a group it proves empty and keeps the entry of one it cannot.
+func TestGroupRecord_SweepKeepsUnprovenGroups(t *testing.T) {
+	recordPath := recordFixture(t)
+	r := &Runner{RecordPath: recordPath}
+	r.beginRecord()
+	launch := func(name string, pg ProcessGroup, pid int) {
+		t.Helper()
+		entry, err := r.recordPending(name, pg)
+		if err != nil {
+			t.Fatalf("recordPending: %v", err)
+		}
+		r.recordTracked(entry, pid)
+		r.trackGroup(name, pg, 0)
+	}
+	launch("wedged", &unstoppableProcessGroup{}, 41234)
+	launch("done", newProcessGroup(), 41235)
+	if got := recordedGroups(t, recordPath); len(got) != 2 {
+		t.Fatalf("record before the sweep = %+v, want both groups", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.sweepGroups(ctx)
+	got := recordedGroups(t, recordPath)
+	if len(got) != 1 || got[0].Name != "wedged" || got[0].PGID != 41234 {
+		t.Fatalf("record after the sweep = %+v, want only the unproven wedged group", got)
+	}
+}
+
+// ── crash recovery ───────────────────────────────────────────────────────────
+
+// requireLinuxRecovery skips tests of signalling recovery, which only Linux
+// performs: it needs procfs start times and pidfds.
+func requireLinuxRecovery(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("crash recovery signals only on Linux; elsewhere it reports empty or unknown")
+	}
+}
+
+// startRecoveryGroup starts argv as the leader of its own process group, the
+// way the runner launches a command, and returns it with the group record a
+// crashed daemon would have left: the leader's pid as pgid and its start time.
+// Cleanup kills that exact leader and reaps it; members are the caller's to
+// register.
+func startRecoveryGroup(t *testing.T, name string, argv ...string) (*exec.Cmd, daemon.Group) {
+	t.Helper()
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start %v: %v", argv, err)
+	}
+	reaped := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(reaped) }()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		<-reaped
+	})
+	return cmd, daemon.Group{Name: name, PGID: cmd.Process.Pid, LeaderStart: leaderStartFor(cmd.Process.Pid)}
+}
+
+// recordSignals replaces the pidfd signal seam with one that delivers only the
+// null signal and records every other signal instead of sending it, so a test
+// can prove a refusal without risking a real signal reaching the wrong process.
+func recordSignals(t *testing.T) *[]syscall.Signal {
+	t.Helper()
+	var (
+		mu   sync.Mutex
+		sent []syscall.Signal
+	)
+	restore := pidfdSend
+	pidfdSend = func(fd int, sig syscall.Signal) error {
+		if sig == 0 {
+			return restore(fd, sig)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		sent = append(sent, sig)
+		return nil
+	}
+	t.Cleanup(func() { pidfdSend = restore })
+	return &sent
+}
+
+// recordProbes wraps the group existence probe and records every pid it is
+// asked about, so a test can prove no probe ever named pid 0 or -1 (this
+// process's group and every process it may signal).
+func recordProbes(t *testing.T) *[]int {
+	t.Helper()
+	var (
+		mu   sync.Mutex
+		pids []int
+	)
+	restore := groupKill
+	groupKill = func(pid int, sig syscall.Signal) error {
+		mu.Lock()
+		pids = append(pids, pid)
+		mu.Unlock()
+		return restore(pid, sig)
+	}
+	t.Cleanup(func() { groupKill = restore })
+	return &pids
+}
+
+func assertSingleRecovery(t *testing.T, got []RecoveredGroup, outcome, reason string) RecoveredGroup {
+	t.Helper()
+	if len(got) != 1 {
+		t.Fatalf("RecoverGroups returned %d results, want 1: %+v", len(got), got)
+	}
+	if got[0].Outcome != outcome || got[0].Reason != reason {
+		t.Fatalf("RecoverGroups = outcome %q reason %q, want %q %q (%+v)",
+			got[0].Outcome, got[0].Reason, outcome, reason, got[0])
+	}
+	return got[0]
+}
+
+func assertStillRunning(t *testing.T, pid int, what string) {
+	t.Helper()
+	if !pidIsRunning(pid) {
+		t.Fatalf("%s (PID %d) is no longer running; recovery signalled a process it had not proven", what, pid)
+	}
+}
+
+// TestRecoverGroups_TerminatesProvenGroup is the S3 headline: a group whose
+// leader is alive with the recorded start time is proven ours, and a graceful
+// recovery ends every member with SIGTERM alone.
+func TestRecoverGroups_TerminatesProvenGroup(t *testing.T) {
+	requireLinuxRecovery(t)
+	memberFile := filepath.Join(t.TempDir(), "member.pid")
+	_, g := startRecoveryGroup(t, "web", "sh", "-c", `sleep 60 & echo $! > "$1"; wait`, "sh", memberFile)
+	member, ok := waitForPIDFile(t, memberFile, 10*time.Second)
+	if !ok {
+		t.Fatal("member never recorded its PID")
+	}
+	trackProcessForCleanup(t, member, "member")
+
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverGraceful, time.Now().Add(10*time.Second))
+	r := assertSingleRecovery(t, got, OutcomeTerminated, "leader_proven")
+	if !reflect.DeepEqual(r.Signals, []string{"SIGTERM"}) {
+		t.Fatalf("Signals = %v, want [SIGTERM]", r.Signals)
+	}
+	if r.Name != "web" || r.PGID != g.PGID || r.LeaderStart != g.LeaderStart {
+		t.Fatalf("result identity = %+v, want the record %+v", r, g)
+	}
+	if !containsPID(r.PIDs, g.PGID) || !containsPID(r.PIDs, member) {
+		t.Fatalf("PIDs = %v, want leader %d and member %d", r.PIDs, g.PGID, member)
+	}
+	assertTerminated(t, member, "proven member", 5*time.Second)
+	assertTerminated(t, g.PGID, "proven leader", 5*time.Second)
+}
+
+// TestRecoverGroups_ForceKillsWithoutTERM pins the forced mode: proven members
+// get SIGKILL at once, so even a SIGTERM-ignoring group ends without a wait.
+func TestRecoverGroups_ForceKillsWithoutTERM(t *testing.T) {
+	requireLinuxRecovery(t)
+	dir := t.TempDir()
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	leaderFile := filepath.Join(dir, "leader.pid")
+	_, g := startRecoveryGroup(t, "stubborn", "sh", stubborn, leaderFile)
+	if _, ok := waitForPIDFile(t, leaderFile, 10*time.Second); !ok {
+		t.Fatal("stubborn leader never recorded its PID")
+	}
+
+	start := time.Now()
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverForce, time.Now().Add(30*time.Second))
+	r := assertSingleRecovery(t, got, OutcomeTerminated, "leader_proven")
+	if !reflect.DeepEqual(r.Signals, []string{"SIGKILL"}) {
+		t.Fatalf("Signals = %v, want [SIGKILL]", r.Signals)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("forced recovery took %s; it waited out the graceful deadline", elapsed)
+	}
+}
+
+// TestRecoverGroups_ReusedPIDIsEmptyNeverSignalled: a live process at the
+// recorded pgid whose start time differs is a new owner of the number. The
+// kernel only reallocates a pid nothing uses as a pgid, so the recorded group
+// is proven empty, and the new owner is never signalled.
+func TestRecoverGroups_ReusedPIDIsEmptyNeverSignalled(t *testing.T) {
+	requireLinuxRecovery(t)
+	_, g := startRecoveryGroup(t, "web", "sleep", "60")
+	g.LeaderStart++
+	sent := recordSignals(t)
+
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverForce, time.Now().Add(5*time.Second))
+	r := assertSingleRecovery(t, got, OutcomeEmpty, "pgid_reused")
+	if len(r.Signals) != 0 || len(*sent) != 0 {
+		t.Fatalf("signals %v / sent %v for a reused pgid, want none", r.Signals, *sent)
+	}
+	assertStillRunning(t, g.PGID, "new owner of the pid")
+}
+
+// TestRecoverGroups_BootMismatchIsEmptyWithoutSignal: a record from another
+// boot names processes that cannot exist any more.
+func TestRecoverGroups_BootMismatchIsEmptyWithoutSignal(t *testing.T) {
+	requireLinuxRecovery(t)
+	_, g := startRecoveryGroup(t, "web", "sleep", "60")
+	host := daemon.HostIdentity()
+	if host.BootID == "" {
+		t.Skip("boot id unreadable")
+	}
+	host.BootID = "00000000-0000-0000-0000-000000000000"
+	probes := recordProbes(t)
+
+	got := RecoverGroups([]daemon.Group{g}, host, RecoverForce, time.Now().Add(5*time.Second))
+	r := assertSingleRecovery(t, got, OutcomeEmpty, "rebooted")
+	if len(r.Signals) != 0 || len(*probes) != 0 {
+		t.Fatalf("signals %v / probes %v after a reboot, want nothing enumerated or signalled", r.Signals, *probes)
+	}
+	assertStillRunning(t, g.PGID, "process from this boot")
+}
+
+// TestRecoverGroups_BootUnknownIsUnknown: on Linux a record whose boot id is
+// missing, or a current boot id that cannot be read, cannot be told apart from
+// a record of a previous boot. The namespace check does not catch a reboot
+// (the initial namespaces keep their inode numbers), so every group is unknown
+// and nothing is enumerated or signalled.
+func TestRecoverGroups_BootUnknownIsUnknown(t *testing.T) {
+	requireLinuxRecovery(t)
+	_, g := startRecoveryGroup(t, "web", "sleep", "60")
+	for name, tc := range map[string]struct{ recorded, current string }{
+		"recorded": {recorded: "", current: "3f2504e0-4f89-11d3-9a0c-0305e82c3301"},
+		"current":  {recorded: "3f2504e0-4f89-11d3-9a0c-0305e82c3301", current: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			restore := currentHost
+			currentHost = func() daemon.Host {
+				h := restore()
+				h.BootID = tc.current
+				return h
+			}
+			t.Cleanup(func() { currentHost = restore })
+			host := daemon.HostIdentity()
+			host.BootID = tc.recorded
+			sent := recordSignals(t)
+			probes := recordProbes(t)
+
+			got := RecoverGroups([]daemon.Group{g}, host, RecoverForce, time.Now().Add(5*time.Second))
+			r := assertSingleRecovery(t, got, OutcomeUnknown, "boot_unknown")
+			if len(r.Signals) != 0 || len(*sent) != 0 || len(*probes) != 0 {
+				t.Fatalf("signals %v / sent %v / probes %v without both boot ids, want nothing enumerated or signalled", r.Signals, *sent, *probes)
+			}
+			assertStillRunning(t, g.PGID, "leader of a record with an unknown boot")
+		})
+	}
+}
+
+// TestRecoverGroups_NamespaceMismatchIsUnknown: pids and start times recorded
+// in another pid or time namespace mean nothing here.
+func TestRecoverGroups_NamespaceMismatchIsUnknown(t *testing.T) {
+	requireLinuxRecovery(t)
+	_, g := startRecoveryGroup(t, "web", "sleep", "60")
+	for name, mutate := range map[string]func(*daemon.Host){
+		"pid":  func(h *daemon.Host) { h.PIDNS = "pid:[1]" },
+		"time": func(h *daemon.Host) { h.TimeNS = "time:[1]" },
+	} {
+		host := daemon.HostIdentity()
+		mutate(&host)
+		got := RecoverGroups([]daemon.Group{g}, host, RecoverForce, time.Now().Add(5*time.Second))
+		r := assertSingleRecovery(t, got, OutcomeUnknown, "namespace_mismatch")
+		if len(r.Signals) != 0 {
+			t.Fatalf("%s namespace mismatch sent %v", name, r.Signals)
+		}
+		assertStillRunning(t, g.PGID, name+" namespace mismatch leader")
+	}
+}
+
+// TestRecoverGroups_ForeignProcfsIsUnknown: under `unshare --pid` without a
+// fresh /proc mount the recorded namespaces match, but /proc numbers the host's
+// processes while a pidfd opens the pid in ours. A proof read from that /proc
+// is about a different process than the one a signal would reach, so every
+// group is unknown and nothing is enumerated or signalled.
+func TestRecoverGroups_ForeignProcfsIsUnknown(t *testing.T) {
+	requireLinuxRecovery(t)
+	if !procfsIsOwn() {
+		t.Fatal("procfsIsOwn() = false in the test's own namespace; the guard would refuse every recovery")
+	}
+	_, g := startRecoveryGroup(t, "web", "sleep", "60")
+	restore := procOwn
+	procOwn = func() bool { return false }
+	t.Cleanup(func() { procOwn = restore })
+	sent := recordSignals(t)
+	probes := recordProbes(t)
+
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverForce, time.Now().Add(5*time.Second))
+	r := assertSingleRecovery(t, got, OutcomeUnknown, "namespace_mismatch")
+	if len(r.Signals) != 0 || len(*sent) != 0 || len(*probes) != 0 {
+		t.Fatalf("signals %v / sent %v / probes %v with a foreign /proc, want nothing enumerated or signalled", r.Signals, *sent, *probes)
+	}
+	assertStillRunning(t, g.PGID, "leader seen through a foreign /proc")
+}
+
+// TestRecoverGroups_LeaderGoneMembersAliveIsUnknown is the roleDetached shape
+// after a crash: the leader was reaped, so nothing pins the pgid to our group
+// and its members cannot be proven ours. They are reported, never signalled.
+func TestRecoverGroups_LeaderGoneMembersAliveIsUnknown(t *testing.T) {
+	requireLinuxRecovery(t)
+	dir := t.TempDir()
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	spawn := writeScript(t, dir, "spawn.sh", spawnScript)
+	descFile := filepath.Join(dir, "descendant.pid")
+	cmd := exec.Command("sh", spawn, stubborn, descFile)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	g := daemon.Group{Name: "detached-child", PGID: cmd.Process.Pid, LeaderStart: leaderStartFor(cmd.Process.Pid)}
+	descendant, ok := waitForPIDFile(t, descFile, 20*time.Second)
+	trackProcessForCleanup(t, descendant, "descendant")
+	if !ok {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal("descendant never recorded its PID")
+	}
+	_ = cmd.Wait() // reap the leader, as init does once the daemon is gone
+	sent := recordSignals(t)
+
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverForce, time.Now().Add(5*time.Second))
+	r := assertSingleRecovery(t, got, OutcomeUnknown, "leader_gone")
+	if len(r.Signals) != 0 || len(*sent) != 0 {
+		t.Fatalf("signals %v / sent %v with the leader gone, want none", r.Signals, *sent)
+	}
+	if r.LiveMembers < 1 || !containsPID(r.PIDs, descendant) {
+		t.Fatalf("result %+v does not report the live descendant %d", r, descendant)
+	}
+	assertStillRunning(t, descendant, "unproven descendant")
+}
+
+// TestRecoverGroups_WrapperLeaderExitsOnTERMChildStillKilled: a wrapper leader
+// exits on SIGTERM and is reaped while its SIGTERM-ignoring child keeps
+// running. The pidfd taken before SIGTERM still pins that child, so the KILL
+// phase ends it although the leader can no longer be proven.
+//
+// The child is one long-lived process that already ignores SIGTERM when it
+// records its PID and never forks, so the group at classification is exactly
+// the wrapper and the child; nothing has to exit on its own within killSettle
+// for the group to be proven empty.
+func TestRecoverGroups_WrapperLeaderExitsOnTERMChildStillKilled(t *testing.T) {
+	requireLinuxRecovery(t)
+	dir := t.TempDir()
+	child := writeScript(t, dir, "stubborn.sh", "#!/bin/sh\ntrap '' TERM INT HUP\necho $$ > \"$1\"\nexec sleep 90\n")
+	childFile := filepath.Join(dir, "child.pid")
+	// startRecoveryGroup reaps the leader as soon as it exits, as init does.
+	_, g := startRecoveryGroup(t, "wrapper", "sh", "-c", `sh "$1" "$2" & wait`, "sh", child, childFile)
+	childPID, ok := waitForPIDFile(t, childFile, 10*time.Second)
+	if !ok {
+		t.Fatal("child never recorded its PID")
+	}
+	trackProcessForCleanup(t, childPID, "TERM-ignoring child")
+	waitForComm(t, childPID, "sleep")
+
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverGraceful, time.Now().Add(2*time.Second))
+	r := assertSingleRecovery(t, got, OutcomeTerminated, "leader_proven")
+	if !reflect.DeepEqual(r.Signals, []string{"SIGTERM", "SIGKILL"}) {
+		t.Fatalf("Signals = %v, want [SIGTERM SIGKILL]", r.Signals)
+	}
+	if !containsPID(r.PIDs, childPID) {
+		t.Fatalf("PIDs = %v, want the pinned child %d", r.PIDs, childPID)
+	}
+	assertTerminated(t, childPID, "TERM-ignoring child of an exited wrapper", 5*time.Second)
+}
+
+// waitForComm waits until pid runs the program named comm, so a fixture that
+// execs into its final program has finished forking and setting up.
+func waitForComm(t *testing.T, pid int, comm string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
+		if err == nil && strings.TrimSpace(string(data)) == comm {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("PID %d never became %q (last read %q, %v)", pid, comm, data, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRecoverGroups_RepinKillsMemberForkedAfterTERM: while the leader is
+// still proven after SIGTERM, a member it forks after the first scan is pinned
+// before SIGKILL and ends with the group. The leader ignores SIGTERM and forks
+// that member in its TERM trap, so the member did not exist at classification.
+func TestRecoverGroups_RepinKillsMemberForkedAfterTERM(t *testing.T) {
+	requireLinuxRecovery(t)
+	dir := t.TempDir()
+	readyFile := filepath.Join(dir, "ready.pid")
+	freshFile := filepath.Join(dir, "fresh.pid")
+	leader := writeScript(t, dir, "spawner.sh", `#!/bin/sh
+trap 'sleep 90 & echo $! > "$2"' TERM
+sleep 90 &
+echo $$ > "$1"
+while :; do wait; done
+`)
+	_, g := startRecoveryGroup(t, "spawner", "sh", leader, readyFile, freshFile)
+	if _, ok := waitForPIDFile(t, readyFile, 10*time.Second); !ok {
+		t.Fatal("leader never became ready")
+	}
+	if _, err := os.Stat(freshFile); err == nil {
+		t.Fatal("the late member exists before SIGTERM; the fixture cannot test repin")
+	}
+
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverGraceful, time.Now().Add(time.Second))
+	fresh, ok := waitForPIDFile(t, freshFile, time.Second)
+	if !ok {
+		t.Fatalf("leader never forked the late member on SIGTERM; results %+v", got)
+	}
+	trackProcessForCleanup(t, fresh, "member forked after SIGTERM")
+	r := assertSingleRecovery(t, got, OutcomeTerminated, "leader_proven")
+	if !reflect.DeepEqual(r.Signals, []string{"SIGTERM", "SIGKILL"}) {
+		t.Fatalf("Signals = %v, want [SIGTERM SIGKILL]", r.Signals)
+	}
+	if !containsPID(r.PIDs, fresh) {
+		t.Fatalf("PIDs = %v, want the member %d forked after SIGTERM", r.PIDs, fresh)
+	}
+	assertTerminated(t, fresh, "member forked after SIGTERM", 5*time.Second)
+}
+
+// TestRecoverGroups_SignalUnavailableIsUnknown: without pidfds (an old kernel,
+// or a seccomp filter) there is no race-free way to signal a proven process,
+// and recovery never falls back to a bare pid.
+func TestRecoverGroups_SignalUnavailableIsUnknown(t *testing.T) {
+	requireLinuxRecovery(t)
+	for _, errno := range []syscall.Errno{syscall.ENOSYS, syscall.EPERM} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			_, g := startRecoveryGroup(t, "web", "sleep", "60")
+			restore := pidfdOpen
+			pidfdOpen = func(int) (int, error) { return -1, errno }
+			t.Cleanup(func() { pidfdOpen = restore })
+
+			got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverForce, time.Now().Add(5*time.Second))
+			r := assertSingleRecovery(t, got, OutcomeUnknown, "signal_unavailable")
+			if len(r.Signals) != 0 {
+				t.Fatalf("Signals = %v without pidfds, want none", r.Signals)
+			}
+			assertStillRunning(t, g.PGID, "leader without pidfds")
+		})
+	}
+}
+
+// TestRecoverGroups_OwnPgrpAndPgidOneRefused pins the signal guards. Signals
+// are recorded rather than sent, so a broken guard fails the test instead of
+// killing the test binary's own process group.
+//
+// The own-group guard sits inside rule C, after rules E and R: a recorded pgid
+// whose number now belongs to a different leader is proven empty as
+// pgid_reused even when that leader heads the caller's own group, and a group
+// whose leader is still the recorded one is refused as own_group.
+func TestRecoverGroups_OwnPgrpAndPgidOneRefused(t *testing.T) {
+	sent := recordSignals(t)
+	probes := recordProbes(t)
+	own := syscall.Getpgrp()
+	ownStart := leaderStartFor(own)
+	groups := []daemon.Group{
+		{Name: "own", PGID: own, LeaderStart: ownStart},
+		{Name: "init", PGID: 1, LeaderStart: leaderStartFor(1)},
+		{Name: "negative", PGID: -5, LeaderStart: 1},
+	}
+	type verdict struct{ outcome, reason string }
+	want := map[string]verdict{
+		"own":      {OutcomeUnknown, "own_group"},
+		"init":     {OutcomeUnknown, "invalid_pgid"},
+		"negative": {OutcomeUnknown, "invalid_pgid"},
+	}
+	if ownStart == 0 {
+		// No live leader with a readable start time (macOS, or a group whose
+		// leader exited): the group cannot be proven at all, so it is unknown
+		// for that reason; it is still never signalled.
+		want["own"] = verdict{OutcomeUnknown, ""}
+	} else if runtime.GOOS == "linux" {
+		groups = append(groups, daemon.Group{Name: "own-reused", PGID: own, LeaderStart: ownStart + 1})
+		want["own-reused"] = verdict{OutcomeEmpty, "pgid_reused"}
+	}
+	got := RecoverGroups(groups, daemon.HostIdentity(), RecoverForce, time.Now().Add(5*time.Second))
+	if len(got) != len(groups) {
+		t.Fatalf("RecoverGroups returned %+v, want %d results", got, len(groups))
+	}
+	for _, r := range got {
+		w := want[r.Name]
+		if r.Outcome != w.outcome || (w.reason != "" && r.Reason != w.reason) || len(r.Signals) != 0 {
+			t.Errorf("%s: %+v, want %s %s with no signal", r.Name, r, w.outcome, w.reason)
+		}
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("signals %v were sent for refused groups", *sent)
+	}
+	for _, pid := range *probes {
+		if pid >= -1 {
+			t.Fatalf("existence probe named pid %d, which is never a single foreign group", pid)
+		}
+	}
+}
+
+// TestRecoverGroups_PendingIsUnknown: an entry written before cmd.Start names
+// no group yet; pgid 0 must never reach kill(2), where it means our own group.
+func TestRecoverGroups_PendingIsUnknown(t *testing.T) {
+	probes := recordProbes(t)
+	got := RecoverGroups([]daemon.Group{{Name: "api"}}, daemon.HostIdentity(), RecoverForce, time.Now().Add(5*time.Second))
+	r := assertSingleRecovery(t, got, OutcomeUnknown, "launch_pending")
+	if len(r.Signals) != 0 || len(*probes) != 0 {
+		t.Fatalf("signals %v / probes %v for a pending launch, want none", r.Signals, *probes)
+	}
+}
+
+// TestRecoverGroups_UnknownGroupDoesNotSpareProvenOnes: one group left unknown
+// must not stop recovery from ending the groups it can prove. Each record is
+// resolved on its own, so a mixed crash still terminates every provable
+// survivor and reports only the rest as unknown.
+func TestRecoverGroups_UnknownGroupDoesNotSpareProvenOnes(t *testing.T) {
+	requireLinuxRecovery(t)
+	_, g := startRecoveryGroup(t, "web", "sleep", "60")
+
+	got := RecoverGroups([]daemon.Group{{Name: "api"}, g}, daemon.HostIdentity(), RecoverForce, time.Now().Add(10*time.Second))
+	if len(got) != 2 {
+		t.Fatalf("RecoverGroups returned %d results, want 2: %+v", len(got), got)
+	}
+	byName := map[string]RecoveredGroup{}
+	for _, r := range got {
+		byName[r.Name] = r
+	}
+	if r := byName["api"]; r.Outcome != OutcomeUnknown || r.Reason != "launch_pending" {
+		t.Fatalf("pending group = outcome %q reason %q, want unknown launch_pending (%+v)", r.Outcome, r.Reason, r)
+	}
+	r := byName["web"]
+	if r.Outcome != OutcomeTerminated || r.Reason != "leader_proven" {
+		t.Fatalf("proven group = outcome %q reason %q, want terminated leader_proven (%+v)", r.Outcome, r.Reason, r)
+	}
+	if !reflect.DeepEqual(r.Signals, []string{"SIGKILL"}) {
+		t.Fatalf("proven group Signals = %v, want [SIGKILL]", r.Signals)
+	}
+	assertTerminated(t, g.PGID, "proven leader beside an unknown group", 5*time.Second)
+}
+
+// TestRecoverGroups_ReapedGroupIsEmpty: a group with no live holder of its pgid
+// ended, whether or not its identity can be proven. It runs on every Unix.
+func TestRecoverGroups_ReapedGroupIsEmpty(t *testing.T) {
+	cmd := exec.Command("true")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	g := daemon.Group{Name: "done", PGID: cmd.Process.Pid, LeaderStart: leaderStartFor(cmd.Process.Pid)}
+	_ = cmd.Wait()
+	sent := recordSignals(t)
+
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverForce, time.Now().Add(5*time.Second))
+	r := assertSingleRecovery(t, got, OutcomeEmpty, "no_members")
+	if len(r.Signals) != 0 || len(*sent) != 0 {
+		t.Fatalf("signals %v / sent %v for an empty group, want none", r.Signals, *sent)
+	}
+}
+
+// TestRecoverGroups_UnsignallableMemberIsNeverProvenEmpty: on Linux
+// kill(-P, 0) answers EPERM only while P has a member this process may not
+// signal. Under a procfs mounted hidepid=2 that member, another user's process
+// for example, is invisible to the membership scan as well, so an EPERM probe
+// with scans that find nothing must leave the group unknown, never empty. An
+// unprivileged test cannot build such a group, so a reaped group (which the
+// scan cannot see either) stands in for it and the probe is stubbed.
+func TestRecoverGroups_UnsignallableMemberIsNeverProvenEmpty(t *testing.T) {
+	requireLinuxRecovery(t)
+	cmd := exec.Command("true")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	g := daemon.Group{Name: "hidden", PGID: cmd.Process.Pid, LeaderStart: leaderStartFor(cmd.Process.Pid)}
+	_ = cmd.Wait()
+	restore := groupKill
+	groupKill = func(pid int, sig syscall.Signal) error {
+		if sig != 0 {
+			t.Errorf("groupKill(%d, %v): recovery must signal only through pidfds", pid, sig)
+		}
+		return syscall.EPERM
+	}
+	t.Cleanup(func() { groupKill = restore })
+	sent := recordSignals(t)
+
+	for _, mode := range []RecoveryMode{RecoverAssessOnly, RecoverForce} {
+		got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), mode, time.Now().Add(5*time.Second))
+		r := assertSingleRecovery(t, got, OutcomeUnknown, "enumeration_failed")
+		if len(r.Signals) != 0 || len(*sent) != 0 {
+			t.Fatalf("mode %v: signals %v / sent %v for an unprovable group, want none", mode, r.Signals, *sent)
+		}
+	}
+
+	// Members the scan can see are still reported: the EPERM rule only refuses
+	// to read an empty scan as proof of absence.
+	_, live := startRecoveryGroup(t, "visible", "sleep", "60")
+	empty, members, known := groupProvenEmpty(live.PGID)
+	if empty || !known || !containsPID(members, live.PGID) {
+		t.Fatalf("groupProvenEmpty(visible group) with an EPERM probe = %v %v %v, want members including %d",
+			empty, members, known, live.PGID)
+	}
+}
+
+// TestRecoverGroups_SignallableHiddenHolderIsNeverProvenEmpty: a probe that
+// succeeds proves a holder this process may signal. A setuid process that keeps
+// this user's real uid answers the probe yet is hidden from the scan under
+// hidepid, so an empty scan is proof only when a visible dead holder explains
+// the probe. A reaped group stands in for the hidden holder, as above.
+func TestRecoverGroups_SignallableHiddenHolderIsNeverProvenEmpty(t *testing.T) {
+	requireLinuxRecovery(t)
+	cmd := exec.Command("true")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	g := daemon.Group{Name: "hidden", PGID: cmd.Process.Pid, LeaderStart: leaderStartFor(cmd.Process.Pid)}
+	_ = cmd.Wait()
+	restore := groupKill
+	groupKill = func(pid int, sig syscall.Signal) error {
+		if sig != 0 {
+			t.Errorf("groupKill(%d, %v): recovery must signal only through pidfds", pid, sig)
+		}
+		return nil
+	}
+	sent := recordSignals(t)
+	for _, mode := range []RecoveryMode{RecoverAssessOnly, RecoverForce} {
+		got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), mode, time.Now().Add(5*time.Second))
+		r := assertSingleRecovery(t, got, OutcomeUnknown, "enumeration_failed")
+		if len(r.Signals) != 0 || len(*sent) != 0 {
+			t.Fatalf("mode %v: signals %v / sent %v for an unprovable group, want none", mode, r.Signals, *sent)
+		}
+	}
+	groupKill = restore
+
+	// A visible zombie explains a successful probe: an exited leader that has
+	// not been reaped yet leaves the group provably empty of live members.
+	zombie := exec.Command("true")
+	zombie.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := zombie.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = zombie.Wait() })
+	pgid := zombie.Process.Pid
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if info, err := daemon.ProcStat(pgid); err == nil && isZombieState(info.State) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("leader %d never became a zombie", pgid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := groupKill(-pgid, 0); err != nil {
+		t.Fatalf("kill(-%d, 0) on a zombie-only group = %v, want success; the test proves nothing", pgid, err)
+	}
+	if empty, members, known := groupProvenEmpty(pgid); !empty || !known || len(members) != 0 {
+		t.Fatalf("groupProvenEmpty(zombie-only group) = %v %v %v, want empty and known", empty, members, known)
+	}
+}
+
+// TestRecoveryLive_ZombieStateWithOtherThreadsIsLive pins the recovery
+// liveness rule: a Z or X state is dead only for a single-task process. A
+// thread-group leader whose main thread exited reports Z while its other
+// threads run, and a task list that cannot be read proves nothing.
+func TestRecoveryLive_ZombieStateWithOtherThreadsIsLive(t *testing.T) {
+	restore := procTasks
+	t.Cleanup(func() { procTasks = restore })
+	for _, tc := range []struct {
+		state byte
+		tasks int
+		err   error
+		want  bool
+	}{
+		{state: 'S', tasks: 1, want: true},
+		{state: 'R', tasks: 0, err: os.ErrNotExist, want: true},
+		{state: 'Z', tasks: 1, want: false},
+		{state: 'X', tasks: 1, want: false},
+		{state: 'Z', tasks: 2, want: true},
+		{state: 'X', tasks: 3, want: true},
+		{state: 'Z', tasks: 0, err: os.ErrPermission, want: true},
+	} {
+		procTasks = func(int) (int, error) { return tc.tasks, tc.err }
+		if got := recoveryLive(4242, tc.state); got != tc.want {
+			t.Errorf("recoveryLive(state %q, %d tasks, err %v) = %v, want %v", tc.state, tc.tasks, tc.err, got, tc.want)
+		}
+	}
+}
+
+// zombieLeaderScript exits its main thread while another thread keeps
+// running, so procfs reports the thread-group leader as Z although the
+// process is alive.
+const zombieLeaderScript = `import ctypes, threading, time
+threading.Thread(target=time.sleep, args=(60,)).start()
+ctypes.CDLL(None).pthread_exit(None)
+`
+
+// TestRecoverGroups_ZombieLeaderWithLiveThreadsIsNotEmpty: a group whose only
+// process is a running thread group with an exited main thread must not be
+// proven empty. It is proven ours like any other live leader and ends on
+// SIGKILL.
+func TestRecoverGroups_ZombieLeaderWithLiveThreadsIsNotEmpty(t *testing.T) {
+	requireLinuxRecovery(t)
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is needed to exit a leader's main thread while other threads run")
+	}
+	script := writeScript(t, t.TempDir(), "zombie_leader.py", zombieLeaderScript)
+	_, g := startRecoveryGroup(t, "threads", python, script)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		info, statErr := daemon.ProcStat(g.PGID)
+		n, taskErr := countProcTasks(g.PGID)
+		if statErr == nil && info.State == 'Z' && taskErr == nil && n > 1 {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Skipf("could not build a Z leader with live threads (stat %+v %v, tasks %d %v)", info, statErr, n, taskErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverAssessOnly, time.Now())
+	r := assertSingleRecovery(t, got, OutcomeLive, "leader_proven")
+	if !containsPID(r.PIDs, g.PGID) {
+		t.Fatalf("assessment = %+v, want the running Z leader %d reported live", r, g.PGID)
+	}
+
+	got = RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverForce, time.Now().Add(5*time.Second))
+	r = assertSingleRecovery(t, got, OutcomeTerminated, "leader_proven")
+	if !reflect.DeepEqual(r.Signals, []string{"SIGKILL"}) || !containsPID(r.PIDs, g.PGID) {
+		t.Fatalf("forced recovery = %+v, want SIGKILL to the Z leader %d", r, g.PGID)
+	}
+}
+
+// TestRecoverGroups_LiveGroupWithoutStartTimeIsNeverSignalled is the macOS
+// contract, checked on every Unix: with no leader start time nothing proves a
+// live group ours, so it is unknown and never signalled.
+func TestRecoverGroups_LiveGroupWithoutStartTimeIsNeverSignalled(t *testing.T) {
+	_, g := startRecoveryGroup(t, "web", "sleep", "60")
+	g.LeaderStart = 0
+	sent := recordSignals(t)
+
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverForce, time.Now().Add(5*time.Second))
+	if len(got) != 1 || got[0].Outcome != OutcomeUnknown || len(got[0].Signals) != 0 || len(*sent) != 0 {
+		t.Fatalf("RecoverGroups = %+v (sent %v), want unknown with no signal", got, *sent)
+	}
+	assertStillRunning(t, g.PGID, "leader with no recorded start time")
+}
+
+func containsPID(pids []int, pid int) bool {
+	for _, p := range pids {
+		if p == pid {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRecoverGroups_AssessOnlyReportsLiveWithoutSignal is what `up` relies on:
+// assessing a crashed run proves a running group ours and reports it live, but
+// opens no pidfd and sends nothing.
+func TestRecoverGroups_AssessOnlyReportsLiveWithoutSignal(t *testing.T) {
+	requireLinuxRecovery(t)
+	_, g := startRecoveryGroup(t, "web", "sleep", "60")
+	restore := pidfdOpen
+	pidfdOpen = func(int) (int, error) { t.Error("AssessOnly opened a pidfd"); return -1, syscall.ENOSYS }
+	t.Cleanup(func() { pidfdOpen = restore })
+
+	got := RecoverGroups([]daemon.Group{g}, daemon.HostIdentity(), RecoverAssessOnly, time.Now())
+	r := assertSingleRecovery(t, got, OutcomeLive, "leader_proven")
+	if len(r.Signals) != 0 || r.LiveMembers != 1 || !containsPID(r.PIDs, g.PGID) {
+		t.Fatalf("assessment = %+v, want the live leader reported and no signal", r)
+	}
+	assertStillRunning(t, g.PGID, "assessed leader")
+}
+
+// TestRun_ReadyTimeoutGracefulExitCountsAsFailure is the regression for the
+// probe-cancel verdict. A readiness timeout cancels the incarnation; a service
+// that handles SIGTERM by exiting 0 used to land in the clean-exit branch, so it
+// was reported "exited", never restarted under on-failure, never counted toward
+// max_restarts, and under restart: never the run did not fail. Both cancel
+// sites are covered: the tcp/http probe result and the log-probe timer.
+//
+// The verdict must not depend on how the reap reports the cancel. os/exec turns
+// a clean exit into ctx.Err() only when its context watcher's cmd.Cancel
+// succeeds; when that watcher is scheduled after the group was withdrawn,
+// Cancel returns os.ErrProcessDone and Wait reports the raw exit status, 0. The
+// waitProcess seam forces that outcome so the test does not rely on scheduling.
+func TestRun_ReadyTimeoutGracefulExitCountsAsFailure(t *testing.T) {
+	tests := []struct {
+		name  string
+		probe config.ReadyWhen
+		want  string
+	}{
+		// 127.0.0.1:1 is a reserved port that nothing listens on.
+		{"tcp", config.ReadyWhen{TCP: "127.0.0.1:1"}, "readiness probe (tcp) timed out"},
+		{"log", config.ReadyWhen{Log: "^NEVER$"}, "readiness probe (log) timed out"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := tc.probe
+			r := makeRunner(map[string]config.Process{
+				"server": {
+					// exec keeps the helper as the group leader, so the group
+					// SIGTERM reaches only the process that exits 0 on it.
+					Cmd:          serviceHelperCmd("term-exit0"),
+					Restart:      "never",
+					ReadyTimeout: 1,
+					ReadyWhen:    &probe,
+				},
+			})
+			r.waitProcess = func(cmd *exec.Cmd) error {
+				err := cmd.Wait()
+				if errors.Is(err, context.Canceled) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+					return nil // the watcher lost the race: Wait reports the clean exit
+				}
+				return err
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			err := r.Run(ctx)
+			if ctx.Err() != nil {
+				t.Fatalf("Run did not finish on its own: %v", err)
+			}
+			got := snapshotOf(r, "server")
+			if got.ExitCode == nil || *got.ExitCode != 0 {
+				t.Fatalf("exit code = %s, want 0: the fixture must exit gracefully on SIGTERM to exercise the clean-exit path", fmtExitCode(got.ExitCode))
+			}
+			if got.State != "failed" {
+				t.Errorf("state = %q, want failed after a readiness timeout", got.State)
+			}
+			if !strings.Contains(got.LastError, tc.want) {
+				t.Errorf("last_error = %q, want it to contain %q", got.LastError, tc.want)
+			}
+			if err == nil || !strings.Contains(err.Error(), "processes failed") {
+				t.Fatalf("Run error = %v, want processes failed", err)
+			}
+		})
+	}
+}
+
+// TestRun_ReadyWhen_CmdProbeCutAtDeadlineDoesNotPass is the cmd-probe
+// counterpart of TestRun_ReadyTimeoutGracefulExitCountsAsFailure. A probe
+// attempt that hangs until ready_timeout and then exits 0 on SIGTERM never
+// passed, so the service must fail at ready_timeout rather than latch ready.
+// The waitProcess seam forces the reap os/exec reports when its context
+// watcher loses the race with the group's withdrawal: the raw exit status 0.
+func TestRun_ReadyWhen_CmdProbeCutAtDeadlineDoesNotPass(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:          serviceHelperCmd("sleep", "30s"),
+			Restart:      "never",
+			ReadyTimeout: 2,
+			ReadyWhen:    &config.ReadyWhen{Cmd: serviceHelperCmd("term-exit0")},
+			// The probe inherits the process env; see
+			// TestRun_HealthReportMarksUnhealthyAndRecovers.
+			Env: map[string]string{"GORACE": "atexit_sleep_ms=0"},
+		},
+	})
+	var cutExit0 atomic.Bool
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		err := cmd.Wait()
+		// Only probe attempts run under a deadline.
+		if errors.Is(err, context.DeadlineExceeded) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+			cutExit0.Store(true)
+			return nil
+		}
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	err := r.Run(ctx)
+	if ctx.Err() != nil {
+		t.Fatalf("Run did not finish on its own (%v): worker = %+v", err, snapshotOf(r, "worker"))
+	}
+	if !cutExit0.Load() {
+		t.Fatal("no probe attempt was cut at its deadline and exited 0: the fixture did not exercise the race")
+	}
+	const want = "readiness probe (cmd) timed out (last attempt: context deadline exceeded)"
+	if got := snapshotOf(r, "worker"); got.State != "failed" || got.LastError != want {
+		t.Fatalf("worker = %+v, want failed with LastError %q", got, want)
+	}
+	if err == nil || !strings.Contains(err.Error(), "processes failed") {
+		t.Fatalf("Run error = %v, want processes failed", err)
+	}
+}
+
+// TestRun_HealthRestartRespectsMaxRestarts pins health_action: restart. An
+// unhealthy incarnation is cancelled and counted as a failure even when it
+// exits 0 on SIGTERM, so it restarts through the ordinary policy path and
+// max_restarts ends it as failed. The waitProcess seam forces the clean-exit
+// reap, as in TestRun_ReadyTimeoutGracefulExitCountsAsFailure.
+func TestRun_HealthRestartRespectsMaxRestarts(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"server": {
+			Cmd:            serviceHelperCmd("term-exit0"),
+			Restart:        "on-failure",
+			MaxRestarts:    1,
+			HealthWhen:     &config.ReadyWhen{TCP: "127.0.0.1:1"},
+			HealthInterval: 1,
+			HealthAction:   config.HealthActionRestart,
+		},
+	})
+	var journal bytes.Buffer
+	r.Output, r.Journal = io.Discard, &journal
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		err := cmd.Wait()
+		if errors.Is(err, context.Canceled) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+			return nil
+		}
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	err := r.Run(ctx)
+	if ctx.Err() != nil {
+		t.Fatalf("Run did not finish on its own: %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "processes failed") {
+		t.Fatalf("Run error = %v, want processes failed", err)
+	}
+	got := snapshotOf(r, "server")
+	if got.State != "failed" || got.Restarts != 1 || got.Generation != 2 || !strings.Contains(got.LastError, "max restarts (1)") {
+		t.Fatalf("final state = %+v, want failed after one health restart", got)
+	}
+	if got.ExitCode == nil || *got.ExitCode != 0 {
+		t.Fatalf("exit code = %s, want 0: the fixture must exit gracefully on SIGTERM", fmtExitCode(got.ExitCode))
+	}
+	failed := 0
+	for _, event := range journalEvents(t, &journal) {
+		if event.Code == "process.failed" {
+			failed++
+			if !strings.Contains(event.Line, "health check failed (3 consecutive)") {
+				t.Fatalf("process.failed = %q, want the health verdict", event.Line)
+			}
+		}
+	}
+	if failed != 2 {
+		t.Fatalf("process.failed events = %d, want one per unhealthy incarnation", failed)
+	}
+}
+
+func fmtExitCode(code *int) string {
+	if code == nil {
+		return "<nil>"
+	}
+	return strconv.Itoa(*code)
 }

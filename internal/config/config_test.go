@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1157,6 +1158,87 @@ processes:
 	}
 }
 
+// TestLoad_ReadyWhenCmd pins the cmd probe kind: a service accepts it, it
+// counts toward ready_when's exactly-one rule, and a task still refuses it.
+func TestLoad_ReadyWhenCmd(t *testing.T) {
+	cfg := loadFromString(t, "processes:\n  worker:\n    cmd: run-worker\n    ready_when:\n      cmd: check-worker --ready\n")
+	if rw := cfg.Processes["worker"].ReadyWhen; rw == nil || rw.Cmd != "check-worker --ready" {
+		t.Fatalf("ready_when = %+v, want cmd probe", rw)
+	}
+
+	for name, probe := range map[string]string{
+		"cmd and http": "      cmd: check\n      http: http://localhost:1/\n",
+		"cmd and tcp":  "      cmd: check\n      tcp: localhost:1\n",
+		"cmd and log":  "      cmd: check\n      log: ready\n",
+		"empty cmd":    "      cmd: \"\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, "processes:\n  worker:\n    cmd: run-worker\n    ready_when:\n"+probe))
+			var verr *ValidationError
+			if !errors.As(err, &verr) || verr.Code != CodeInvalidReadyWhen || FormatPath(verr.Path) != "processes.worker.ready_when" {
+				t.Fatalf("err = %v, want %s at processes.worker.ready_when", err, CodeInvalidReadyWhen)
+			}
+			if !strings.Contains(err.Error(), "cmd") {
+				t.Fatalf("message does not name the cmd kind: %v", err)
+			}
+		})
+	}
+
+	_, err := Load(writeConfig(t, "processes:\n  migrate:\n    cmd: migrate\n    mode: task\n    ready_when:\n      cmd: check\n"))
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != CodeTaskIncompatible {
+		t.Fatalf("task with ready_when.cmd: err = %v, want %s", err, CodeTaskIncompatible)
+	}
+}
+
+// TestLoad_HealthWhen pins the ongoing health probe fields: http, tcp and cmd
+// are accepted with their defaults, and every misuse is refused with a stable
+// code at the offending field.
+func TestLoad_HealthWhen(t *testing.T) {
+	for kind, probe := range map[string]string{
+		"http": "      http: http://localhost:3000/health\n",
+		"tcp":  "      tcp: localhost:5432\n",
+		"cmd":  "      cmd: check-worker --live\n",
+	} {
+		t.Run("accepts "+kind, func(t *testing.T) {
+			cfg := loadFromString(t, "processes:\n  worker:\n    cmd: run-worker\n    health_when:\n"+probe)
+			proc := cfg.Processes["worker"]
+			if proc.HealthWhen == nil || proc.EffectiveHealthInterval() != 10 || proc.EffectiveHealthAction() != HealthActionReport {
+				t.Fatalf("health = %+v interval=%d action=%q, want probe with defaults 10/report", proc.HealthWhen, proc.EffectiveHealthInterval(), proc.EffectiveHealthAction())
+			}
+		})
+	}
+	cfg := loadFromString(t, "processes:\n  worker:\n    cmd: run-worker\n    restart: on-failure\n    max_restarts: 3\n    health_when:\n      tcp: localhost:1\n    health_interval: 2\n    health_action: restart\n")
+	if proc := cfg.Processes["worker"]; proc.EffectiveHealthInterval() != 2 || proc.EffectiveHealthAction() != HealthActionRestart {
+		t.Fatalf("explicit health fields = %+v", proc)
+	}
+
+	tests := []struct {
+		name, body, code, path string
+	}{
+		{"log rejected", "    health_when:\n      log: ready\n", CodeInvalidReadyWhen, "processes.worker.health_when.log"},
+		{"two kinds", "    health_when:\n      tcp: localhost:1\n      cmd: check\n", CodeInvalidReadyWhen, "processes.worker.health_when"},
+		{"empty probe", "    health_when: {}\n", CodeInvalidReadyWhen, "processes.worker.health_when"},
+		{"task health_when", "    mode: task\n    health_when:\n      tcp: localhost:1\n", CodeTaskIncompatible, "processes.worker.health_when"},
+		{"task health_interval", "    mode: task\n    health_interval: 5\n", CodeTaskIncompatible, "processes.worker.health_interval"},
+		{"task health_action", "    mode: task\n    health_action: report\n", CodeTaskIncompatible, "processes.worker.health_action"},
+		{"orphan interval", "    health_interval: 5\n", CodeInvalidValue, "processes.worker.health_interval"},
+		{"orphan action", "    health_action: report\n", CodeInvalidValue, "processes.worker.health_action"},
+		{"negative interval", "    health_when:\n      tcp: localhost:1\n    health_interval: -1\n", CodeInvalidValue, "processes.worker.health_interval"},
+		{"unknown action", "    health_when:\n      tcp: localhost:1\n    health_action: page\n", CodeInvalidValue, "processes.worker.health_action"},
+		{"restart action with restart never", "    health_when:\n      tcp: localhost:1\n    health_action: restart\n", CodeInvalidValue, "processes.worker.health_action"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, "processes:\n  worker:\n    cmd: run-worker\n"+tc.body))
+			var verr *ValidationError
+			if !errors.As(err, &verr) || verr.Code != tc.code || FormatPath(verr.Path) != tc.path {
+				t.Fatalf("err = %v (%+v), want %s at %s", err, verr, tc.code, tc.path)
+			}
+		})
+	}
+}
+
 func TestLoad_ModeTaskRejectsReadyWhen(t *testing.T) {
 	yaml := `
 processes:
@@ -1323,6 +1405,68 @@ processes:
 	}
 	if cfg.Processes["migrate"].ReadyTimeout != 0 {
 		t.Errorf("ReadyTimeout = %d, want 0", cfg.Processes["migrate"].ReadyTimeout)
+	}
+}
+
+// TestLoad_ModeTeardown pins mode: teardown. A teardown process takes only
+// cmd, dir, env, env_file and a shutdown_timeout of at most 5s; every
+// startup, restart or health field is refused at the offending field, nothing
+// may depend on it, and it is never part of a startup selection.
+func TestLoad_ModeTeardown(t *testing.T) {
+	cfg := loadFromString(t, `processes:
+  api:
+    cmd: api
+  cleanup:
+    mode: teardown
+    cmd: rm -rf ./uploads
+    dir: .
+    env:
+      KEEP: "0"
+    shutdown_timeout: 5
+`)
+	if got := cfg.Processes["cleanup"].EffectiveMode(); got != ProcessModeTeardown {
+		t.Fatalf("EffectiveMode() = %q, want teardown", got)
+	}
+	if got := SelectedNames(cfg, nil); !equalSlices(got, []string{"api"}) {
+		t.Fatalf("SelectedNames = %v, want only the service", got)
+	}
+	if got := TeardownNames(cfg); !equalSlices(got, []string{"cleanup"}) {
+		t.Fatalf("TeardownNames = %v, want [cleanup]", got)
+	}
+	if err := CheckSelector(cfg, "cleanup"); err == nil || !strings.Contains(err.Error(), "teardown") {
+		t.Fatalf("CheckSelector(cleanup) = %v, want a teardown refusal", err)
+	}
+	if err := CheckSelector(cfg, "nope"); err == nil || !strings.Contains(err.Error(), `unknown process "nope"`) {
+		t.Fatalf("CheckSelector(nope) = %v, want unknown process", err)
+	}
+	if err := CheckSelector(cfg, "api"); err != nil {
+		t.Fatalf("CheckSelector(api) = %v", err)
+	}
+
+	for _, tc := range []struct{ field, yaml, code string }{
+		{"ready_when", "    ready_when:\n      log: done\n", CodeTaskIncompatible},
+		{"ready_timeout", "    ready_timeout: 5\n", CodeTaskIncompatible},
+		{"restart", "    restart: on-failure\n", CodeTaskIncompatible},
+		{"health_when", "    health_when:\n      tcp: localhost:1\n", CodeTaskIncompatible},
+		{"health_interval", "    health_interval: 3\n", CodeTaskIncompatible},
+		{"health_action", "    health_action: report\n", CodeTaskIncompatible},
+		{"ports", "    ports:\n      http: 0\n", CodeTaskIncompatible},
+		{"depends_on", "    depends_on: [api]\n", CodeTaskIncompatible},
+		{"shutdown_timeout", "    shutdown_timeout: 6\n", CodeInvalidValue},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			_, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: api\n  cleanup:\n    cmd: x\n    mode: teardown\n"+tc.yaml))
+			var verr *ValidationError
+			if !errors.As(err, &verr) || verr.Code != tc.code || FormatPath(verr.Path) != "processes.cleanup."+tc.field {
+				t.Fatalf("err = %v, want %s at processes.cleanup.%s", err, tc.code, tc.field)
+			}
+		})
+	}
+
+	_, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: api\n    depends_on: [cleanup]\n  cleanup:\n    cmd: x\n    mode: teardown\n"))
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != CodeTeardownDependency || FormatPath(verr.Path) != "processes.api.depends_on[0]" {
+		t.Fatalf("depending on a teardown: err = %v, want %s at processes.api.depends_on[0]", err, CodeTeardownDependency)
 	}
 }
 

@@ -73,11 +73,29 @@ func (r *Runner) Reload() ipc.CommandResult {
 		r.reloadEvent(fmt.Sprintf("reload: removed process %q ignored (hot-remove not supported)", name), false)
 	}
 	var skipped []string
+	updated := 0
 	store := r.store.Load()
 	for _, c := range changes {
 		var st *procState
 		if store != nil {
 			st = store.get(c.name)
+		}
+		if c.proc.EffectiveMode() == config.ProcessModeTeardown {
+			// Nothing is running for it: the teardown phase reads the
+			// definition when the stack stops. Admission is checked so the
+			// phase never sees a definition change under it.
+			r.lifecycleMu.Lock()
+			if r.launchAdmissionClosedLocked() {
+				r.lifecycleMu.Unlock()
+				return ipc.CommandResult{Status: "error", Message: "daemon is shutting down"}
+			}
+			r.cfgMu.Lock()
+			r.Config.Processes[c.name] = c.proc
+			r.cfgMu.Unlock()
+			r.lifecycleMu.Unlock()
+			updated++
+			r.reloadEvent(fmt.Sprintf("reload: teardown %q updated; it runs when the stack stops", c.name), false)
+			continue
 		}
 		if c.proc.EffectiveMode() == config.ProcessModeTask {
 			skipped = append(skipped, c.name)
@@ -107,6 +125,18 @@ func (r *Runner) Reload() ipc.CommandResult {
 		r.reloadEvent("reload: no changes detected", false)
 	}
 
+	// applied describes the changes that took effect: restarted services and
+	// updated teardown definitions.
+	restarted := len(changes) - len(skipped) - updated
+	applied := func(parts []string) []string {
+		if restarted > 0 {
+			parts = append(parts, fmt.Sprintf("restarted %d", restarted))
+		}
+		if updated > 0 {
+			parts = append(parts, fmt.Sprintf("updated %d teardown", updated))
+		}
+		return parts
+	}
 	if len(added) > 0 || len(removed) > 0 {
 		var parts []string
 		if len(added) > 0 {
@@ -115,23 +145,16 @@ func (r *Runner) Reload() ipc.CommandResult {
 		if len(removed) > 0 {
 			parts = append(parts, fmt.Sprintf("ignored removed: %s", strings.Join(removed, ", ")))
 		}
-		if len(changes) > 0 {
-			parts = append(parts, fmt.Sprintf("restarted %d", len(changes)))
-		}
-		return ipc.CommandResult{Status: "partial", Message: strings.Join(parts, "; ") + " (restart the daemon to apply add/remove)"}
+		return ipc.CommandResult{Status: "partial", Message: strings.Join(applied(parts), "; ") + " (restart the daemon to apply add/remove)"}
 	}
 	if len(skipped) > 0 {
-		var parts []string
-		if len(changes)-len(skipped) > 0 {
-			parts = append(parts, fmt.Sprintf("restarted %d", len(changes)-len(skipped)))
-		}
-		parts = append(parts, fmt.Sprintf("skipped %d completed", len(skipped)))
+		parts := append(applied(nil), fmt.Sprintf("skipped %d completed", len(skipped)))
 		return ipc.CommandResult{Status: "partial", Message: strings.Join(parts, "; ") + " (restart the daemon to apply changes to completed tasks)"}
 	}
 	if len(changes) == 0 {
 		return ipc.CommandResult{Status: "ok", Message: "no changes detected"}
 	}
-	return ipc.CommandResult{Status: "ok", Message: fmt.Sprintf("restarted %d", len(changes))}
+	return ipc.CommandResult{Status: "ok", Message: strings.Join(applied(nil), "; ")}
 }
 
 // reloadEvent serializes reload diagnostics with admission closure. A reload
@@ -153,7 +176,8 @@ func procChanged(a, b config.Process) bool {
 		a.EnvFile != b.EnvFile || a.Mode != b.Mode || a.ReadyTimeout != b.ReadyTimeout {
 		return true
 	}
-	if !readyWhenEqual(a.ReadyWhen, b.ReadyWhen) {
+	if !readyWhenEqual(a.ReadyWhen, b.ReadyWhen) || !readyWhenEqual(a.HealthWhen, b.HealthWhen) ||
+		a.HealthInterval != b.HealthInterval || a.HealthAction != b.HealthAction {
 		return true
 	}
 	if len(a.Env) != len(b.Env) {
@@ -182,5 +206,5 @@ func readyWhenEqual(a, b *config.ReadyWhen) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return a.HTTP == b.HTTP && a.TCP == b.TCP && a.Log == b.Log
+	return *a == *b
 }

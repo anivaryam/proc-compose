@@ -646,6 +646,31 @@ func TestExistingConfigReportsOtherFindings(t *testing.T) {
 	}
 }
 
+// TestTeardownPortIsNotADuplicate: a teardown process's PORT names the
+// service it talks to after the stack stopped; it never binds it.
+func TestTeardownPortIsNotADuplicate(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `processes:
+  api:
+    cmd: go run .
+    env:
+      PORT: "3000"
+  cleanup:
+    mode: teardown
+    cmd: go run ./cleanup
+    env:
+      PORT: "3000"
+`)
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasFinding(report, codeDuplicatePort) {
+		t.Fatalf("teardown PORT reported as a duplicate: %+v", report.Findings)
+	}
+}
+
 func TestExistingConfigReportsMissingEnvFile(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `processes:

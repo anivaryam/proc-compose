@@ -65,6 +65,7 @@ const (
 	CodeRequiredFailed      = "required_process_failed"
 	CodeInterrupted         = "interrupted"
 	CodeCleanupUnverified   = "cleanup_unverified"
+	CodeTeardownFailed      = "teardown_failed"
 	CodeReceiptPersistence  = "receipt_persistence_failed"
 	CodeResultSizeLimit     = "result_size_limit"
 	CodeEvidenceUnavailable = "evidence_unavailable"
@@ -179,6 +180,22 @@ type Cleanup struct {
 	TerminationVerified *bool               `json:"termination_verified"`
 	UnresolvedProcesses []UnresolvedProcess `json:"unresolved_processes"`
 	Errors              []ErrorRecord       `json:"errors"`
+	// Teardown records each teardown process in run order; it is always a
+	// list, empty when none is configured. Status and TerminationVerified
+	// describe termination only.
+	Teardown []TeardownRecord `json:"teardown"`
+}
+
+// TeardownRecord is one teardown process's outcome. Status is one of the
+// runner's teardown statuses: passed, failed, timed_out, handed_off, not_run,
+// or skipped.
+type TeardownRecord struct {
+	Name       string  `json:"name"`
+	Status     string  `json:"status"`
+	ExitCode   *int    `json:"exit_code"`
+	StartedAt  *string `json:"started_at"`
+	FinishedAt *string `json:"finished_at"`
+	Error      string  `json:"error,omitempty"`
 }
 
 // EvidenceEvent is a bounded excerpt of one journal event.

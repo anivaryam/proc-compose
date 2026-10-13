@@ -16,7 +16,7 @@ proc-compose status [--json]                            Show daemon process stat
 proc-compose logs [process] [--json] [--follow]         Query or follow bounded, structured process events
 proc-compose restart <process>                          Restart one running process
 proc-compose reload                                     Reload config and restart changed processes
-proc-compose stop [--timeout N] [--force]               Stop daemon gracefully (or SIGKILL)
+proc-compose stop [--timeout N] [--force]               Stop daemon and verify its processes ended
 proc-compose list                                       List config processes
 proc-compose verify [processes...] -- PROGRAM [ARG...]  Owned stack + check + verified cleanup + receipt
 proc-compose attempts [id|latest] [--json]              List or show verification receipts
@@ -62,8 +62,8 @@ Important flags (bootstrap):
       --json               Emit machine-readable JSON
 
 Flags (stop):
-      --timeout int        Seconds to wait for graceful shutdown before SIGKILL (default 10)
-      --force              SIGKILL immediately without graceful shutdown
+      --timeout int        Seconds to wait for a verified shutdown (default 10, plus 15 when the stack has teardown processes)
+      --force              Force-terminate managed processes; clears a crashed daemon's state
 
 Flags (init):
       --template string    Starter template: minimal (default), node, go, python
@@ -91,6 +91,19 @@ $XDG_RUNTIME_DIR/pc-<hash>.pid    # daemon PID file
 $XDG_RUNTIME_DIR/pc-<hash>.log    # default log file when --log-file is not set
 ```
 
+The PID file is JSON and is replaced atomically, so a reader never sees a
+partial file. On Linux and macOS it also records every process group the
+daemon launched and has not yet proven empty, together with the boot and
+namespace identity (Linux) needed to interpret those IDs later. An entry is
+written before its command starts, so if the record cannot be written the
+launch fails instead of starting an unrecorded process. The exception is a
+PID file that cannot be updated when the stack starts, or that is deleted
+while it runs (for example when `$XDG_RUNTIME_DIR` is removed at logout),
+including one that another daemon has since recreated as its own: recording
+is then turned off for the rest of that run with a warning, processes keep
+launching unrecorded, and the other daemon's record is left untouched. Windows records no groups; Job Objects
+end managed processes together with the daemon.
+
 `logs` reads the default `.log` path. If you ran `up --silent --log-file PATH`, the daemon writes to `PATH` instead and `logs` will report "no log file found" — read `PATH` directly.
 
 ## Common tasks
@@ -115,6 +128,13 @@ proc-compose up --silent --log-file app.log
 
 The process starts daemonized. Logs are written to `app.log`. Use `monitor` to watch it live or `stop` to shut it down. A task-only stack runs in the foreground because no service remains for the daemon to manage, so `--silent` requires at least one service process.
 
+`up` refuses to start over a crashed run whose recorded process groups may
+still be running, because starting would overwrite the only record of them.
+It names those groups and asks you to run `proc-compose stop` first; `up`
+itself never signals anything. A crashed run whose groups are all gone, and a
+PID file without a group record, are cleaned up as before. On Linux and macOS
+an unreadable PID file also refuses the start; clear it with `stop --force`.
+
 ### Monitor a running daemon
 
 ```sh
@@ -126,11 +146,11 @@ Opens an interactive TUI showing process status, readiness, resource usage, and 
 ```
 proc-compose monitor               q=quit  ?=help  ↑↓/jk=nav  ⏎=filter  a=all  PgUp/Dn=scroll
   ready 3/3  tasks 1 done  failed 0  restarting 0
-  PROCESS    STATUS        RESTARTS  CPU%    MEM       READY     UPTIME
-▶ backend    ● running     0         12.5%    45.2MB   ready     1m32s
-  frontend   ● running     0          8.1%    32.1MB   ready     1m32s
-  merge-port ● running     0          0.2%     8.4MB   ready     1m32s
-  migrate    ✓ completed   0          0.0%     0.0MB   done      1m32s
+  PROCESS    STATUS        RESTARTS  CPU%    MEM       READY      UPTIME
+▶ backend    ● running     0         12.5%    45.2MB   ready      1m32s
+  frontend   ● running     0          8.1%    32.1MB   ready      1m32s
+  merge-port ● running     0          0.2%     8.4MB   ready      1m32s
+  migrate    ✓ completed   0          0.0%     0.0MB   done       1m32s
 ──────────────────────────────────────────────────────────────────────────────────────────────
 Logs: all
 backend    │ listening on :3001
@@ -199,13 +219,85 @@ restart the daemon to pick those up.
 ### Stop a running daemon
 
 ```sh
-proc-compose stop                # graceful, 10s timeout, then SIGKILL
+proc-compose stop                # graceful, 10s timeout
 proc-compose stop --timeout 30   # graceful, 30s timeout
-proc-compose stop --force        # SIGKILL immediately
+proc-compose stop --force        # force-terminate managed processes
 ```
 
-`stop` sends SIGTERM and waits up to `--timeout` seconds (default 10) for
-the daemon to exit cleanly. If the deadline passes the process is force-killed.
+`stop` asks the daemon to shut down. The daemon terminates every managed
+process, including descendants, and reports whether it verified that all of
+them exited. `stop` exits 0 only when the daemon verified this. When
+termination could not be verified, `stop` names what it could not confirm and
+exits non-zero. `--timeout` (default 10) bounds the wait for that verdict. If
+the daemon cannot be reached and has to be killed directly, the final kill
+can add up to 5 seconds.
+
+When the stack declares [teardown processes](configuration.md#teardown-processes),
+the daemon runs them after termination is verified (also with `--force`), and
+the default `--timeout` grows by their 15-second budget; an explicit
+`--timeout` is used as given. If only teardown failed, `stop` says that
+termination was verified but teardown did not pass, lists each teardown line
+(`teardown: <name> <status>: <reason>`), and exits non-zero.
+
+If the daemon crashed or was killed, it never reported a verdict, so `stop`
+recovers from its PID file instead. On Linux and macOS that file records each
+process group the daemon launched and had not yet proven empty. Under the
+session lease (if another proc-compose command holds it, `stop` fails and
+signals nothing), each recorded group ends up in one of these states:
+
+- **empty**: nothing is left in the group, the machine has rebooted since, or
+  the group's ID now belongs to an unrelated process. Nothing is signalled.
+- **terminated** (Linux only): the group's leader is still alive with the
+  recorded start time, which proves the group is the one the daemon launched.
+  Each member is signalled through a pidfd, which cannot reach a process that
+  later reuses the PID. Members get SIGTERM, and whatever is left at
+  `--timeout` gets SIGKILL (`--force` sends SIGKILL at once).
+- **unknown**: the group cannot be proven to be the daemon's, and it is never
+  signalled. This covers a group whose leader has already exited and been
+  reaped while other members keep running, a launch that crashed before its
+  process group existed, a record or machine whose boot ID cannot be read
+  (Linux; without both IDs a reboot cannot be ruled out), pids recorded in
+  another PID or time namespace (or read through a `/proc` mounted for
+  another PID namespace), a kernel or sandbox without pidfds, and every live
+  group on macOS (macOS has no start-time check, so it never signals).
+  Processes that moved out of the group with `setsid` or `setpgid` are not in
+  the record at all.
+
+`stop` prints one line of evidence per group, for example:
+
+```
+recovered group=web pgid=912 leader_start=51301 outcome=terminated reason=leader_proven signals=SIGTERM members=912,915
+recovered group=worker pgid=944 outcome=unknown reason=leader_gone live_members=1 members=950
+```
+
+`stop` exits 0 and removes the PID file only when every group is empty or
+terminated. Otherwise it fails, keeps the PID file, and lists the groups that
+are NOT verified. A retry checks every group again. Inspect the leftovers
+(`ps -eo pid,ppid,pgid,args`), then run `stop --force`: it clears the stale
+state but still exits non-zero when any group stayed unknown.
+
+A PID file written by a daemon that records no groups (an older
+proc-compose), or one that cannot be read, proves nothing. `stop` fails and
+keeps it. `stop --force` clears it and warns that the managed processes were
+NOT verified. It exits 0 for a readable file without groups, and non-zero for
+an unreadable file, which may have recorded groups that are still running.
+On Linux the PID file also records the daemon's start time, so a retry gives
+the same answer even after the PID is reused. macOS has no start-time check:
+once another process takes the dead daemon's PID, that process counts as the
+daemon. A retried `stop`, or `stop --force`, then cannot reach it over IPC,
+signals that unrelated process directly (SIGTERM and then SIGKILL; SIGKILL at
+once with `--force`), and once it exits deletes the PID file with its group
+record. Before retrying on macOS, check the daemon PID the failed `stop`
+reported with `ps -p <PID> -o pid,args`. If it is not a proc-compose daemon,
+do not run `stop` again and remove nothing blindly: inspect the leftovers
+with `ps -eo pid,ppid,pgid,args` first.
+
+On Windows, managed processes run in Job Objects that the kernel ends together
+with the daemon, so a dead daemon is cleaned up and reported as stopped.
+
+A daemon that crashed never ran its teardown processes. On every platform,
+`stop` adds `teardown did not run: <names>` to its report (as a warning when
+the stop itself succeeds), so the cleanup they do can be run by hand.
 
 ### Show daemon status
 
@@ -217,7 +309,17 @@ proc-compose status --json       # machine-readable, scriptable
 `status` reads a one-shot snapshot from the running daemon and exits. The
 text table includes a `MODE` column, and successful tasks appear as
 `completed`. The `--json` output includes a `ready` flag per process that
-distinguishes "started" from "started and passed its readiness probe".
+distinguishes "started" from "started and passed its readiness probe". A
+process with `health_when` also has `health` (`unknown`, `healthy`, or
+`unhealthy`) and, while checks are failing, `health_error` with the last
+failure. `ready` stays true while a service is unhealthy. Health describes the
+running incarnation only: while the process is restarting, exited, or failed,
+`health` is `unknown`, and the last verdict stays in the log.
+
+With `--health-port`, `GET /health` returns 200 only when every service is
+`running` or `restarting` and not `unhealthy`, and every task has `completed`;
+otherwise it returns 503. Each process in its body carries `health` when it
+has `health_when`. `GET /ready` reports readiness only and ignores health.
 
 ### Validate a config
 

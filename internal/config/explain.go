@@ -14,11 +14,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// RestartPolicies and ProcessModes are the accepted enum values; Load and the
-// published schema both read them so the two cannot drift.
+// RestartPolicies, ProcessModes and HealthActions are the accepted enum
+// values; Load and the published schema both read them so the two cannot
+// drift.
 var (
 	RestartPolicies = []string{"never", "on-failure", "always"}
-	ProcessModes    = []string{ProcessModeService, ProcessModeTask}
+	ProcessModes    = []string{ProcessModeService, ProcessModeTask, ProcessModeTeardown}
+	HealthActions   = []string{HealthActionReport, HealthActionRestart}
 )
 
 // Stable diagnostic codes. Codes are a machine contract: add new ones, never
@@ -43,6 +45,7 @@ const (
 	CodeUnknownDependency  = "unknown_dependency"
 	CodeDependencyCycle    = "dependency_cycle"
 	CodeInvalidResource    = "invalid_resource"
+	CodeTeardownDependency = "teardown_dependency"
 	CodeInvalid            = "invalid_config"
 )
 
@@ -56,16 +59,17 @@ var diagnosticHints = map[string]string{
 	CodeInvalidProcessName: "use [-A-Za-z0-9._] and start/end with an alphanumeric character",
 	CodeMissingCmd:         "add a cmd: the shell command that runs this process",
 	CodeInvalidRestart:     "use never, on-failure, or always",
-	CodeInvalidMode:        "use service or task",
-	CodeTaskIncompatible:   "remove the field, or drop mode: task to run this as a service",
+	CodeInvalidMode:        "use service, task, or teardown",
+	CodeTaskIncompatible:   "remove the field, or change the mode: tasks and teardown processes cannot use it",
 	CodeInvalidValue:       "use a non-negative value consistent with the restart policy",
-	CodeInvalidReadyWhen:   "set exactly one of ready_when.http, ready_when.tcp, or ready_when.log (a valid Go regex)",
+	CodeInvalidReadyWhen:   "set exactly one of ready_when.http, ready_when.tcp, ready_when.cmd, or ready_when.log (a valid Go regex); health_when takes http, tcp, or cmd",
 	CodeInvalidPort:        "port names follow process-name rules; preferred ports are 0-65535 (0 = ephemeral)",
 	CodeEnvFile:            "create the env_file or fix its path (relative paths resolve from the config directory)",
 	CodeSelfDependency:     "remove the process from its own depends_on",
 	CodeUnknownDependency:  "name an existing process in depends_on",
 	CodeDependencyCycle:    "remove one depends_on edge to break the cycle",
 	CodeInvalidResource:    "resource labels must be unique, non-empty, single-line, and at most 256 bytes",
+	CodeTeardownDependency: "remove the teardown process from depends_on: it runs only after the stack stops",
 }
 
 // ValidationError is the typed error Load returns for rule violations. Its
@@ -388,6 +392,9 @@ func schemaExtras() map[string]map[string]any {
 		"Process.max_restarts":     {"minimum": 0},
 		"Process.shutdown_timeout": {"minimum": 0},
 		"Process.ready_timeout":    {"minimum": -1},
+		"Process.health_when":      {"not": map[string]any{"required": []string{"log"}}}, // a log line matches once; validateProbe(allowLog=false)
+		"Process.health_interval":  {"minimum": 0, "default": DefaultHealthInterval},     // 0 = default, like shutdown_timeout
+		"Process.health_action":    {"enum": HealthActions, "default": HealthActionReport},
 		"Process.ports":            {"propertyNames": portName, "additionalProperties": map[string]any{"type": "integer", "minimum": 0, "maximum": 65535}},
 		"ReadyWhen":                {"minProperties": 1, "maxProperties": 1},
 	}
@@ -473,7 +480,16 @@ type PlannedProcess struct {
 	Probe      string              `json:"probe,omitempty"`
 	DependsOn  []string            `json:"depends_on"`
 	Ports      map[string]int      `json:"ports,omitempty"`
+	Health     *PlannedHealth      `json:"health,omitempty"`
 	References []EndpointReference `json:"references,omitempty"`
+}
+
+// PlannedHealth summarises a service's health_when probe.
+type PlannedHealth struct {
+	Probe    string `json:"probe"`  // http | tcp | cmd
+	Target   string `json:"target"` // the probe's URL, address or command
+	Interval int    `json:"interval_seconds"`
+	Action   string `json:"action"` // report | restart
 }
 
 // StartupPlan is the resolved dependency order for a selection. It is derived
@@ -485,6 +501,9 @@ type StartupPlan struct {
 	Note          string           `json:"note"`
 	Levels        [][]string       `json:"levels"`
 	Processes     []PlannedProcess `json:"processes"`
+	// Teardown lists the teardown processes in run order. They run after the
+	// stack stops, for the whole stack whatever the filter.
+	Teardown []string `json:"teardown,omitempty"`
 }
 
 var referenceRe = regexp.MustCompile(`\$\{((?:ports|urls|session|config)\.[^}]*)\}`)
@@ -494,8 +513,8 @@ var referenceRe = regexp.MustCompile(`\$\{((?:ports|urls|session|config)\.[^}]*)
 // known dependencies and no cycles.
 func Plan(cfg *Config, filter []string) (*StartupPlan, error) {
 	for _, name := range filter {
-		if _, ok := cfg.Processes[name]; !ok {
-			return nil, fmt.Errorf("unknown process %q", name)
+		if err := CheckSelector(cfg, name); err != nil {
+			return nil, err
 		}
 	}
 	names := SelectedNames(cfg, filter)
@@ -537,14 +556,29 @@ func Plan(cfg *Config, filter []string) (*StartupPlan, error) {
 					p.Readiness, p.Probe = "http", rw.HTTP
 				case rw.TCP != "":
 					p.Readiness, p.Probe = "tcp", rw.TCP
+				case rw.Cmd != "":
+					p.Readiness, p.Probe = "cmd", rw.Cmd
 				case rw.Log != "":
 					p.Readiness, p.Probe = "log", rw.Log
 				}
+			}
+			if hw := proc.HealthWhen; hw != nil {
+				h := &PlannedHealth{Interval: proc.EffectiveHealthInterval(), Action: proc.EffectiveHealthAction()}
+				switch {
+				case hw.HTTP != "":
+					h.Probe, h.Target = "http", hw.HTTP
+				case hw.TCP != "":
+					h.Probe, h.Target = "tcp", hw.TCP
+				case hw.Cmd != "":
+					h.Probe, h.Target = "cmd", hw.Cmd
+				}
+				p.Health = h
 			}
 			p.References = processReferences(cfg, proc, selected)
 			plan.Processes = append(plan.Processes, p)
 		}
 	}
+	plan.Teardown = TeardownNames(cfg)
 	return plan, nil
 }
 
@@ -560,7 +594,10 @@ func processReferences(cfg *Config, proc Process, selected map[string]bool) []En
 		fields = append(fields, [2]string{"env." + key, proc.Env[key]})
 	}
 	if rw := proc.ReadyWhen; rw != nil {
-		fields = append(fields, [2]string{"ready_when.http", rw.HTTP}, [2]string{"ready_when.tcp", rw.TCP})
+		fields = append(fields, [2]string{"ready_when.http", rw.HTTP}, [2]string{"ready_when.tcp", rw.TCP}, [2]string{"ready_when.cmd", rw.Cmd})
+	}
+	if hw := proc.HealthWhen; hw != nil {
+		fields = append(fields, [2]string{"health_when.http", hw.HTTP}, [2]string{"health_when.tcp", hw.TCP}, [2]string{"health_when.cmd", hw.Cmd})
 	}
 	var refs []EndpointReference
 	for _, field := range fields {

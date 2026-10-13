@@ -5,10 +5,16 @@ package verify
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+
+	"github.com/anivaryam/proc-compose/internal/daemon"
+	"github.com/anivaryam/proc-compose/internal/paths"
+	"github.com/anivaryam/proc-compose/internal/session"
 )
 
 func TestRun_CheckDescendantsAreCleanedUp(t *testing.T) {
@@ -45,5 +51,53 @@ func TestRun_EscapedCheckDescendantIsUnverified(t *testing.T) {
 	}
 	if result.Status == StatusPassed || result.Cleanup.Status != StatusUnverified || result.Cleanup.TerminationVerified == nil || *result.Cleanup.TerminationVerified {
 		t.Fatalf("escaped descendant reported as clean: status %s cleanup %+v", result.Status, result.Cleanup)
+	}
+}
+
+// TestVerify_RefusesCrashedRunRecord: verify never runs `up`'s preflight, so it
+// gates on a crashed run itself, under the lease it just took. A record whose
+// group is still running is not overwritten: the attempt fails as
+// session_occupied, the group is untouched and the lease is released.
+func TestVerify_RefusesCrashedRunRecord(t *testing.T) {
+	f := newFixture(t, serviceConfig)
+	opts := f.options(t, "", "true")
+	gone := exec.Command("true")
+	if err := gone.Run(); err != nil {
+		t.Fatal(err)
+	}
+	leader := exec.Command("sleep", "60")
+	leader.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := leader.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reaped := make(chan struct{})
+	go func() { _ = leader.Wait(); close(reaped) }()
+	t.Cleanup(func() {
+		_ = leader.Process.Kill()
+		<-reaped
+	})
+	info, _ := daemon.ProcStat(leader.Process.Pid)
+	pidPath := paths.PID(opts.Hash)
+	if err := daemon.WritePID(pidPath, gone.Process.Pid, paths.Socket(opts.Hash)); err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.WriteGroups(pidPath, gone.Process.Pid, []daemon.Group{{Name: "api", PGID: leader.Process.Pid, LeaderStart: info.StartTime}}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(pidPath)
+
+	result := Run(context.Background(), opts)
+	assertComplete(t, result)
+	if result.ExitCode != ExitUsage || result.Phase != PhaseAcquiring || len(result.Errors) == 0 || result.Errors[0].Code != CodeSessionOccupied {
+		t.Fatalf("verify over a crashed run = exit %d phase %s errors %v, want session_occupied", result.ExitCode, result.Phase, result.Errors)
+	}
+	if after, _ := os.ReadFile(pidPath); string(after) != string(before) {
+		t.Fatalf("verify overwrote the crashed run's record:\nbefore %s\nafter  %s", before, after)
+	}
+	if err := syscall.Kill(leader.Process.Pid, 0); err != nil {
+		t.Fatalf("verify signalled the recorded leader: %v", err)
+	}
+	if held, _ := session.InstanceHeld(opts.Hash); held {
+		t.Fatal("refusal kept the instance lease")
 	}
 }

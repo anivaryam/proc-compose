@@ -64,6 +64,64 @@ processes:
     restart: always
 ```
 
+## Reset and seed before services
+
+Chained tasks prepare state before any service starts. Each step runs only
+after the one before it exited `0`, and a failed step fails the stack before
+the services start.
+
+```yaml
+processes:
+  db:
+    cmd: postgres -D ./data
+    ready_when:
+      tcp: localhost:5432
+  reset:
+    mode: task
+    cmd: npm run db:reset
+    depends_on: [db]
+  seed:
+    mode: task
+    cmd: npm run db:seed
+    depends_on: [reset]
+  api:
+    cmd: npm start
+    depends_on: [seed]
+    ready_when:
+      http: http://localhost:3000/health
+```
+
+Tasks run again on every `up`, and `restart` refuses a task. Keep destructive
+steps behind whatever guard the script already has (for example a check that
+the database URL points at a test database).
+
+A task's `env` and `env_file` are read by the proc-compose daemon and passed to
+the command, like any process's. If a reset needs credentials the services must
+not have, such as a database owner URL, give only that task the `env_file`, or
+keep the reset outside proc-compose and run it before `up`.
+
+## Clean up after the stack stops
+
+A teardown process runs once the stack has stopped and its processes are
+verified gone, for example to delete what an end-to-end run uploaded:
+
+```yaml
+processes:
+  api:
+    cmd: npm start
+    ready_when:
+      http: http://localhost:3000/health
+  cleanup-uploads:
+    mode: teardown
+    cmd: node scripts/cleanup-uploads.mjs
+    env_file: .env.test.local
+```
+
+It runs after `stop` (also `--force`), Ctrl+C, or a failed setup task, within
+a 15 second budget. If any process could not be verified terminated it is
+skipped and reported instead. See
+[Teardown Processes](configuration.md#teardown-processes).
+
 ## Full-stack with public tunnel
 
 Tunnel runs as a regular process. The [`tunnel`](https://github.com/anivaryam/tunnel) binary spawns a background daemon (managed via a unix socket in `$TMPDIR`); the foreground command is a client attached to it. If proc-compose kills the client, the daemon keeps running and the public URL stays open. On Linux/macOS, wrap the command with `bash` and `trap` so SIGTERM stops the daemon too:

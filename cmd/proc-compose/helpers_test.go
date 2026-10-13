@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/logs"
 	"github.com/anivaryam/proc-compose/internal/paths"
+	"github.com/anivaryam/proc-compose/internal/runner"
 	"github.com/anivaryam/proc-compose/internal/session"
 	"github.com/anivaryam/proc-compose/internal/update"
 	"github.com/spf13/cobra"
@@ -413,7 +415,7 @@ func TestPreflightCheck_MergeProxyOutputPortOccupiedFails(t *testing.T) {
 		},
 	}
 
-	err := preflightCheck(testPIDPath(t), testSocketPath(t), cfg)
+	err := preflightCheck(testPIDPath(t), cfg)
 	if err == nil {
 		t.Fatal("expected occupied merge proxy output port to fail preflight")
 	}
@@ -438,7 +440,7 @@ func TestPreflightCheck_ManagedSimpleUpstreamPortOccupiedFails(t *testing.T) {
 		},
 	}
 
-	err := preflightCheck(testPIDPath(t), testSocketPath(t), cfg)
+	err := preflightCheck(testPIDPath(t), cfg)
 	if err == nil {
 		t.Fatal("expected occupied managed upstream port to fail preflight")
 	}
@@ -463,7 +465,7 @@ func TestPreflightCheck_ExternalSimpleUpstreamPortOccupiedAllowed(t *testing.T) 
 		},
 	}
 
-	if err := preflightCheck(testPIDPath(t), testSocketPath(t), cfg); err != nil {
+	if err := preflightCheck(testPIDPath(t), cfg); err != nil {
 		t.Fatalf("external occupied upstream port should be allowed, got: %v", err)
 	}
 }
@@ -485,7 +487,7 @@ func TestPreflightCheck_RouteModeMixedManagedExternalTargetsOnlyManagedFails(t *
 		},
 	}
 
-	err := preflightCheck(testPIDPath(t), testSocketPath(t), cfg)
+	err := preflightCheck(testPIDPath(t), cfg)
 	if err == nil {
 		t.Fatal("expected occupied managed route target to fail preflight")
 	}
@@ -499,6 +501,201 @@ func TestPreflightCheck_RouteModeMixedManagedExternalTargetsOnlyManagedFails(t *
 	if strings.Contains(msg, fmt.Sprintf(":%d", externalPort)) {
 		t.Fatalf("error should not mention occupied external route target %d, got: %s", externalPort, msg)
 	}
+}
+
+// TestPreflight_RefusesWhenCrashedDaemonLeftLiveGroups is the S4 gate: a PID
+// file left by a crashed daemon whose recorded group is still running must stop
+// `up` from overwriting the only record of that group. The file is kept and the
+// group is not touched; `up` never signals.
+func TestPreflight_RefusesWhenCrashedDaemonLeftLiveGroups(t *testing.T) {
+	requireSignalStopFixture(t)
+	runtimeDir := testTempDir(t)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	pidPath, leader := startCrashedRecord(t, runtimeDir, "crashedlive")
+	before, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = preflightCheck(pidPath, &config.Config{})
+	if err == nil || !strings.Contains(err.Error(), "proc-compose stop") || !strings.Contains(err.Error(), "recovered group=api") {
+		t.Fatalf("preflightCheck after a crash with a live group = %v, want a refusal naming the group and proc-compose stop", err)
+	}
+	if after, _ := os.ReadFile(pidPath); string(after) != string(before) {
+		t.Fatalf("preflight changed the crashed run's record:\nbefore %s\nafter  %s", before, after)
+	}
+	if !pidIsRunning(leader) {
+		t.Fatalf("preflight signalled the recorded leader (PID %d)", leader)
+	}
+}
+
+// TestPreflight_CrashedDaemonWithEmptyGroupsCleanedOnlyUnderLease: a crashed
+// run whose recorded groups are all proven empty leaves nothing to protect, so
+// `up` may start, and a PID file without a record may too. Preflight runs
+// without the lease, so it must leave the stale files alone: by the time it
+// would delete them another `up` may have taken the lease and written its own.
+// acquireRun, under the lease, is what removes them.
+func TestPreflight_CrashedDaemonWithEmptyGroupsCleanedOnlyUnderLease(t *testing.T) {
+	requireSignalStopFixture(t)
+	dir := testTempDir(t)
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	gone := exec.Command("true")
+	if err := gone.Run(); err != nil {
+		t.Fatal(err)
+	}
+	for name, groups := range map[string]*[]daemon.Group{
+		"recorded": {{Name: "done", PGID: gone.Process.Pid, LeaderStart: 1}},
+		"legacy":   nil,
+	} {
+		pidPath := filepath.Join(dir, "pc-"+name+".pid")
+		socketPath := filepath.Join(dir, "pc-"+name+".sock")
+		if err := daemon.WritePID(pidPath, gone.Process.Pid, socketPath); err != nil {
+			t.Fatal(err)
+		}
+		if groups != nil {
+			if err := daemon.WriteGroups(pidPath, gone.Process.Pid, *groups); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(socketPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := preflightCheck(pidPath, &config.Config{}); err != nil {
+			t.Fatalf("%s: preflightCheck = %v, want the start allowed", name, err)
+		}
+		for _, path := range []string{pidPath, socketPath} {
+			if _, statErr := os.Stat(path); statErr != nil {
+				t.Fatalf("%s: preflight, which holds no lease, removed %s: %v", name, path, statErr)
+			}
+		}
+
+		cfg := &config.Config{Processes: map[string]config.Process{"api": {Cmd: "serve"}}}
+		plan, err := acquireRun(cfg, filepath.Join(dir, name+".yml"), name, name, nil, pidPath, socketPath)
+		if err != nil {
+			t.Fatalf("%s: acquireRun = %v, want the stale state cleaned", name, err)
+		}
+		plan.Close()
+		for _, path := range []string{pidPath, socketPath} {
+			if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("%s: acquireRun left %s (stat err = %v)", name, path, statErr)
+			}
+		}
+	}
+}
+
+// TestAcquireRun_RefusesCrashedRunUnderLease pins the authoritative gate `up`
+// runs once it holds the session lease. Preflight catches the same crashed run
+// earlier, so only this test notices if the gate after Acquire goes missing: a
+// record that appears between preflight and Acquire would be overwritten. The
+// refusal keeps the record, signals nothing and releases the lease.
+func TestAcquireRun_RefusesCrashedRunUnderLease(t *testing.T) {
+	requireSignalStopFixture(t)
+	runtimeDir := testTempDir(t)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	pidPath, leader := startCrashedRecord(t, runtimeDir, "gated")
+	before, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Processes: map[string]config.Process{"api": {Cmd: "serve"}}}
+	plan, err := acquireRun(cfg, filepath.Join(runtimeDir, "proc-compose.yml"), "gated", "gated", nil,
+		pidPath, filepath.Join(runtimeDir, "pc-gated.sock"))
+	if err == nil {
+		plan.Close()
+		t.Fatal("acquireRun took the session over a crashed run whose recorded group is still running")
+	}
+	if !strings.Contains(err.Error(), "recovered group=api") || !strings.Contains(err.Error(), "proc-compose stop") {
+		t.Fatalf("acquireRun refusal = %v, want it to name the group and point at proc-compose stop", err)
+	}
+	if after, _ := os.ReadFile(pidPath); string(after) != string(before) {
+		t.Fatalf("acquireRun changed the crashed run's record:\nbefore %s\nafter  %s", before, after)
+	}
+	if !pidIsRunning(leader) {
+		t.Fatalf("acquireRun signalled the recorded leader (PID %d)", leader)
+	}
+	if held, err := session.InstanceHeld("gated"); err != nil || held {
+		t.Fatalf("after the refusal the instance lease is held = %v (err %v), want it released", held, err)
+	}
+}
+
+// TestPreflight_CorruptPIDFileRefusesOnUnix: an unreadable PID file may hide a
+// record of running groups, so on Unix it is never cleaned as if it were stale.
+func TestPreflight_CorruptPIDFileRefusesOnUnix(t *testing.T) {
+	requireSignalStopFixture(t)
+	pidPath := testPIDPath(t)
+	if err := os.WriteFile(pidPath, []byte(`{"pid":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := preflightCheck(pidPath, &config.Config{})
+	if err == nil || !strings.Contains(err.Error(), "NOT verified") || !strings.Contains(err.Error(), "stop --force") {
+		t.Fatalf("preflightCheck on a corrupt PID file = %v, want a NOT verified refusal pointing at stop --force", err)
+	}
+	if _, statErr := os.Stat(pidPath); statErr != nil {
+		t.Fatalf("preflight removed the corrupt PID file: %v", statErr)
+	}
+}
+
+// TestUp_RefusesAfterCrashUntilStop drives the gate through the binary: after a
+// crash, `up` refuses while the recorded groups run, `stop` recovers them, and
+// then `up` starts normally.
+func TestUp_RefusesAfterCrashUntilStop(t *testing.T) {
+	requireLinuxRecovery(t)
+	bin := buildTestBinary(t)
+	dir := t.TempDir()
+	fixture := startStack(t, bin, dir, false)
+	fixture.assertRecordedGroups(t, rolePortless, roleStubborn)
+	killDaemon(t, fixture)
+	up := func() (string, error) {
+		c := exec.Command(bin, "up", "--silent", "--file", fixture.configPath)
+		c.Env = fixture.env
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+
+	out, err := up()
+	if err == nil {
+		// Do not leak the stack this wrongly started: its live daemon can still
+		// verify its own shutdown, and its pid is killed exactly as a fallback.
+		if stopOut, stopErr := fixture.stop(t, "--force"); stopErr != nil {
+			t.Logf("cleanup: stop of the wrongly started stack: %v\n%s", stopErr, stopOut)
+		}
+		if rec, readErr := daemon.ReadRecord(fixture.pidPath); readErr == nil && rec.PID > 0 {
+			if proc, findErr := os.FindProcess(rec.PID); findErr == nil {
+				_ = proc.Kill()
+			}
+		}
+		t.Fatalf("up started over a crashed run whose groups were still running:\n%s", out)
+	}
+	if !strings.Contains(out, "proc-compose stop") {
+		t.Fatalf("up refusal = %q, want it to point at proc-compose stop", out)
+	}
+	for _, role := range []string{rolePortless, roleStubborn} {
+		if !pidIsRunning(fixture.pids[role]) {
+			t.Fatalf("up signalled %s (PID %d); it must only refuse", role, fixture.pids[role])
+		}
+	}
+
+	if out, err := fixture.stop(t, "--timeout", "2"); err != nil {
+		t.Fatalf("stop after the crash failed: %v\n%s", err, out)
+	}
+	fixture.assertAllTerminated(t, 10*time.Second)
+	for _, f := range []string{"portless.pid", "stubborn.pid"} {
+		_ = os.Remove(filepath.Join(dir, f))
+	}
+	if out, err := up(); err != nil {
+		t.Fatalf("up after a verified stop failed: %v\n%s", err, out)
+	}
+	restarted := stackFixture{bin: bin, configPath: fixture.configPath, env: fixture.env, pidPath: fixture.pidPath, pids: map[string]int{
+		roleDaemon:   readDaemonPID(t, fixture.pidPath),
+		rolePortless: waitForRecordedPID(t, filepath.Join(dir, "portless.pid")),
+		roleStubborn: waitForRecordedPID(t, filepath.Join(dir, "stubborn.pid")),
+	}}
+	t.Cleanup(func() { restarted.forceCleanup(t) })
+	if out, err := restarted.stop(t); err != nil {
+		t.Fatalf("stop of the restarted stack failed: %v\n%s", err, out)
+	}
+	restarted.assertAllTerminated(t, 30*time.Second)
 }
 
 func occupyTCPPort(t *testing.T) (int, func()) {
@@ -521,11 +718,6 @@ func freeTCPPort(t *testing.T) int {
 func testPIDPath(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(t.TempDir(), "pc.pid")
-}
-
-func testSocketPath(t *testing.T) string {
-	t.Helper()
-	return filepath.Join(t.TempDir(), "pc.sock")
 }
 
 func TestGetHomeDir(t *testing.T) {
@@ -1135,6 +1327,20 @@ func TestSilentGuardrail_TaskOnlyErrorMessage(t *testing.T) {
 	}
 }
 
+// TestSilentGuardrail_TeardownIsNotAService: a teardown process never starts
+// with the stack, so it cannot keep a task-only stack in the background.
+func TestSilentGuardrail_TeardownIsNotAService(t *testing.T) {
+	cfg := &config.Config{
+		Processes: map[string]config.Process{
+			"migrate": {Cmd: "echo migrate", Mode: config.ProcessModeTask},
+			"cleanup": {Cmd: "echo cleanup", Mode: config.ProcessModeTeardown},
+		},
+	}
+	if err := validateSilentSelection(cfg, nil); err == nil {
+		t.Fatal("a task plus a teardown process was accepted for --silent")
+	}
+}
+
 func TestSilentGuardrail_ServiceWithTaskAllowed(t *testing.T) {
 	cfg := &config.Config{
 		Processes: map[string]config.Process{
@@ -1453,22 +1659,14 @@ func pidIsRunning(pid int) bool {
 }
 
 // pidIsTerminatedUnreaped reports whether pid is a zombie or already dead.
-// Linux only; elsewhere the /proc read fails and plain liveness is used.
+// Linux only; elsewhere daemon.ProcStat is unsupported and plain liveness is used.
 func pidIsTerminatedUnreaped(pid int) bool {
-	data, err := os.ReadFile("/proc/" + fmt.Sprint(pid) + "/stat")
+	info, err := daemon.ProcStat(pid)
 	if err != nil {
 		return false
 	}
-	closeIdx := strings.LastIndexByte(string(data), ')')
-	if closeIdx < 0 || closeIdx+2 > len(data) {
-		return false
-	}
-	fields := strings.Fields(string(data[closeIdx+2:]))
-	if len(fields) == 0 {
-		return false
-	}
-	switch fields[0] {
-	case "Z", "X", "x":
+	switch info.State {
+	case 'Z', 'X', 'x':
 		return true
 	}
 	return false
@@ -1539,6 +1737,7 @@ type stackFixture struct {
 	bin        string
 	configPath string
 	env        []string // the environment `up` used; `stop` must resolve the same PID file
+	pidPath    string   // the daemon's PID file
 	pids       map[string]int
 }
 
@@ -1556,9 +1755,9 @@ const (
 // would race on a loaded machine.
 //
 // withDetached adds a role whose group leader exits immediately while a
-// descendant that ignores SIGTERM keeps running. Such a process is
-// reportable-but-not-signallable — see TestStop_ReportsUnsignalledSurvivor — so
-// it is opt-in, because it changes the verdict a stop must produce.
+// descendant that ignores SIGTERM keeps running — see
+// TestStop_TerminatesDetachedDescendantOfAnExitedLeader. It is opt-in because
+// it is the hardest case for a stop to resolve.
 func startStack(t *testing.T, bin, dir string, withDetached bool) stackFixture {
 	t.Helper()
 
@@ -1614,6 +1813,7 @@ func startStack(t *testing.T, bin, dir string, withDetached bool) stackFixture {
 	if pidPath == "" {
 		t.Fatalf("daemon wrote no PID file in %s", runtimeDir)
 	}
+	fixture.pidPath = pidPath
 	fixture.pids[roleDaemon] = readDaemonPID(t, pidPath)
 
 	fixture.pids[rolePortless] = waitForRecordedPID(t, portlessPIDFile)
@@ -1692,6 +1892,62 @@ func waitForRecordedPID(t *testing.T, path string) int {
 	}
 }
 
+// assertRecordedGroups pins the `up` wiring of Runner.RecordPath: the real
+// daemon's PID file must record a tracked process group for every listed role.
+// On Linux each recorded pgid must be the role's actual process group and carry
+// its leader's start time. It polls because a fixture can write its own PID
+// before the daemon records the tracked leader.
+func (f stackFixture) assertRecordedGroups(t *testing.T, roles ...string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	var rec daemon.Record
+	for {
+		var err error
+		rec, err = daemon.ReadRecord(f.pidPath)
+		if err != nil {
+			t.Fatalf("ReadRecord(%s): %v", f.pidPath, err)
+		}
+		tracked := map[string]bool{}
+		if rec.Groups != nil {
+			for _, g := range *rec.Groups {
+				if g.PGID > 0 {
+					tracked[g.Name] = true
+				}
+			}
+		}
+		missing := false
+		for _, role := range roles {
+			missing = missing || !tracked[role]
+		}
+		if !missing {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("daemon PID file %s does not record a tracked group for each of %v: %+v (groups %v)",
+				f.pidPath, roles, rec, rec.Groups)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if runtime.GOOS != "linux" {
+		return
+	}
+	for _, role := range roles {
+		info, err := daemon.ProcStat(f.pids[role])
+		if err != nil {
+			t.Fatalf("ProcStat(%s, PID %d): %v", role, f.pids[role], err)
+		}
+		found := false
+		for _, g := range *rec.Groups {
+			if g.Name == role && g.PGID == info.PGID && g.LeaderStart != 0 {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("record %v has no %s entry for pgid %d with a leader start time", *rec.Groups, role, info.PGID)
+		}
+	}
+}
+
 func atoiOrZero(s string) int {
 	if s == "" {
 		return 0
@@ -1709,10 +1965,20 @@ func atoiOrZero(s string) int {
 // assertAllTerminated fails unless every tracked PID has stopped executing.
 func (f stackFixture) assertAllTerminated(t *testing.T, timeout time.Duration) {
 	t.Helper()
+	f.assertRolesTerminated(t, timeout)
+}
+
+// assertRolesTerminated fails unless the named roles' PIDs have stopped
+// executing; with no roles it checks every tracked PID.
+func (f stackFixture) assertRolesTerminated(t *testing.T, timeout time.Duration, roles ...string) {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
 		alive := ""
 		for role, pid := range f.pids {
+			if len(roles) > 0 && !slices.Contains(roles, role) {
+				continue
+			}
 			if pidIsRunning(pid) {
 				alive += fmt.Sprintf(" %s(PID %d)", role, pid)
 			}
@@ -1721,7 +1987,7 @@ func (f stackFixture) assertAllTerminated(t *testing.T, timeout time.Duration) {
 			return
 		}
 		if !time.Now().Before(deadline) {
-			t.Fatalf("still running%s after %s — the stop reported success but the processes survived", alive, timeout)
+			t.Fatalf("still running%s after %s — stop did not terminate them", alive, timeout)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -1810,6 +2076,7 @@ func TestStop_TerminatesManagedProcesses(t *testing.T) {
 	requireSignalStopFixture(t)
 	bin := buildTestBinary(t)
 	fixture := startStack(t, bin, t.TempDir(), false)
+	fixture.assertRecordedGroups(t, rolePortless, roleStubborn)
 
 	out, err := fixture.stop(t)
 	if err != nil {
@@ -1841,6 +2108,405 @@ func TestStopForce_TerminatesManagedProcesses(t *testing.T) {
 	fixture.assertAllTerminated(t, 30*time.Second)
 	if !strings.Contains(out, "stopped proc-compose daemon") {
 		t.Fatalf("stop --force output = %q, want it to report a stopped daemon", out)
+	}
+}
+
+// TestStop_DeadDaemonDoesNotReportSuccess pins the crash path for a PID file
+// that records no process groups (an older daemon, or recording disabled). A
+// daemon that dies without a shutdown verdict leaves its managed processes
+// running, and without a record nothing outside the daemon knows which ones
+// they are. `stop` used to delete the PID file and exit 0 anyway; it must
+// instead fail, keep the PID file, and leave clearing it to `stop --force`.
+func TestStop_DeadDaemonDoesNotReportSuccess(t *testing.T) {
+	requireSignalStopFixture(t)
+	bin := buildTestBinary(t)
+	fixture := startStack(t, bin, t.TempDir(), false)
+
+	pidPath := fixture.pidPath
+	killDaemon(t, fixture)
+	stripRecordedGroups(t, pidPath)
+	if pid := fixture.pids[rolePortless]; !pidIsRunning(pid) {
+		t.Fatalf("portless worker (PID %d) died with the daemon; the test would prove nothing", pid)
+	}
+
+	out, err := fixture.stop(t)
+	if err == nil {
+		t.Fatalf("stop exited 0 after the daemon crashed while the portless worker was still running:\n%s", out)
+	}
+	if !strings.Contains(out, "NOT verified") {
+		t.Fatalf("stop output = %q, want it to say the managed processes are NOT verified", out)
+	}
+	if _, statErr := os.Stat(pidPath); statErr != nil {
+		t.Fatalf("stop removed the PID file without verifying the managed processes: %v", statErr)
+	}
+
+	// Repeating the stop must give the same answer rather than succeed once
+	// the evidence has been consumed.
+	if out, err := fixture.stop(t); err == nil {
+		t.Fatalf("second stop exited 0 after the daemon crashed:\n%s", out)
+	}
+}
+
+// TestStopForce_DeadDaemonClearsStateWithWarning covers the operator's way out
+// of the crash path for a PID file without a process-group record: --force
+// acknowledges that the managed processes cannot be verified, clears the stale
+// state, and says so.
+func TestStopForce_DeadDaemonClearsStateWithWarning(t *testing.T) {
+	requireSignalStopFixture(t)
+	bin := buildTestBinary(t)
+	fixture := startStack(t, bin, t.TempDir(), false)
+
+	pidPath := fixture.pidPath
+	socketPath := strings.TrimSuffix(pidPath, ".pid") + ".sock"
+	killDaemon(t, fixture)
+	stripRecordedGroups(t, pidPath)
+	if _, err := os.Stat(socketPath); err != nil {
+		t.Fatalf("killed daemon left no socket at %s, so clearing it proves nothing: %v", socketPath, err)
+	}
+
+	// The warning must reach stderr: a script that keeps only stdout would
+	// otherwise lose the one statement that nothing was verified.
+	c := exec.Command(fixture.bin, "stop", "--force", "--file", fixture.configPath)
+	c.Env = fixture.env
+	var stdout, stderr bytes.Buffer
+	c.Stdout, c.Stderr = &stdout, &stderr
+	if err := c.Run(); err != nil {
+		t.Fatalf("stop --force failed on a dead daemon: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "NOT verified") {
+		t.Fatalf("stop --force stderr = %q, want it to warn the managed processes are NOT verified", stderr.String())
+	}
+	for _, path := range []string{pidPath, socketPath} {
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("stop --force left %s in place (stat err = %v)", path, statErr)
+		}
+	}
+}
+
+// stripRecordedGroups rewrites a PID file the way a daemon without
+// process-group recording would have left it: same pid, address and start time,
+// no groups and no host identity.
+func stripRecordedGroups(t *testing.T, pidPath string) {
+	t.Helper()
+	rec, err := daemon.ReadRecord(pidPath)
+	if err != nil {
+		t.Fatalf("ReadRecord(%s): %v", pidPath, err)
+	}
+	data, err := json.Marshal(daemon.Record{PID: rec.PID, Addr: rec.Addr, StartedAt: rec.StartedAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pidPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// requireLinuxRecovery skips tests that need crash recovery to signal, which
+// only Linux does.
+func requireLinuxRecovery(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("crash recovery terminates survivors only on Linux")
+	}
+}
+
+// evidenceLine returns the stop output's evidence line for one group, or "".
+func evidenceLine(out, group string) string {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "recovered group="+group+" ") {
+			return line
+		}
+	}
+	return ""
+}
+
+// TestStop_DeadDaemonTerminatesProvenSurvivors is the S3 acceptance test: after
+// the daemon is SIGKILLed, every managed group it recorded still has its
+// leader, so stop proves each one ours, terminates it, and only then reports
+// success and clears the PID file.
+func TestStop_DeadDaemonTerminatesProvenSurvivors(t *testing.T) {
+	requireLinuxRecovery(t)
+	bin := buildTestBinary(t)
+	fixture := startStack(t, bin, t.TempDir(), false)
+	fixture.assertRecordedGroups(t, rolePortless, roleStubborn)
+	killDaemon(t, fixture)
+	for _, role := range []string{rolePortless, roleStubborn} {
+		if !pidIsRunning(fixture.pids[role]) {
+			t.Fatalf("%s (PID %d) died with the daemon; the test would prove nothing", role, fixture.pids[role])
+		}
+	}
+
+	out, err := fixture.stop(t, "--timeout", "2")
+	if err != nil {
+		t.Fatalf("stop failed after a crash with provable survivors: %v\n%s", err, out)
+	}
+	fixture.assertAllTerminated(t, 10*time.Second)
+	for _, role := range []string{rolePortless, roleStubborn} {
+		if line := evidenceLine(out, role); !strings.Contains(line, "outcome=terminated") || !strings.Contains(line, "reason=leader_proven") {
+			t.Fatalf("evidence for %s = %q, want outcome=terminated reason=leader_proven\n%s", role, line, out)
+		}
+	}
+	if line := evidenceLine(out, roleStubborn); !strings.Contains(line, "signals=SIGTERM,SIGKILL") {
+		t.Fatalf("stubborn evidence = %q, want SIGTERM then SIGKILL", line)
+	}
+	if _, statErr := os.Stat(fixture.pidPath); !os.IsNotExist(statErr) {
+		t.Fatalf("verified recovery left the PID file in place (stat err = %v)", statErr)
+	}
+}
+
+// TestStop_DeadDaemonDetachedDescendantIsUnknown: once the crashed daemon's
+// zombie leader is reaped, nothing pins the detached role's pgid to our group,
+// so its descendant cannot be proven ours. stop terminates what it can prove,
+// reports the rest as unknown, keeps the PID file, and fails again on retry.
+func TestStop_DeadDaemonDetachedDescendantIsUnknown(t *testing.T) {
+	requireLinuxRecovery(t)
+	bin := buildTestBinary(t)
+	fixture := startStack(t, bin, t.TempDir(), true)
+	fixture.assertRecordedGroups(t, rolePortless, roleStubborn, roleDetached)
+	info, err := daemon.ProcStat(fixture.pids[roleDetached])
+	if err != nil {
+		t.Fatalf("ProcStat(detached): %v", err)
+	}
+	leader := info.PGID
+	killDaemon(t, fixture)
+	deadline := time.Now().Add(10 * time.Second)
+	for daemon.IsAlive(leader) {
+		if !time.Now().Before(deadline) {
+			t.Fatalf("detached role's leader (PID %d) was never reaped after the daemon died", leader)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	out, err := fixture.stop(t, "--timeout", "2")
+	if err == nil {
+		t.Fatalf("stop exited 0 while an unprovable descendant was running:\n%s", out)
+	}
+	if line := evidenceLine(out, roleDetached); !strings.Contains(line, "outcome=unknown") || !strings.Contains(line, "reason=leader_gone") {
+		t.Fatalf("detached evidence = %q, want outcome=unknown reason=leader_gone\n%s", line, out)
+	}
+	if !strings.Contains(out, "NOT verified") {
+		t.Fatalf("stop output = %q, want it to say the groups are NOT verified", out)
+	}
+	if pid := fixture.pids[roleDetached]; !pidIsRunning(pid) {
+		t.Fatalf("unprovable descendant (PID %d) was signalled", pid)
+	}
+	// The unknown group must not spare the groups stop can prove.
+	fixture.assertRolesTerminated(t, 10*time.Second, rolePortless, roleStubborn)
+	for _, role := range []string{rolePortless, roleStubborn} {
+		if line := evidenceLine(out, role); !strings.Contains(line, "outcome=terminated") || !strings.Contains(line, "reason=leader_proven") {
+			t.Fatalf("evidence for %s = %q, want outcome=terminated reason=leader_proven\n%s", role, line, out)
+		}
+	}
+	if _, statErr := os.Stat(fixture.pidPath); statErr != nil {
+		t.Fatalf("stop removed the PID file with a group unverified: %v", statErr)
+	}
+	if out, err := fixture.stop(t, "--timeout", "2"); err == nil {
+		t.Fatalf("second stop exited 0 with the descendant still unproven:\n%s", out)
+	}
+}
+
+// startCrashedRecord leaves a PID file the way a SIGKILLed daemon would: its pid
+// is gone, and its record names one live, test-owned process group with the
+// leader's real start time. It returns the PID file path and the leader's pid.
+func startCrashedRecord(t *testing.T, runtimeDir, hash string) (string, int) {
+	t.Helper()
+	gone := exec.Command("true")
+	if err := gone.Run(); err != nil {
+		t.Fatal(err)
+	}
+	leader := exec.Command("sleep", "60")
+	ok, err := startInOwnProcessGroup(leader)
+	if !ok {
+		t.Skip("this platform records no process groups")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	reaped := make(chan struct{})
+	go func() { _ = leader.Wait(); close(reaped) }()
+	t.Cleanup(func() {
+		_ = leader.Process.Kill()
+		<-reaped
+	})
+	info, _ := daemon.ProcStat(leader.Process.Pid)
+	pidPath := filepath.Join(runtimeDir, "pc-"+hash+".pid")
+	if err := daemon.WritePID(pidPath, gone.Process.Pid, filepath.Join(runtimeDir, "pc-"+hash+".sock")); err != nil {
+		t.Fatal(err)
+	}
+	group := daemon.Group{Name: "api", PGID: leader.Process.Pid, LeaderStart: info.StartTime}
+	if err := daemon.WriteGroups(pidPath, gone.Process.Pid, []daemon.Group{group}); err != nil {
+		t.Fatal(err)
+	}
+	return pidPath, leader.Process.Pid
+}
+
+// TestStop_DeadDaemonRefusesWhileLeaseHeld: recovery runs under the instance
+// lease. While another command holds it (a fresh `up` about to write its own
+// PID file, say), stop must not read, signal or delete anything.
+func TestStop_DeadDaemonRefusesWhileLeaseHeld(t *testing.T) {
+	requireSignalStopFixture(t)
+	runtimeDir := testTempDir(t)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	pidPath, leader := startCrashedRecord(t, runtimeDir, "leaseheld")
+	release, err := session.LeaseInstance("leaseheld")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	err = stopDeadDaemon(pidPath, filepath.Join(runtimeDir, "pc-leaseheld.sock"), "leaseheld", 1, true, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "nothing was signalled") {
+		t.Fatalf("stopDeadDaemon with the lease held = %v, want a refusal that signalled nothing", err)
+	}
+	if !pidIsRunning(leader) {
+		t.Fatalf("recorded leader (PID %d) was signalled while another command held the lease", leader)
+	}
+	if _, statErr := os.Stat(pidPath); statErr != nil {
+		t.Fatalf("refusal removed the PID file: %v", statErr)
+	}
+}
+
+// TestStop_DeadDaemonRechecksLivenessUnderLease: between stop finding the
+// daemon dead and taking the lease, a fresh `up` may have written its own PID
+// file. stop must see that live daemon once it holds the lease and leave its
+// PID file alone instead of recovering or clearing it.
+func TestStop_DeadDaemonRechecksLivenessUnderLease(t *testing.T) {
+	requireSignalStopFixture(t)
+	runtimeDir := testTempDir(t)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	// This test process stands in for the daemon that took over: it is alive
+	// and the PID file records its real start time.
+	pidPath := filepath.Join(runtimeDir, "pc-takeover.pid")
+	socketPath := filepath.Join(runtimeDir, "pc-takeover.sock")
+	if err := daemon.WritePID(pidPath, os.Getpid(), socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.WriteGroups(pidPath, os.Getpid(), []daemon.Group{}); err != nil {
+		t.Fatal(err)
+	}
+	if alive, _ := daemon.IsAliveFromPIDFile(pidPath); !alive {
+		t.Skip("this platform cannot prove the stand-in daemon alive from its PID file")
+	}
+	before, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, force := range []bool{false, true} {
+		err := stopDeadDaemon(pidPath, socketPath, "takeover", 1, force, time.Second)
+		if err == nil || !strings.Contains(err.Error(), "is now running") {
+			t.Fatalf("stopDeadDaemon(force=%v) over a live daemon = %v, want the now-running refusal", force, err)
+		}
+		if after, readErr := os.ReadFile(pidPath); readErr != nil || string(after) != string(before) {
+			t.Fatalf("stopDeadDaemon(force=%v) changed the live daemon's PID file (err %v):\nbefore %s\nafter  %s",
+				force, readErr, before, after)
+		}
+	}
+}
+
+// TestStop_CorruptPIDFileForceClears: an unparseable PID file proves nothing,
+// so stop reports it NOT verified and keeps it, and --force clears it instead
+// of dead-ending at "no running proc-compose". The file may have held a group
+// record, so unlike a readable legacy file --force still exits non-zero.
+func TestStop_CorruptPIDFileForceClears(t *testing.T) {
+	requireSignalStopFixture(t)
+	bin := buildTestBinary(t)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "proc-compose.yml")
+	if err := os.WriteFile(configPath, []byte("processes:\n  api:\n    cmd: sleep 60\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir := socketDirForTest(t)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	hash, err := paths.FromConfig(configPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidPath := paths.PID(hash)
+	if err := os.WriteFile(pidPath, []byte(`{"pid":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(), "XDG_RUNTIME_DIR="+runtimeDir, "NO_COLOR=1")
+	run := func(args ...string) (string, error) {
+		c := exec.Command(bin, append(args, "--file", configPath)...)
+		c.Env = env
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+
+	out, err := run("stop")
+	if err == nil || !strings.Contains(out, "NOT verified") {
+		t.Fatalf("stop on a corrupt PID file = %v\n%s\nwant a NOT verified failure", err, out)
+	}
+	if _, statErr := os.Stat(pidPath); statErr != nil {
+		t.Fatalf("stop removed the corrupt PID file without --force: %v", statErr)
+	}
+	if out, err := run("stop", "--force"); err == nil || !strings.Contains(out, "NOT verified") {
+		t.Fatalf("stop --force on a corrupt PID file = %v\n%s\nwant it cleared but failing with NOT verified", err, out)
+	}
+	if _, statErr := os.Stat(pidPath); !os.IsNotExist(statErr) {
+		t.Fatalf("stop --force left the corrupt PID file (stat err = %v)", statErr)
+	}
+}
+
+// TestStopForce_DeadDaemonUnprovenGroupClearsButFails pins the user decision
+// for a recorded run: --force with a group it cannot prove still clears the
+// stale state and prints the evidence, but exits 1 with NOT verified.
+func TestStopForce_DeadDaemonUnprovenGroupClearsButFails(t *testing.T) {
+	requireLinuxRecovery(t)
+	runtimeDir := testTempDir(t)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	pidPath, leader := startCrashedRecord(t, runtimeDir, "forceunknown")
+	rec, err := daemon.ReadRecord(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := append(*rec.Groups, daemon.Group{Name: "pending"})
+	if err := daemon.WriteGroups(pidPath, rec.PID, groups); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(runtimeDir, "pc-forceunknown.sock")
+
+	err = stopDeadDaemon(pidPath, socketPath, "forceunknown", rec.PID, true, time.Second)
+	if err == nil {
+		t.Fatal("stop --force exited 0 with a recorded group unproven")
+	}
+	for _, want := range []string{"NOT verified", "recovered group=pending pgid=0 outcome=unknown reason=launch_pending"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("stop --force error = %q, want it to contain %q", err, want)
+		}
+	}
+	// The unproven group must not spare the provable one.
+	if line := evidenceLine(err.Error(), "api"); !strings.Contains(line, "outcome=terminated") || !strings.Contains(line, "reason=leader_proven") {
+		t.Fatalf("evidence for api = %q, want outcome=terminated reason=leader_proven\n%v", line, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for pidIsRunning(leader) {
+		if !time.Now().Before(deadline) {
+			t.Fatalf("provable leader (PID %d) survived stop --force beside an unproven group", leader)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, statErr := os.Stat(pidPath); !os.IsNotExist(statErr) {
+		t.Fatalf("stop --force kept the PID file (stat err = %v)", statErr)
+	}
+}
+
+// killDaemon SIGKILLs the fixture daemon so it cannot run its shutdown, and
+// waits until it is gone.
+func killDaemon(t *testing.T, f stackFixture) {
+	t.Helper()
+	pid := f.pids[roleDaemon]
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatalf("find daemon (PID %d): %v", pid, err)
+	}
+	if err := proc.Kill(); err != nil {
+		t.Fatalf("kill daemon (PID %d): %v", pid, err)
+	}
+	if !waitProcessGone(pid, 10*time.Second) {
+		t.Fatalf("daemon (PID %d) survived SIGKILL", pid)
 	}
 }
 
@@ -2047,6 +2713,141 @@ func TestStopDaemon_SurvivorVerdictMakesStopFail(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "41234") {
 		t.Fatalf("error = %q, want it to name the surviving process group", err)
+	}
+}
+
+// TestStop_RunsTeardownAfterVerifiedStop drives the whole teardown surface
+// through the binary: a daemon started with up --silent runs its teardown
+// processes once its service is verified gone, and stop reports a teardown
+// failure as such while still exiting non-zero.
+func TestStop_RunsTeardownAfterVerifiedStop(t *testing.T) {
+	requireSignalStopFixture(t)
+	bin := buildTestBinary(t)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "torn-down")
+	configPath := filepath.Join(dir, "proc-compose.yml")
+	body := "processes:\n" +
+		"  api:\n    cmd: exec sleep 60\n    shutdown_timeout: 1\n" +
+		"  a-mark:\n    mode: teardown\n    cmd: touch " + marker + "\n" +
+		"  b-fail:\n    mode: teardown\n    cmd: echo bucket locked >&2; exit 4\n"
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir := socketDirForTest(t)
+	env := append(os.Environ(), "XDG_RUNTIME_DIR="+runtimeDir, "NO_COLOR=1")
+	run := func(args ...string) (string, error) {
+		c := exec.Command(bin, append(args, "--file", configPath)...)
+		c.Env = env
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := run("up", "--silent"); err != nil {
+		t.Fatalf("up --silent = %v\n%s", err, out)
+	}
+	hash, err := paths.FromConfig(configPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidPath := filepath.Join(runtimeDir, filepath.Base(paths.PID(hash)))
+	daemonPID := readDaemonPID(t, pidPath)
+	t.Cleanup(func() {
+		if pidIsRunning(daemonPID) {
+			_, _ = run("stop", "--force")
+		}
+	})
+
+	out, err := run("stop")
+	if err == nil {
+		t.Fatalf("stop = nil\n%s\nwant a failure: a teardown process failed", out)
+	}
+	if !strings.Contains(out, "termination was verified, but teardown did not pass") ||
+		!strings.Contains(out, ipc.TeardownPrefix+"b-fail failed: exit 4: bucket locked") ||
+		strings.Contains(out, "a-mark") {
+		t.Fatalf("stop output:\n%s\nwant only b-fail reported as a teardown failure", out)
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("a-mark did not run: %v", statErr)
+	}
+	if pidIsRunning(daemonPID) {
+		t.Fatalf("daemon (PID %d) still running after stop", daemonPID)
+	}
+	if _, statErr := os.Stat(pidPath); !os.IsNotExist(statErr) {
+		t.Fatalf("stop kept the PID file (stat err = %v)", statErr)
+	}
+}
+
+// TestStopDaemon_TeardownOnlyVerdictUsesTeardownWording: when every line of a
+// partial verdict is a teardown line, termination was verified and only
+// teardown failed, so stop says exactly that and still fails. A verdict that
+// also names a managed process keeps the not-verified wording.
+func TestStopDaemon_TeardownOnlyVerdictUsesTeardownWording(t *testing.T) {
+	for _, tc := range []struct {
+		name, detail, want, reject string
+	}{
+		{"teardown only", ipc.TeardownPrefix + "cleanup failed: exit 3", "termination was verified, but teardown did not pass", "NOT fully verified"},
+		{"mixed", "could not terminate worker: group 41234 survived\n" + ipc.TeardownPrefix + "cleanup skipped: managed_processes_unverified", "NOT fully verified", "termination was verified"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fd := startFakeDaemon(t, nil)
+			scriptedInto(fd, serveAck("partial", tc.detail, func() { _ = fd.proc.Process.Kill() }))
+			dir := socketDirForTest(t)
+			err := stopDaemon(fd.socketPath, filepath.Join(dir, "x.pid"), fd.pid, fd.proc.Process, false, 5*time.Second)
+			if err == nil {
+				t.Fatal("stopDaemon = nil, want a failure")
+			}
+			if !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), tc.reject) || !strings.Contains(err.Error(), "cleanup") {
+				t.Fatalf("error = %q, want %q and not %q", err, tc.want, tc.reject)
+			}
+		})
+	}
+}
+
+// TestStopBudget_ExtendedByDeclaredTeardown: a default --timeout grows by the
+// teardown budget when the session declares teardown processes; an explicit
+// --timeout is kept as given.
+func TestStopBudget_ExtendedByDeclaredTeardown(t *testing.T) {
+	dir := t.TempDir()
+	withTeardown, without := filepath.Join(dir, "with.meta.json"), filepath.Join(dir, "without.meta.json")
+	if err := session.Save(withTeardown, &ipc.Project{RunID: "r", Teardown: []string{"cleanup"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Save(without, &ipc.Project{RunID: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	base := 10 * time.Second
+	if got := stopBudget(withTeardown, base, false); got != base+runner.TeardownBudget {
+		t.Fatalf("default timeout with teardown = %s, want %s", got, base+runner.TeardownBudget)
+	}
+	if got := stopBudget(withTeardown, base, true); got != base {
+		t.Fatalf("explicit timeout with teardown = %s, want it unchanged", got)
+	}
+	if got := stopBudget(without, base, false); got != base {
+		t.Fatalf("default timeout without teardown = %s, want it unchanged", got)
+	}
+	if got := stopBudget(filepath.Join(dir, "missing.meta.json"), base, false); got != base {
+		t.Fatalf("default timeout without metadata = %s, want it unchanged", got)
+	}
+}
+
+// TestStopDeadDaemon_ReportsTeardownDidNotRun: a crashed daemon never ran its
+// teardown, and stop says so whenever the session declared teardown processes.
+func TestStopDeadDaemon_ReportsTeardownDidNotRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows crash path is covered by its own branch")
+	}
+	runtimeDir := socketDirForTest(t)
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	hash := "teardown-crash"
+	pidPath, socketPath := paths.PID(hash), paths.Socket(hash)
+	if err := os.WriteFile(pidPath, []byte(`{"pid":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Save(paths.Metadata(hash), &ipc.Project{RunID: "r", Teardown: []string{"cleanup-uploads"}}); err != nil {
+		t.Fatal(err)
+	}
+	err := stopDeadDaemon(pidPath, socketPath, hash, 0, false, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "NOT verified") || !strings.Contains(err.Error(), "teardown did not run: cleanup-uploads") {
+		t.Fatalf("stopDeadDaemon = %v, want the unverified crash and the teardown that did not run", err)
 	}
 }
 

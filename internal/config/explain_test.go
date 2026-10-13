@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,8 @@ func TestDiagnose_Codes(t *testing.T) {
 		{"task restart", "processes:\n  migrate:\n    cmd: x\n    mode: task\n    restart: always\n", CodeTaskIncompatible, "processes.migrate.restart", 5},
 		{"invalid restart", "processes:\n  api:\n    cmd: x\n    restart: sometimes\n", CodeInvalidRestart, "processes.api.restart", 4},
 		{"invalid mode", "processes:\n  api:\n    cmd: x\n    mode: daemon\n", CodeInvalidMode, "processes.api.mode", 4},
+		{"teardown ports", "processes:\n  clean:\n    cmd: x\n    mode: teardown\n    ports:\n      http: 0\n", CodeTaskIncompatible, "processes.clean.ports", 6},
+		{"teardown dependency", "processes:\n  api:\n    cmd: x\n    depends_on: [clean]\n  clean:\n    cmd: y\n    mode: teardown\n", CodeTeardownDependency, "processes.api.depends_on[0]", 4},
 		{"invalid port", "processes:\n  api:\n    cmd: x\n    ports:\n      http: 70000\n", CodeInvalidPort, "processes.api.ports.http", 5},
 		{"invalid ready_when", "processes:\n  api:\n    cmd: x\n    ready_when:\n      http: http://x\n      tcp: x:1\n", CodeInvalidReadyWhen, "processes.api.ready_when", 5},
 		{"invalid resource", "processes:\n  api:\n    cmd: x\nresources: [db, db]\n", CodeInvalidResource, "resources[1]", 4},
@@ -255,6 +258,87 @@ func TestSchema_ParityWithStructTagsAndParser(t *testing.T) {
 			t.Fatalf("schema restart %q rejected: %v", policy, err)
 		}
 	}
+	// health_action enum parity, and the health_interval floor.
+	process := schema.Defs["Process"]["properties"].(map[string]any)
+	action, _ := process["health_action"].(map[string]any)
+	if enum, _ := action["enum"].([]any); len(enum) != len(HealthActions) {
+		t.Fatalf("health_action schema = %v, want enum %v", action, HealthActions)
+	}
+	for _, a := range HealthActions {
+		if _, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: x\n    restart: always\n    health_when:\n      tcp: localhost:1\n    health_action: "+a+"\n")); err != nil {
+			t.Fatalf("schema health_action %q rejected: %v", a, err)
+		}
+	}
+	// health_interval floor parity: Load accepts the schema minimum and
+	// rejects the value below it.
+	interval, _ := process["health_interval"].(map[string]any)
+	floor, ok := interval["minimum"].(float64)
+	if !ok {
+		t.Fatalf("health_interval schema = %v, want a minimum", interval)
+	}
+	healthYAML := func(extra string) string {
+		return "processes:\n  api:\n    cmd: x\n    health_when:\n      tcp: localhost:1\n" + extra
+	}
+	if _, err := Load(writeConfig(t, healthYAML(fmt.Sprintf("    health_interval: %d\n", int(floor))))); err != nil {
+		t.Fatalf("schema minimum health_interval %v rejected by Load: %v", floor, err)
+	}
+	if _, err := Load(writeConfig(t, healthYAML(fmt.Sprintf("    health_interval: %d\n", int(floor)-1)))); err == nil {
+		t.Fatalf("health_interval %d is below the schema minimum %v but Load accepted it", int(floor)-1, floor)
+	}
+	// Probe kind parity: for ready_when and health_when, the schema forbids a
+	// kind (not.required) exactly when Load rejects it.
+	probeValues := map[string]string{"http": "http://localhost:1/", "tcp": "localhost:1", "cmd": "true", "log": "ready"}
+	if got, want := keys(objects["ReadyWhen"]), keys(map[string]any{"http": 0, "tcp": 0, "cmd": 0, "log": 0}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadyWhen kinds %v, probe parity covers %v", got, want)
+	}
+	for _, field := range []string{"ready_when", "health_when"} {
+		prop, _ := process[field].(map[string]any)
+		forbidden := map[string]bool{}
+		if not, ok := prop["not"].(map[string]any); ok {
+			req, _ := not["required"].([]any)
+			for _, k := range req {
+				forbidden[k.(string)] = true
+			}
+		}
+		for kind, value := range probeValues {
+			_, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: x\n    "+field+":\n      "+kind+": "+value+"\n"))
+			if schemaOK, loadOK := !forbidden[kind], err == nil; schemaOK != loadOK {
+				t.Fatalf("%s.%s: schema accepts=%v, Load accepts=%v (err %v)", field, kind, schemaOK, loadOK, err)
+			}
+		}
+	}
+}
+
+// TestPlan_ListsTeardownSeparately pins that teardown processes never enter
+// the startup levels; the plan lists them on their own, in run order, and
+// refuses one named as a selector.
+func TestPlan_ListsTeardownSeparately(t *testing.T) {
+	cfg := loadFromString(t, `processes:
+  api:
+    cmd: api
+  zz-cleanup:
+    mode: teardown
+    cmd: cleanup
+  a-cleanup:
+    mode: teardown
+    cmd: cleanup
+`)
+	plan, err := Plan(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Levels) != 1 || !equalSlices(plan.Levels[0], []string{"api"}) || len(plan.Processes) != 1 {
+		t.Fatalf("plan = %+v, want only api in the startup levels", plan)
+	}
+	if !equalSlices(plan.Teardown, []string{"a-cleanup", "zz-cleanup"}) {
+		t.Fatalf("plan.Teardown = %v, want both teardown processes in name order", plan.Teardown)
+	}
+	if plan, err := Plan(cfg, []string{"api"}); err != nil || !equalSlices(plan.Teardown, []string{"a-cleanup", "zz-cleanup"}) {
+		t.Fatalf("filtered plan = %+v, %v; teardown runs for the stack under a filter too", plan, err)
+	}
+	if _, err := Plan(cfg, []string{"a-cleanup"}); err == nil || !strings.Contains(err.Error(), "teardown") {
+		t.Fatalf("Plan(a-cleanup) = %v, want a teardown refusal", err)
+	}
 }
 
 func TestPlan_LevelsReadinessAndReferences(t *testing.T) {
@@ -308,6 +392,41 @@ func TestPlan_LevelsReadinessAndReferences(t *testing.T) {
 	}
 	if !reflect.DeepEqual(refs, want) || !strings.HasPrefix(refs[1].Treatment, "unresolved") {
 		t.Fatalf("references = %+v", refs)
+	}
+
+	worker := loadFromString(t, "processes:\n  worker:\n    cmd: worker\n    ports:\n      http: 0\n    ready_when:\n      cmd: check ${urls.worker.http}/ready\n")
+	cmdPlan, err := Plan(worker, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := cmdPlan.Processes[0]; p.Readiness != "cmd" || p.Probe != "check ${urls.worker.http}/ready" ||
+		!reflect.DeepEqual(p.References, []EndpointReference{{Field: "ready_when.cmd", Ref: "urls.worker.http", Resolvable: true, Treatment: ReferenceTreatment}}) {
+		t.Fatalf("cmd probe plan = %+v", p)
+	}
+	if !strings.Contains(diagnosticHints[CodeInvalidReadyWhen], "ready_when.cmd") {
+		t.Fatalf("ready_when hint omits cmd: %q", diagnosticHints[CodeInvalidReadyWhen])
+	}
+	if !strings.Contains(diagnosticHints[CodeInvalidReadyWhen], "health_when") {
+		t.Fatalf("ready_when hint omits health_when: %q", diagnosticHints[CodeInvalidReadyWhen])
+	}
+
+	healthCfg := loadFromString(t, "processes:\n  worker:\n    cmd: worker\n    restart: on-failure\n    ports:\n      http: 0\n    health_when:\n      cmd: check ${urls.worker.http}/live\n    health_interval: 15\n    health_action: restart\n  db:\n    cmd: db\n")
+	healthPlan, err := Plan(healthCfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range healthPlan.Processes {
+		switch p.Name {
+		case "worker":
+			if want := (&PlannedHealth{Probe: "cmd", Target: "check ${urls.worker.http}/live", Interval: 15, Action: HealthActionRestart}); !reflect.DeepEqual(p.Health, want) ||
+				!reflect.DeepEqual(p.References, []EndpointReference{{Field: "health_when.cmd", Ref: "urls.worker.http", Resolvable: true, Treatment: ReferenceTreatment}}) {
+				t.Fatalf("health plan = %+v / %+v", p.Health, p.References)
+			}
+		case "db":
+			if p.Health != nil {
+				t.Fatalf("unmonitored process planned with health: %+v", p.Health)
+			}
+		}
 	}
 
 	all, err := Plan(cfg, nil)

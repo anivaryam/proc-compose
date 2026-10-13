@@ -3,10 +3,12 @@
 package runner
 
 import (
-	"fmt"
 	"os"
 	"strconv"
-	"strings"
+	"syscall"
+
+	"github.com/anivaryam/proc-compose/internal/daemon"
+	"golang.org/x/sys/unix"
 )
 
 // groupMembers counts the live members of a process group by walking procfs.
@@ -14,17 +16,48 @@ import (
 // It reports false for the second return value when the count could not be
 // established, so that callers skip escalation rather than assume a group is
 // empty on incomplete information.
+func groupMembers(pgid int) (int, bool) {
+	pids, ok := groupMemberPIDs(pgid)
+	return len(pids), ok
+}
+
+// groupMemberPIDs lists the live members of a process group by walking procfs;
+// groupMembers counts over it.
 //
 // A member is live unless its /proc state is a termination state. cmd.Wait
 // reaps the command leader only, so a killed descendant whose new parent has not
 // collected it stays in procfs as a zombie; treating those as live would turn a
 // successful shutdown into a reported failure.
-func groupMembers(pgid int) (int, bool) {
+func groupMemberPIDs(pgid int) ([]int, bool) {
+	return walkGroupMembers(pgid, func(_ int, state byte) bool { return !isZombieState(state) })
+}
+
+// recoveryMemberPIDs is the membership walk crash recovery proves emptiness
+// and pins members with. It differs from groupMemberPIDs in one way: a zombie
+// state alone does not make a member dead, because a thread-group leader whose
+// main thread exited reports Z while its other threads still run; see
+// recoveryLive.
+func recoveryMemberPIDs(pgid int) ([]int, bool) { return walkGroupMembers(pgid, recoveryLive) }
+
+// recoveryGroupHolders counts every visible process in pgid, dead or alive.
+func recoveryGroupHolders(pgid int) (int, bool) {
+	pids, ok := walkGroupMembers(pgid, func(int, byte) bool { return true })
+	return len(pids), ok
+}
+
+// probeEPERMProvesMember is true: Linux answers kill(-pgid, 0) with EPERM only
+// when the group has a member and this process may signal none of them.
+const probeEPERMProvesMember = true
+
+// walkGroupMembers lists the members of pgid that live reports as live. A
+// process whose procfs entry is hidden (hidepid) or unreadable is skipped, so
+// an empty result alone does not prove another user's process absent.
+func walkGroupMembers(pgid int, live func(pid int, state byte) bool) ([]int, bool) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return 0, false
+		return nil, false
 	}
-	live := 0
+	var members []int
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil || pid <= 0 {
@@ -34,42 +67,37 @@ func groupMembers(pgid int) (int, bool) {
 		if !ok || gid != pgid {
 			continue
 		}
-		if isZombieState(state) {
-			continue
+		if live(pid, state) {
+			members = append(members, pid)
 		}
-		live++
 	}
-	return live, true
+	return members, true
 }
 
 // procStat returns a process's group ID and its single-letter state.
 func procStat(pid int) (pgid int, state byte, ok bool) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	info, err := daemon.ProcStat(pid)
 	if err != nil {
 		return 0, 0, false
 	}
-	// The comm field is parenthesised and may itself contain spaces or
-	// parentheses, so parse relative to the final ')': the fields after it are
-	// state, ppid, pgrp, ... in that fixed order.
-	i := strings.LastIndexByte(string(data), ')')
-	if i < 0 || i+2 > len(data) {
-		return 0, 0, false
-	}
-	fields := strings.Fields(string(data[i+2:]))
-	if len(fields) < 3 {
-		return 0, 0, false
-	}
-	state = fields[0][0]
-	gid, err := strconv.Atoi(fields[2])
-	if err != nil {
-		return 0, 0, false
-	}
-	return gid, state, true
+	return info.PGID, info.State, true
 }
 
-// isZombieState reports whether a procfs state letter means the process has
-// terminated. Z is the ordinary zombie state; X and x are the dead and
-// in-death-transit states used during exit.
-func isZombieState(state byte) bool {
-	return state == 'Z' || state == 'X' || state == 'x'
+// procfsIsOwn reports whether the mounted /proc numbers processes as this
+// process's pid namespace does. Crash recovery proves identity by reading
+// /proc but signals through pidfd_open, which resolves a pid in the caller's
+// namespace; under `unshare --pid` without a fresh /proc mount the two name
+// different processes, so recovery must not act on what /proc says.
+func procfsIsOwn() bool {
+	self, err := os.Readlink("/proc/self")
+	return err == nil && self == strconv.Itoa(os.Getpid())
 }
+
+// openPidfd returns a pidfd for pid: a handle that keeps naming that exact
+// process, so a signal sent through it cannot reach a later owner of the pid.
+func openPidfd(pid int) (int, error) { return unix.PidfdOpen(pid, 0) }
+
+// sendPidfd signals the process a pidfd names. Signal 0 checks that the process
+// has not been reaped, which is what lets a procfs read taken in between be
+// attributed to it.
+func sendPidfd(fd int, sig syscall.Signal) error { return unix.PidfdSendSignal(fd, sig, nil, 0) }

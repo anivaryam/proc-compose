@@ -21,8 +21,8 @@ every declared named port.
 | Exit | Meaning |
 |---|---|
 | 0 | Startup, check, and verified cleanup all passed; receipt persisted |
-| 1 | Startup/readiness, check, required process, cleanup, or receipt failure |
-| 2 | Usage, invalid config, or occupied session — nothing was started |
+| 1 | Startup/readiness, check, required process, cleanup, teardown, or receipt failure |
+| 2 | Usage, invalid config, or occupied session (including a crashed run whose process groups may still be running; run `stop` first) — nothing was started |
 | 130 | Interrupted (cleanup still ran) |
 
 With `--json`, stdout is exactly one JSON object (`kind: verify.response`, at
@@ -30,7 +30,9 @@ most 64 KiB; or `verify.compact_error` if the full result cannot fit). Process
 output is kept in the journal only (read it with `why --attempt`); add
 `--stream-logs` to also stream it to stderr, as human mode does. Each phase (`startup`, `check`, `cleanup`) keeps its own
 status, so a passing check cannot hide a crashed service or an unverified
-cleanup. A service without a readiness probe is reported as
+cleanup. A required service that stops running, restarts, or becomes
+`unhealthy` through its `health_when` while the check runs fails the attempt
+with `required_failed`. A service without a readiness probe is reported as
 `not_configured`/unprobed rather than ready. Source revision and dirty state are
 recorded as provenance only (`loaded_code_proven: false`). Default budgets are
 startup 120s, check 10m, and an independent 30s cleanup (unmeasured policy
@@ -38,6 +40,15 @@ defaults; override with `--startup-timeout`, `--check-timeout`,
 `--cleanup-timeout`). The cleanup budget starts once, at the first trigger
 (check deadline, interruption, or failure), and covers check teardown, stack
 teardown, and sealing together.
+
+[Teardown processes](configuration.md#teardown-processes) run inside that same
+cleanup budget, ending before the final sealing reserve. The receipt's
+`cleanup.teardown` lists each one with its `status` (`passed`, `failed`,
+`timed_out`, `handed_off`, `not_run`, or `skipped`), exit code, times, and
+`error`; it is an empty list when none is configured. A teardown that does not
+pass fails the attempt with `teardown_failed`; `cleanup.status` and
+`cleanup.termination_verified` still describe only whether the processes were
+terminated.
 
 ```sh
 proc-compose attempts                      # receipts for this session, newest first

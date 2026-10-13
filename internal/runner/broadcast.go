@@ -79,32 +79,21 @@ func (r *Runner) readOutput(p procInfo, stream string, input io.Reader, onLine f
 	}
 }
 
-// broadcastState pushes the current state to IPC (no-op if IPC is nil).
+// broadcastState pushes the current state to IPC (no-op if IPC is nil). A
+// quiet execution is never broadcast.
 func (r *Runner) broadcastState(p procInfo, st *procState) {
-	st.mu.Lock()
-	snap := ipc.ProcState{
-		Name:       p.name,
-		State:      st.state,
-		Mode:       p.proc.EffectiveMode(),
-		Ready:      st.currentlyReady(),
-		PID:        st.pid,
-		Restarts:   st.restarts,
-		StartedAt:  st.startedAt,
-		ColorIndex: p.colorIndex,
-		CPUPercent: st.cpuPercent,
-		MemoryMB:   st.memoryMB,
-		Generation: st.generation,
-		LastError:  st.lastError,
-		ExitCode:   st.exitCode,
-		DependsOn:  append([]string(nil), p.proc.DependsOn...),
+	if p.quiet {
+		return
 	}
+	st.mu.Lock()
+	snap := st.ipcStateLocked(p.name, p.proc)
 	st.mu.Unlock()
 	if r.IPC != nil {
 		r.IPC.BroadcastState(snap)
 	}
 	r.logMu.Lock()
 	previous, exists := r.lastStates[p.name]
-	changed := !exists || previous.State != snap.State || previous.Generation != snap.Generation || previous.PID != snap.PID || previous.Ready != snap.Ready || previous.LastError != snap.LastError
+	changed := !exists || previous.State != snap.State || previous.Generation != snap.Generation || previous.PID != snap.PID || previous.Ready != snap.Ready || previous.LastError != snap.LastError || previous.Health != snap.Health
 	if r.lastStates == nil {
 		r.lastStates = make(map[string]ipc.ProcState)
 	}
@@ -117,7 +106,7 @@ func (r *Runner) broadcastState(p procInfo, st *procState) {
 
 func (r *Runner) processLog(p procInfo, level, code, message string) {
 	kind := "lifecycle"
-	if strings.HasPrefix(code, "readiness.") {
+	if strings.HasPrefix(code, "readiness.") || strings.HasPrefix(code, "health.") {
 		kind = "probe"
 	}
 	r.emit(p, ipc.LogEntry{Kind: kind, Level: level, Code: code, Stream: "supervisor", Line: message, IsEvent: true, IsError: level == "error"})
@@ -129,7 +118,12 @@ func (r *Runner) systemLog(level, code, message string) {
 
 // emit is the sole event-ordering and output boundary. A message is rendered
 // once per sink; files, agents, and the monitor observe the same identity.
+// Nothing from a quiet execution passes it: output, lifecycle, and error
+// events alike are dropped here so no call site has to remember the check.
 func (r *Runner) emit(p procInfo, entry ipc.LogEntry) {
+	if p.quiet {
+		return
+	}
 	entry.Process = p.name
 	if st := r.stateFor(p.name); st != nil {
 		st.mu.Lock()
