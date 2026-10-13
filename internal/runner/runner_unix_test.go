@@ -185,9 +185,10 @@ func TestProcessGroup_SealPreservesSurvivorIdentity(t *testing.T) {
 	}
 }
 
-// pidHasExited is the Windows liveness refinement for pidIsRunning. On Unix the
-// /proc zombie check in pidIsTerminatedUnreaped already covers it.
-func pidHasExited(int) bool { return false }
+// pidHasExited refines pidIsRunning where pidIsTerminatedUnreaped cannot see
+// a zombie: on macOS there is no /proc, so an exited but unreaped process is
+// detected through its kinfo state instead.
+func pidHasExited(pid int) bool { return pidIsZombie(pid) }
 
 // TestObserveLeaderExit_SetupDoesNotBlockOnARunningCommand pins correction 1:
 // setup must return promptly for a long-running service, and must report that

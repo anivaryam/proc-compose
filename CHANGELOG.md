@@ -62,6 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `verify` no longer races on its stack cleanup budget when the stack stops
+  on its own, for example after a required process fails. The budget now
+  starts at that stop, like any other cleanup trigger, instead of being
+  written after the runner may already have read it.
 - `stop` no longer reports success on Linux and macOS when the daemon has
   crashed and its managed processes cannot be verified as terminated (see the
   next entry for how recorded process groups are recovered). For a PID file

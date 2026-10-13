@@ -40,7 +40,14 @@ type Runner struct {
 	// workers after this independent shutdown budget. Zero preserves legacy Run
 	// behavior and waits for every lifecycle goroutine.
 	CleanupHandoffTimeout time.Duration
-	Project               *ipc.Project
+	// CleanupHandoffDeadline, when set, replaces CleanupHandoffTimeout as the
+	// handoff budget: it is called once Run observes cancellation, from Run's
+	// goroutine, and the handoff happens at the time it returns. A caller whose
+	// budget is only known at that moment (verify's single cleanup budget)
+	// supplies it here instead of writing CleanupHandoffTimeout while Run reads
+	// it.
+	CleanupHandoffDeadline func() time.Time
+	Project                *ipc.Project
 	// AttemptID stamps every journal event of this run with the owning
 	// verification attempt, so diagnosis can scope evidence to one attempt.
 	AttemptID     string
@@ -403,7 +410,11 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 		select {
 		case <-workersDone:
 		case <-runCtx.Done():
-			timer := time.NewTimer(r.CleanupHandoffTimeout)
+			wait := r.CleanupHandoffTimeout
+			if r.CleanupHandoffDeadline != nil {
+				wait = max(time.Until(r.CleanupHandoffDeadline()), time.Millisecond)
+			}
+			timer := time.NewTimer(wait)
 			select {
 			case <-workersDone:
 				if !timer.Stop() {

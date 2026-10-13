@@ -417,6 +417,11 @@ func (a *attempt) startAndCheck(ctx context.Context) {
 		Project:               plan.Project,
 		ResolveConfig:         plan.Resolve,
 		CleanupHandoffTimeout: opts.CleanupTimeout - opts.sealReserve(),
+		// Stack teardown gets what remains of the one cleanup budget minus the
+		// seal reserve, from whichever trigger started it: verify's cleanup,
+		// or the stack stopping on its own (a required process failing). A
+		// check teardown that already spent the budget leaves only sealing.
+		CleanupHandoffDeadline: func() time.Time { return a.beginCleanup().Add(-opts.sealReserve()) },
 		// Teardown spends the same cleanup budget and leaves the seal reserve.
 		TeardownDeadline: func() time.Time { return a.beginCleanup().Add(-opts.sealReserve()) },
 		AttemptID:        *res.AttemptID,
@@ -743,12 +748,8 @@ func (a *attempt) cleanup() {
 		res.Cleanup.FinishedAt = timestamp(a.opts.now())
 		return
 	}
-	// The handoff budget is read when Run observes cancellation; cancel() is the
-	// happens-before edge for this write.
-	// Stack teardown gets what remains of the one budget minus the seal
-	// reserve; a check teardown that already spent it leaves only sealing.
-	handoff := max(time.Until(deadline)-a.opts.sealReserve(), time.Millisecond)
-	a.runner.CleanupHandoffTimeout = handoff
+	// Run reads its handoff budget through CleanupHandoffDeadline when it
+	// observes this cancellation, or an earlier one of its own.
 	a.cancelRun()
 	returned := false
 	timer := time.NewTimer(time.Until(deadline))

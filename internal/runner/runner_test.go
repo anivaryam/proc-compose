@@ -4299,6 +4299,64 @@ func assertRunnerQuiescent(t *testing.T, r *Runner, state []ipc.ProcState, proce
 	}
 }
 
+// TestRunnerCleanupHandoff_DeadlineReadWhenStackStopsItself pins that
+// CleanupHandoffDeadline is read when Run observes cancellation, including one
+// the stack caused itself (a failed task), so a caller such as verify never
+// writes the handoff budget while Run may be reading it. The deadline, not the
+// much longer CleanupHandoffTimeout, bounds the handoff.
+func TestRunnerCleanupHandoff_DeadlineReadWhenStackStopsItself(t *testing.T) {
+	dir := t.TempDir()
+	apiPID, trigger := filepath.Join(dir, "api.pid"), filepath.Join(dir, "fail")
+	apiCmd := serviceHelperCmd("pid-block", apiPID)
+	r := makeRunner(map[string]config.Process{
+		"api":  {Cmd: apiCmd, ShutdownTimeout: shutdownGraceForTest},
+		"seed": {Cmd: helperCmd("fail-after-file", trigger, "30s"), Mode: config.ProcessModeTask},
+	})
+	r.Output = io.Discard
+	r.CleanupHandoffTimeout = 30 * time.Second
+	var calls atomic.Int32
+	r.CleanupHandoffDeadline = func() time.Time {
+		calls.Add(1)
+		return time.Now().Add(300 * time.Millisecond)
+	}
+	reapRelease := make(chan struct{})
+	releaseReap := sync.OnceFunc(func() { close(reapRelease) })
+	t.Cleanup(releaseReap)
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		if strings.Contains(strings.Join(cmd.Args, " "), apiCmd) {
+			<-reapRelease
+		}
+		return cmd.Wait()
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background()) }()
+	pid, ok := waitForPIDFile(t, apiPID, 10*time.Second)
+	if !ok {
+		releaseReap()
+		t.Fatal("api never started")
+	}
+	trackProcessForCleanup(t, pid, "api")
+	if err := os.WriteFile(trigger, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		releaseReap()
+		t.Fatal("Run waited out CleanupHandoffTimeout instead of the handoff deadline")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("handoff took %s, want it bounded by the deadline", elapsed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("CleanupHandoffDeadline called %d times, want once when cancellation was observed", got)
+	}
+	// The seal ended api although its reap is still held.
+	assertTerminated(t, pid, "api", 2*time.Second)
+	releaseReap()
+}
+
 func TestRunnerCleanupHandoff_SealsBeforeReturningAndQuiescesWorker(t *testing.T) {
 	command := serviceHelperCmd("sleep", "120s")
 	configPath := filepath.Join(t.TempDir(), "proc-compose.yml")
