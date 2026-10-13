@@ -200,3 +200,10 @@ func (pg *unixProcessGroup) numericID() int {
 	}
 	return pg.pgid
 }
+
+// isZombieState reports whether a procfs state letter means the process has
+// terminated. It reads daemon.ProcStat states, which only Linux provides. Z is the ordinary zombie state; X and x are the dead and
+// in-death-transit states used during exit.
+func isZombieState(state byte) bool {
+	return state == 'Z' || state == 'X' || state == 'x'
+}

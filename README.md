@@ -96,7 +96,7 @@ proc-compose stop                       # stop everything
 
 - **One config, one log stream** with stable, color-coded process names
 - **Services and tasks**: long-running processes and one-shot setup steps
-- **Ordered startup** via `depends_on` and `http`, `tcp`, or `log` readiness probes
+- **Ordered startup** via `depends_on` and `http`, `tcp`, `cmd`, or `log` readiness probes, plus optional ongoing health checks
 - **Restart policies** with exponential backoff and restart limits
 - **Verified shutdown** of whole process trees on Linux, macOS, and Windows
 - **Background daemon** with a TUI monitor, status, restart, reload, and stop

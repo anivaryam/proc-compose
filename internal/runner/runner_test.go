@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -178,6 +179,83 @@ func TestReload_RebuildsReadinessForReplacement(t *testing.T) {
 		return s.Generation == 3 && s.State == "failed" && strings.Contains(s.LastError, "1s")
 	}, 3*time.Second) {
 		t.Fatalf("replacement did not use new timeout: %+v", snapshotOf(r, "server"))
+	}
+}
+
+// TestStoreSnapshot_MatchesBroadcastAfterReload pins the single ProcState
+// builder. status, /ready and /health read the store snapshot, and the event
+// stream reads broadcastState. After a reload replaces a definition, both must
+// describe the incarnation that is running, not the definition loaded at
+// startup. Reload refuses mode and depends_on changes, so the stale startup
+// definition is caught on the store itself rather than on a ProcState field.
+func TestStoreSnapshot_MatchesBroadcastAfterReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	write := func(marker string) {
+		t.Helper()
+		body := fmt.Sprintf("processes:\n  api:\n    cmd: %q\n  server:\n    cmd: %q\n    depends_on: [api]\n    ready_when:\n      log: \"^(OLD|NEW)$\"\n",
+			serviceHelperCmd("sleep", "30s"), serviceHelperCmd("log-block", marker))
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("OLD")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Config: cfg, ConfigPath: path, NoColor: true, Output: io.Discard}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	}()
+	if !waitForProcState(t, r, "server", func(s ipc.ProcState) bool { return s.Ready }, 5*time.Second) {
+		t.Fatalf("initial readiness failed: %+v", snapshotOf(r, "server"))
+	}
+	write("NEW")
+	if result := r.Reload(); result.Status != "ok" {
+		t.Fatalf("reload: %+v", result)
+	}
+	if !waitForProcState(t, r, "server", func(s ipc.ProcState) bool { return s.Generation == 2 && s.Ready }, 5*time.Second) {
+		t.Fatalf("replacement never became ready: %+v", snapshotOf(r, "server"))
+	}
+
+	want, _ := r.getProc("server")
+	info, ok := r.store.Load().info("server")
+	if !ok {
+		t.Fatal("store has no definition for server")
+	}
+	if !reflect.DeepEqual(info.proc, want) {
+		t.Fatalf("snapshot reads a stale definition after reload: cmd %q, want %q", info.proc.Cmd, want.Cmd)
+	}
+
+	comparable := func(s ipc.ProcState) ipc.ProcState {
+		s.CPUPercent, s.MemoryMB = 0, 0 // the metrics sampler updates these between broadcasts
+		return s
+	}
+	var snap, last ipc.ProcState
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		snap = comparable(snapshotOf(r, "server"))
+		r.logMu.Lock()
+		last = comparable(r.lastStates["server"])
+		r.logMu.Unlock()
+		if reflect.DeepEqual(snap, last) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !reflect.DeepEqual(snap, last) {
+		t.Fatalf("snapshot and last broadcast disagree after reload:\nsnapshot:  %+v\nbroadcast: %+v", snap, last)
+	}
+	if !slices.Equal(snap.DependsOn, []string{"api"}) || snap.Mode != config.ProcessModeService {
+		t.Fatalf("snapshot lost the definition: mode=%q depends_on=%v", snap.Mode, snap.DependsOn)
 	}
 }
 
@@ -508,6 +586,87 @@ func TestRunnerHelperProcess(t *testing.T) {
 		// The child is deliberately not waited on: this process exits at once and
 		// the child is left running inside the job.
 		os.Exit(0)
+	case "term-exit0":
+		// term-exit0: run until SIGTERM, then exit 0. Models a service that
+		// shuts down gracefully when proc-compose cancels it, so the cancel
+		// itself is the only evidence that the incarnation failed.
+		if len(args) != 1 {
+			os.Exit(2)
+		}
+		term := make(chan os.Signal, 1)
+		signal.Notify(term, syscall.SIGTERM)
+		select {
+		case <-term:
+			os.Exit(0)
+		case <-time.After(60 * time.Second):
+			os.Exit(7)
+		}
+	case "probe-file":
+		// probe-file <path>: a ready_when.cmd probe that talks on both streams
+		// and passes only once path exists.
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		_, _ = os.Stdout.WriteString("probe-chatter-stdout\n")
+		_, _ = os.Stderr.WriteString("probe-chatter-stderr\n")
+		if _, err := os.Stat(args[1]); err != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	case "probe-env":
+		// probe-env <key> <value> <dir>: passes only when it runs with the
+		// process's environment and working directory.
+		if len(args) != 4 {
+			os.Exit(2)
+		}
+		wd, err := os.Getwd()
+		if err != nil {
+			os.Exit(2)
+		}
+		want, err := filepath.EvalSymlinks(args[3])
+		if err != nil {
+			os.Exit(2)
+		}
+		if got, err := filepath.EvalSymlinks(wd); err != nil || got != want || os.Getenv(args[1]) != args[2] {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	case "pid-block":
+		// pid-block <pidfile>: record this PID, then hang.
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(args[1], []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+			os.Exit(2)
+		}
+		time.Sleep(60 * time.Second)
+		os.Exit(0)
+	case "teardown-probe":
+		// teardown-probe <pidfile> <out> <code>: write to out whether the PID in
+		// pidfile is still running ("alive" or "gone"), then exit with code.
+		if len(args) != 4 {
+			os.Exit(2)
+		}
+		code, err := strconv.Atoi(args[3])
+		if err != nil {
+			os.Exit(2)
+		}
+		data, err := os.ReadFile(args[1])
+		if err != nil {
+			os.Exit(2)
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil {
+			os.Exit(2)
+		}
+		verdict := "gone"
+		if pidIsRunning(pid) {
+			verdict = "alive"
+		}
+		if err := os.WriteFile(args[2], []byte(verdict), 0o644); err != nil {
+			os.Exit(2)
+		}
+		os.Exit(code)
 	case "record-and-exit":
 		// record-and-exit <pidfile>: record this PID and exit 0 immediately.
 		// A shutdown that arrives afterwards must treat it as a non-event
@@ -1138,6 +1297,643 @@ func TestRun_ReadyWhen_LogTimeoutFailsProcess(t *testing.T) {
 	}
 }
 
+// TestRun_ReadyWhen_CmdBecomesReady pins the cmd probe kind: the service is
+// running but not ready, and its dependent waits, until the probe command
+// exits 0.
+func TestRun_ReadyWhen_CmdBecomesReady(t *testing.T) {
+	flag := filepath.Join(t.TempDir(), "ready")
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:          serviceHelperCmd("sleep", "30s"),
+			ReadyTimeout: 20,
+			ReadyWhen:    &config.ReadyWhen{Cmd: helperCmd("probe-file", flag)},
+		},
+		"app": {Cmd: serviceHelperCmd("sleep", "30s"), DependsOn: []string{"worker"}},
+	})
+	r.Output = io.Discard
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	}()
+
+	if !waitForProcState(t, r, "worker", func(s ipc.ProcState) bool { return s.State == "running" }, 5*time.Second) {
+		t.Fatalf("worker never started: %+v", snapshotOf(r, "worker"))
+	}
+	// Long enough for more than one failing attempt.
+	time.Sleep(1500 * time.Millisecond)
+	if got := snapshotOf(r, "worker"); got.Ready {
+		t.Fatalf("worker ready before its probe passed: %+v", got)
+	}
+	if got := snapshotOf(r, "app"); got.PID != 0 {
+		t.Fatalf("dependent started before the probe passed: %+v", got)
+	}
+	if err := os.WriteFile(flag, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !waitForProcState(t, r, "worker", func(s ipc.ProcState) bool { return s.State == "running" && s.Ready }, 10*time.Second) {
+		t.Fatalf("worker never became ready after the probe passed: %+v", snapshotOf(r, "worker"))
+	}
+	if !waitForProcState(t, r, "app", func(s ipc.ProcState) bool { return s.State == "running" }, 10*time.Second) {
+		t.Fatalf("dependent never started: %+v", snapshotOf(r, "app"))
+	}
+	if got := snapshotOf(r, "worker"); got.Generation != 1 || got.Restarts != 0 {
+		t.Fatalf("probe disturbed the incarnation: %+v", got)
+	}
+}
+
+// TestRun_ReadyWhen_CmdTimeoutFailsProcess pins that a cmd probe that never
+// passes fails the service at ready_timeout, like every other probe kind, and
+// that the timeout message itself (the error-level readiness.failed event and
+// LastError, visible without --verbose) names the last attempt's exit status
+// and stderr. With --verbose, failed attempts after the fifth are
+// readiness.progress lines with the same detail.
+func TestRun_ReadyWhen_CmdTimeoutFailsProcess(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "never-created")
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:     serviceHelperCmd("sleep", "30s"),
+			Restart: "never",
+			// Long enough for more than five failed attempts.
+			ReadyTimeout: 8,
+			ReadyWhen:    &config.ReadyWhen{Cmd: helperCmd("probe-file", missing)},
+		},
+	})
+	var journal bytes.Buffer
+	r.Output, r.Journal, r.Verbose = io.Discard, &journal, true
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := r.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "worker") {
+		t.Fatalf("Run = %v, want the worker reported failed", err)
+	}
+	const want = "readiness probe (cmd) timed out (last attempt: exit 1: probe-chatter-stderr)"
+
+	if got := snapshotOf(r, "worker"); got.State != "failed" || got.LastError != want {
+		t.Fatalf("worker = %+v, want failed with LastError %q", got, want)
+	}
+	failed, progress := 0, 0
+	decoder := json.NewDecoder(&journal)
+	for {
+		var event ipc.LogEntry
+		if err := decoder.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case event.Code == "readiness.failed":
+			failed++
+			if event.Level != "error" || event.Line != want {
+				t.Fatalf("readiness.failed = %+v, want error-level %q", event, want)
+			}
+		case event.Code == "readiness.progress" && strings.HasPrefix(event.Line, "probe cmd:"):
+			progress++
+			if event.Line != "probe cmd: exit 1: probe-chatter-stderr" {
+				t.Fatalf("progress line = %q, want the attempt's exit status and stderr", event.Line)
+			}
+		}
+	}
+	if failed != 1 {
+		t.Fatalf("readiness.failed events = %d, want 1", failed)
+	}
+	if progress == 0 {
+		t.Fatal("no probe cmd progress line after more than five failed attempts")
+	}
+}
+
+// TestRun_ReadyWhen_CmdUsesProcessEnv pins that the probe runs with the
+// process's own environment and working directory.
+func TestRun_ReadyWhen_CmdUsesProcessEnv(t *testing.T) {
+	dir := t.TempDir()
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:          serviceHelperCmd("sleep", "30s"),
+			Dir:          dir,
+			Env:          map[string]string{"PROBE_TOKEN": "from-process-env"},
+			ReadyTimeout: 10,
+			ReadyWhen:    &config.ReadyWhen{Cmd: helperCmd("probe-env", "PROBE_TOKEN", "from-process-env", dir)},
+		},
+	})
+	r.Output = io.Discard
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	}()
+	if !waitForProcState(t, r, "worker", func(s ipc.ProcState) bool { return s.Ready || s.State == "failed" }, 12*time.Second) {
+		t.Fatalf("worker never settled: %+v", snapshotOf(r, "worker"))
+	}
+	if got := snapshotOf(r, "worker"); !got.Ready {
+		t.Fatalf("probe did not see the process env and dir: %+v", got)
+	}
+}
+
+// TestRun_ReadyWhen_CmdProbeIsQuiet pins that probe processes are not managed
+// processes on any surface: no <name>:probe state in the store snapshot, the
+// IPC snapshot or the journal, and none of the probe's output emitted.
+func TestRun_ReadyWhen_CmdProbeIsQuiet(t *testing.T) {
+	flag := filepath.Join(t.TempDir(), "ready")
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:          serviceHelperCmd("sleep", "30s"),
+			ReadyTimeout: 20,
+			ReadyWhen:    &config.ReadyWhen{Cmd: helperCmd("probe-file", flag)},
+		},
+	})
+	var output, journal bytes.Buffer
+	r.Output, r.Journal, r.Verbose = &output, &journal, true
+	socketPath, server, stopServer := ipcServerForTest(t)
+	defer stopServer()
+	r.IPC = server
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	stopped := false
+	defer func() {
+		if !stopped {
+			cancel()
+			<-done
+		}
+	}()
+
+	if !waitForProcState(t, r, "worker", func(s ipc.ProcState) bool { return s.State == "running" }, 5*time.Second) {
+		t.Fatalf("worker never started: %+v", snapshotOf(r, "worker"))
+	}
+	time.Sleep(1500 * time.Millisecond) // at least one failing attempt
+	if err := os.WriteFile(flag, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !waitForProcState(t, r, "worker", func(s ipc.ProcState) bool { return s.Ready }, 10*time.Second) {
+		t.Fatalf("worker never became ready: %+v", snapshotOf(r, "worker"))
+	}
+
+	for _, st := range r.Snapshot() {
+		if st.Name != "worker" {
+			t.Fatalf("store snapshot has a non-managed process: %+v", st)
+		}
+	}
+	client, err := ipc.Dial(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := client.RecvTimeout(5 * time.Second)
+	client.Close()
+	if err != nil || snapshot.Type != ipc.TypeSnapshot {
+		t.Fatalf("IPC snapshot = %+v, %v", snapshot, err)
+	}
+	for _, st := range snapshot.Processes {
+		if st.Name != "worker" {
+			t.Fatalf("IPC snapshot has a non-managed process: %+v", st)
+		}
+	}
+	for _, entry := range snapshot.RecentLogs {
+		if strings.HasSuffix(entry.Process, ":probe") {
+			t.Fatalf("IPC log history has a probe event: %+v", entry)
+		}
+	}
+
+	cancel()
+	stopped = true
+	if err := <-done; err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	r.logMu.Lock()
+	for name := range r.lastStates {
+		if name != "worker" {
+			t.Errorf("broadcast state cached for %q", name)
+		}
+	}
+	r.logMu.Unlock()
+	decoder := json.NewDecoder(&journal)
+	for {
+		var event ipc.LogEntry
+		if err := decoder.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasSuffix(event.Process, ":probe") || strings.Contains(event.Line, "probe-chatter") {
+			t.Fatalf("journal has a probe event: %+v", event)
+		}
+	}
+	if strings.Contains(output.String(), "probe-chatter") {
+		t.Fatalf("probe output reached the console: %q", output.String())
+	}
+}
+
+// TestRun_ReadyWhen_CmdProbeEscapeStaysQuiet pins that a probe stays out of
+// the event stream on its error paths too. A probe whose descendant leaves the
+// group still holding the output pipe makes the runner close the pipe under
+// the blocked readers, so they fail with a read error instead of EOF; that
+// read error must not surface as a "<name>:probe" event. The escape itself is
+// still reported, because the descendant may outlive the stack.
+func TestRun_ReadyWhen_CmdProbeEscapeStaysQuiet(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("setsid is a Unix facility")
+	}
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid(1) not available on this host")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "escapee.pid")
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	escape := writeScript(t, dir, "escape.sh", escapeScript)
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:          serviceHelperCmd("sleep", "30s"),
+			ReadyTimeout: 20,
+			ReadyWhen:    &config.ReadyWhen{Cmd: escape + " " + stubborn + " " + pidFile},
+		},
+	})
+	var journal bytes.Buffer
+	r.Output, r.Journal, r.Verbose = io.Discard, &journal, true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	escapee, ok := waitForPIDFile(t, pidFile, 20*time.Second)
+	if !ok {
+		cancel()
+		<-done
+		t.Fatal("escaped probe descendant never recorded its PID")
+	}
+	trackProcessForCleanup(t, escapee, "escaped probe descendant")
+	if !waitForProcState(t, r, "worker", func(s ipc.ProcState) bool { return s.Ready }, 20*time.Second) {
+		cancel()
+		<-done
+		t.Fatalf("worker never became ready: %+v", snapshotOf(r, "worker"))
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("runner did not finish shutting down")
+	}
+
+	if verdict := r.ShutdownResult(); verdict == nil || !strings.Contains(verdict.Error(), "worker:probe") {
+		t.Fatalf("verdict = %v, want the escaped probe descendant reported", verdict)
+	}
+	decoder := json.NewDecoder(&journal)
+	for {
+		var event ipc.LogEntry
+		if err := decoder.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasSuffix(event.Process, ":probe") {
+			t.Fatalf("journal has a probe event: %+v", event)
+		}
+	}
+}
+
+// TestRun_ReadyWhen_CmdProbeEndsWithIncarnation pins that a probe still
+// running when the stack stops is terminated and its group released before Run
+// returns. TestRun_ReadyWhen_CmdProbeIsJoinedBeforeRunReturns pins the join.
+func TestRun_ReadyWhen_CmdProbeEndsWithIncarnation(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "probe.pid")
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:          serviceHelperCmd("sleep", "30s"),
+			ReadyTimeout: -1,
+			ReadyWhen:    &config.ReadyWhen{Cmd: serviceHelperCmd("pid-block", pidFile)},
+		},
+	})
+	r.Output = io.Discard
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	pid, ok := waitForPIDFile(t, pidFile, 10*time.Second)
+	if !ok {
+		cancel()
+		<-done
+		t.Fatal("probe never started")
+	}
+	trackProcessForCleanup(t, pid, "probe")
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run = %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Run did not return with a probe running")
+	}
+	assertTerminated(t, pid, "probe", 2*time.Second)
+	if groups := r.snapshotGroups(); len(groups) != 0 {
+		t.Fatalf("groups left registered: %d", len(groups))
+	}
+}
+
+// TestRun_ReadyWhen_CmdProbeReapsDoNotAccumulate pins that a probe retried
+// without limit (ready_timeout -1) does not grow the reap registry: each
+// completed attempt's wait, and with it the attempt's exec.Cmd, is dropped
+// once a later reap registers, rather than kept until Run returns.
+func TestRun_ReadyWhen_CmdProbeReapsDoNotAccumulate(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:          serviceHelperCmd("sleep", "30s"),
+			ReadyTimeout: -1,
+			ReadyWhen:    &config.ReadyWhen{Cmd: helperCmd("exit", "1")},
+		},
+	})
+	r.Output = io.Discard
+	var started atomic.Int32
+	r.reapStarted = func(*singleReap) { started.Add(1) }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Run = %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	}()
+
+	// The worker's own reap plus four probe attempts.
+	for deadline := time.Now().Add(15 * time.Second); started.Load() < 5; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d reaps started", started.Load())
+		}
+	}
+	r.reapersMu.Lock()
+	total, probes := len(r.reapers), 0
+	for _, tracked := range r.reapers {
+		if tracked.process == "worker:probe" {
+			probes++
+		}
+	}
+	r.reapersMu.Unlock()
+	// At most the worker's pending reap and the latest probe attempt.
+	if probes > 1 || total > 2 {
+		t.Fatalf("reap registry kept %d entries (%d probe attempts) after %d reaps started", total, probes, started.Load())
+	}
+}
+
+// TestRun_ReadyWhen_CmdProbeIsJoinedBeforeRunReturns pins that the probe
+// goroutine itself, not just its process, has finished when Run returns. The
+// probe's reap is held, so its attempt cannot finish until the stack hands off
+// cleanup; a runner that stopped joining the probe would let the incarnation,
+// and then Run, return with that goroutine still inside probeCmd.
+func TestRun_ReadyWhen_CmdProbeIsJoinedBeforeRunReturns(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "probe.pid")
+	probeCmd := serviceHelperCmd("pid-block", pidFile)
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:          serviceHelperCmd("sleep", "30s"),
+			ReadyTimeout: -1,
+			ReadyWhen:    &config.ReadyWhen{Cmd: probeCmd},
+		},
+	})
+	r.Output = io.Discard
+	r.CleanupHandoffTimeout = 250 * time.Millisecond
+	var probeReapHeld atomic.Bool
+	reapRelease := make(chan struct{})
+	releaseReap := sync.OnceFunc(func() { close(reapRelease) })
+	t.Cleanup(releaseReap)
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		if strings.Contains(strings.Join(cmd.Args, " "), probeCmd) {
+			probeReapHeld.Store(true)
+			<-reapRelease
+		}
+		return cmd.Wait()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	pid, ok := waitForPIDFile(t, pidFile, 10*time.Second)
+	if !ok {
+		cancel()
+		releaseReap()
+		<-done
+		t.Fatal("probe never started")
+	}
+	trackProcessForCleanup(t, pid, "probe")
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		releaseReap()
+		t.Fatal("Run did not return with a probe running")
+	}
+	if !probeReapHeld.Load() {
+		t.Fatal("the probe's reap was never held, so the join was not exercised")
+	}
+	buf := make([]byte, 1<<20)
+	stacks := string(buf[:runtime.Stack(buf, true)])
+	if strings.Contains(stacks, ".(*Runner).probeCmd") {
+		t.Fatalf("probe goroutine still running after Run returned:\n%s", stacks)
+	}
+	assertTerminated(t, pid, "probe", 2*time.Second)
+	// Let the held reap collect the probe's zombie before cleanup runs.
+	releaseReap()
+	for deadline := time.Now().Add(2 * time.Second); daemon.IsAlive(pid) && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// journalEvents decodes a journal written by a finished Run.
+func journalEvents(t *testing.T, journal *bytes.Buffer) []ipc.LogEntry {
+	t.Helper()
+	var events []ipc.LogEntry
+	decoder := json.NewDecoder(journal)
+	for {
+		var event ipc.LogEntry
+		if err := decoder.Decode(&event); err == io.EOF {
+			return events
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, event)
+	}
+}
+
+// TestRun_HealthReportMarksUnhealthyAndRecovers pins health_action: report.
+// The service keeps running and stays ready while its health_when probe fails;
+// it becomes unhealthy after healthThreshold consecutive failures, recovers on
+// the next pass, and each transition is journalled exactly once. Health probe
+// runs stay out of the state store and the journal, like readiness probes.
+func TestRun_HealthReportMarksUnhealthyAndRecovers(t *testing.T) {
+	flag := filepath.Join(t.TempDir(), "healthy")
+	if err := os.WriteFile(flag, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:            serviceHelperCmd("sleep", "60s"),
+			HealthWhen:     &config.ReadyWhen{Cmd: helperCmd("probe-file", flag)},
+			HealthInterval: 1,
+			// The probe inherits the process env. A -race helper otherwise
+			// sleeps 1s at exit (the race runtime's atexit_sleep_ms), which
+			// is the whole 1s check limit of this interval.
+			Env: map[string]string{"GORACE": "atexit_sleep_ms=0"},
+		},
+	})
+	var journal bytes.Buffer
+	r.Output, r.Journal = io.Discard, &journal
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	stop := func() error {
+		cancel()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(15 * time.Second):
+			t.Fatal("runner did not stop")
+			return nil
+		}
+	}
+
+	health := func(want string) func(ipc.ProcState) bool {
+		return func(s ipc.ProcState) bool { return s.Health == want }
+	}
+	if !waitForProcState(t, r, "worker", health("healthy"), 10*time.Second) {
+		_ = stop()
+		t.Fatalf("worker never became healthy: %+v", snapshotOf(r, "worker"))
+	}
+	if err := os.Remove(flag); err != nil {
+		t.Fatal(err)
+	}
+	if !waitForProcState(t, r, "worker", health("unhealthy"), 15*time.Second) {
+		_ = stop()
+		t.Fatalf("worker never became unhealthy: %+v", snapshotOf(r, "worker"))
+	}
+	got := snapshotOf(r, "worker")
+	if got.State != "running" || !got.Ready || got.Generation != 1 || got.Restarts != 0 {
+		t.Fatalf("report action disturbed the incarnation: %+v", got)
+	}
+	if !strings.Contains(got.HealthError, "exit 1") || !strings.Contains(got.HealthError, "probe-chatter-stderr") {
+		t.Fatalf("health_error = %q, want the exit status and stderr head", got.HealthError)
+	}
+	for _, st := range r.Snapshot() {
+		if st.Name != "worker" {
+			t.Fatalf("store snapshot has a non-managed process: %+v", st)
+		}
+	}
+	if err := os.WriteFile(flag, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !waitForProcState(t, r, "worker", health("healthy"), 10*time.Second) {
+		_ = stop()
+		t.Fatalf("worker never recovered: %+v", snapshotOf(r, "worker"))
+	}
+	if got := snapshotOf(r, "worker"); got.HealthError != "" || got.Generation != 1 {
+		t.Fatalf("recovered state = %+v", got)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+
+	counts := map[string]int{}
+	var healthStates []string
+	for _, event := range journalEvents(t, &journal) {
+		// The stderr head reaches health events as the failure detail; the
+		// probe's own output never becomes an output event.
+		if strings.HasSuffix(event.Process, ":probe") || (event.Kind == "output" && strings.Contains(event.Line, "probe-chatter")) {
+			t.Fatalf("journal has a probe event: %+v", event)
+		}
+		counts[event.Code]++
+		if strings.HasPrefix(event.Code, "health.") && event.Kind != "probe" {
+			t.Fatalf("health event kind = %q, want probe: %+v", event.Kind, event)
+		}
+		if event.Code == "process.state" && event.State != nil && event.State.Health != "" {
+			if n := len(healthStates); n == 0 || healthStates[n-1] != event.State.Health {
+				healthStates = append(healthStates, event.State.Health)
+			}
+		}
+	}
+	if counts["health.unhealthy"] != 1 || counts["health.recovered"] != 1 || counts["health.check_failed"] < healthThreshold {
+		t.Fatalf("health events = %v, want one unhealthy, one recovered, at least %d check_failed", counts, healthThreshold)
+	}
+	// The final unknown is the stop: a process that is not running has no
+	// current verdict.
+	if want := []string{"unknown", "healthy", "unhealthy", "healthy", "unknown"}; !slices.Equal(healthStates, want) {
+		t.Fatalf("journalled health transitions = %v, want %v", healthStates, want)
+	}
+}
+
+// TestRun_HealthProbeGroupSealedOnShutdown pins that a health_when.cmd run is
+// owned by its incarnation: one still running when the stack stops is bounded
+// by the cleanup handoff, sealed with the stack, and its goroutine is joined
+// before Run returns.
+func TestRun_HealthProbeGroupSealedOnShutdown(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "probe.pid")
+	probeCmd := serviceHelperCmd("pid-block", pidFile)
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd:            serviceHelperCmd("sleep", "30s"),
+			HealthWhen:     &config.ReadyWhen{Cmd: probeCmd},
+			HealthInterval: 3,
+		},
+	})
+	r.Output = io.Discard
+	r.CleanupHandoffTimeout = 250 * time.Millisecond
+	var probeReapHeld atomic.Bool
+	reapRelease := make(chan struct{})
+	releaseReap := sync.OnceFunc(func() { close(reapRelease) })
+	t.Cleanup(releaseReap)
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		if strings.Contains(strings.Join(cmd.Args, " "), probeCmd) {
+			probeReapHeld.Store(true)
+			<-reapRelease
+		}
+		return cmd.Wait()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	pid, ok := waitForPIDFile(t, pidFile, 10*time.Second)
+	if !ok {
+		cancel()
+		releaseReap()
+		<-done
+		t.Fatal("health probe never started")
+	}
+	trackProcessForCleanup(t, pid, "health probe")
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		releaseReap()
+		t.Fatal("Run did not return with a health probe running")
+	}
+	if !probeReapHeld.Load() {
+		t.Fatal("the probe's reap was never held, so the handoff was not exercised")
+	}
+	buf := make([]byte, 1<<20)
+	if stacks := string(buf[:runtime.Stack(buf, true)]); strings.Contains(stacks, ".(*Runner).monitorHealth") {
+		t.Fatalf("health goroutine still running after Run returned:\n%s", stacks)
+	}
+	assertTerminated(t, pid, "health probe", 2*time.Second)
+	releaseReap()
+	for deadline := time.Now().Add(2 * time.Second); daemon.IsAlive(pid) && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestRun_MultipleFailedProcessesErrorContainsNames(t *testing.T) {
 	r := makeRunner(map[string]config.Process{
 		"proc-a": {Cmd: helperCmd("exit", "1"), Restart: "never"},
@@ -1398,6 +2194,64 @@ func TestServeHealth_ServiceRunningIsHealthy(t *testing.T) {
 	}
 }
 
+// TestServeHealth_UnhealthyServiceIs503 pins the /health rule: a running
+// service whose health_when probe has failed is unhealthy, while /ready keeps
+// reporting the startup latch.
+func TestServeHealth_UnhealthyServiceIs503(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	r := makeRunner(map[string]config.Process{
+		// 127.0.0.1:1 is a reserved port that nothing listens on.
+		"svc": {Cmd: serviceHelperCmd("sleep", "60s"), HealthWhen: &config.ReadyWhen{TCP: "127.0.0.1:1"}, HealthInterval: 1},
+	})
+	r.Output = io.Discard
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	if !waitForProcState(t, r, "svc", func(s ipc.ProcState) bool { return s.Health == "unhealthy" }, 15*time.Second) {
+		t.Fatalf("svc never became unhealthy: %+v", snapshotOf(r, "svc"))
+	}
+	go r.serveHealth(ln, r.store.Load())
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + ln.Addr().String() + "/health")
+	if err != nil {
+		t.Fatalf("health request failed: %v", err)
+	}
+	var body struct {
+		Healthy   bool `json:"healthy"`
+		Processes []struct {
+			Name   string `json:"name"`
+			State  string `json:"state"`
+			Health string `json:"health"`
+		} `json:"processes"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || body.Healthy || len(body.Processes) != 1 ||
+		body.Processes[0].State != "running" || body.Processes[0].Health != "unhealthy" {
+		t.Fatalf("/health = %d %+v, want 503 naming the unhealthy running service", resp.StatusCode, body)
+	}
+	ready, err := client.Get("http://" + ln.Addr().String() + "/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready.Body.Close()
+	if ready.StatusCode != http.StatusOK {
+		t.Fatalf("/ready = %d, want 200: health does not change readiness", ready.StatusCode)
+	}
+}
+
 // ─── Restart guardrail tests ────────────────────────────────────────────
 
 func TestHandleRestart_RejectsTaskMode(t *testing.T) {
@@ -1588,6 +2442,33 @@ func TestReload_DetectsReadyWhenChange(t *testing.T) {
 	}
 }
 
+func TestReload_DetectsReadyWhenCmdChange(t *testing.T) {
+	a := config.Process{Cmd: "worker", ReadyWhen: &config.ReadyWhen{Cmd: "check --ready"}}
+	b := config.Process{Cmd: "worker", ReadyWhen: &config.ReadyWhen{Cmd: "check --live"}}
+	if !procChanged(a, b) {
+		t.Error("procChanged should detect a ready_when.cmd change")
+	}
+}
+
+func TestReload_DetectsHealthWhenChange(t *testing.T) {
+	base := config.Process{Cmd: "worker", Restart: "always", HealthWhen: &config.ReadyWhen{Cmd: "check --live"}}
+	for name, change := range map[string]func(*config.Process){
+		"probe":    func(p *config.Process) { p.HealthWhen = &config.ReadyWhen{Cmd: "check --deep"} },
+		"removed":  func(p *config.Process) { p.HealthWhen = nil },
+		"interval": func(p *config.Process) { p.HealthInterval = 30 },
+		"action":   func(p *config.Process) { p.HealthAction = config.HealthActionRestart },
+	} {
+		changed := base
+		change(&changed)
+		if !procChanged(base, changed) {
+			t.Errorf("procChanged missed a health_* %s change", name)
+		}
+	}
+	if procChanged(base, base) {
+		t.Error("procChanged reported an unchanged health probe")
+	}
+}
+
 func TestReload_DetectsReadyTimeoutChange(t *testing.T) {
 	a := config.Process{Cmd: "echo", ReadyTimeout: 30}
 	b := config.Process{Cmd: "echo", ReadyTimeout: 60}
@@ -1671,22 +2552,14 @@ func pidIsRunning(pid int) bool {
 }
 
 // pidIsTerminatedUnreaped reports whether pid is a zombie or already dead.
-// Linux only; elsewhere the /proc read fails and plain liveness is used.
+// Linux only; elsewhere daemon.ProcStat is unsupported and plain liveness is used.
 func pidIsTerminatedUnreaped(pid int) bool {
-	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	info, err := daemon.ProcStat(pid)
 	if err != nil {
 		return false
 	}
-	closeIdx := strings.LastIndexByte(string(data), ')')
-	if closeIdx < 0 || closeIdx+2 > len(data) {
-		return false
-	}
-	fields := strings.Fields(string(data[closeIdx+2:]))
-	if len(fields) == 0 {
-		return false
-	}
-	switch fields[0] {
-	case "Z", "X", "x":
+	switch info.State {
+	case 'Z', 'X', 'x':
 		return true
 	}
 	return false
@@ -3426,6 +4299,64 @@ func assertRunnerQuiescent(t *testing.T, r *Runner, state []ipc.ProcState, proce
 	}
 }
 
+// TestRunnerCleanupHandoff_DeadlineReadWhenStackStopsItself pins that
+// CleanupHandoffDeadline is read when Run observes cancellation, including one
+// the stack caused itself (a failed task), so a caller such as verify never
+// writes the handoff budget while Run may be reading it. The deadline, not the
+// much longer CleanupHandoffTimeout, bounds the handoff.
+func TestRunnerCleanupHandoff_DeadlineReadWhenStackStopsItself(t *testing.T) {
+	dir := t.TempDir()
+	apiPID, trigger := filepath.Join(dir, "api.pid"), filepath.Join(dir, "fail")
+	apiCmd := serviceHelperCmd("pid-block", apiPID)
+	r := makeRunner(map[string]config.Process{
+		"api":  {Cmd: apiCmd, ShutdownTimeout: shutdownGraceForTest},
+		"seed": {Cmd: helperCmd("fail-after-file", trigger, "30s"), Mode: config.ProcessModeTask},
+	})
+	r.Output = io.Discard
+	r.CleanupHandoffTimeout = 30 * time.Second
+	var calls atomic.Int32
+	r.CleanupHandoffDeadline = func() time.Time {
+		calls.Add(1)
+		return time.Now().Add(300 * time.Millisecond)
+	}
+	reapRelease := make(chan struct{})
+	releaseReap := sync.OnceFunc(func() { close(reapRelease) })
+	t.Cleanup(releaseReap)
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		if strings.Contains(strings.Join(cmd.Args, " "), apiCmd) {
+			<-reapRelease
+		}
+		return cmd.Wait()
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background()) }()
+	pid, ok := waitForPIDFile(t, apiPID, 10*time.Second)
+	if !ok {
+		releaseReap()
+		t.Fatal("api never started")
+	}
+	trackProcessForCleanup(t, pid, "api")
+	if err := os.WriteFile(trigger, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		releaseReap()
+		t.Fatal("Run waited out CleanupHandoffTimeout instead of the handoff deadline")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("handoff took %s, want it bounded by the deadline", elapsed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("CleanupHandoffDeadline called %d times, want once when cancellation was observed", got)
+	}
+	// The seal ended api although its reap is still held.
+	assertTerminated(t, pid, "api", 2*time.Second)
+	releaseReap()
+}
+
 func TestRunnerCleanupHandoff_SealsBeforeReturningAndQuiescesWorker(t *testing.T) {
 	command := serviceHelperCmd("sleep", "120s")
 	configPath := filepath.Join(t.TempDir(), "proc-compose.yml")
@@ -4086,4 +5017,30 @@ func TestRunnerCleanupHandoff_FailedTrackDoesNotHoldAdmissionOrRun(t *testing.T)
 	}
 	assertTerminated(t, group.cmd.Process.Pid, "failed-track leader", 5*time.Second)
 	assertRunnerQuiescent(t, r, stateBefore, processBefore, verdictBefore, outputBefore, journalBefore, sequenceBefore)
+}
+
+// TestFormatRecovery_StableEvidenceLines pins the evidence shape stop and up
+// print for a crashed run: one key=value line per group, sorted by name and
+// then pgid, with empty fields left out.
+func TestFormatRecovery_StableEvidenceLines(t *testing.T) {
+	groups := []RecoveredGroup{
+		{GroupResult: GroupResult{Name: "web", PGID: 912}, LeaderStart: 51301, Outcome: OutcomeTerminated, Reason: "leader_proven", Signals: []string{"SIGTERM"}, PIDs: []int{912, 915}},
+		{GroupResult: GroupResult{Name: "detached-child", PGID: 944}, Outcome: OutcomeUnknown, Reason: "leader_gone", LiveMembers: 1, PIDs: []int{950}},
+		{GroupResult: GroupResult{Name: "api", PGID: 0}, Outcome: OutcomeUnknown, Reason: "launch_pending"},
+		{GroupResult: GroupResult{Name: "web", PGID: 13}, Outcome: OutcomeEmpty, Reason: "no_members"},
+		{GroupResult: GroupResult{Name: "stubborn", PGID: 930}, LeaderStart: 51340, Outcome: OutcomeTerminated, Reason: "leader_proven", Signals: []string{"SIGTERM", "SIGKILL"}, PIDs: []int{930, 931}},
+		{GroupResult: GroupResult{Name: "worker", PGID: 960}, LeaderStart: 51400, Outcome: OutcomeUnknown, Reason: "boot_unknown"},
+	}
+	want := "recovered group=api pgid=0 outcome=unknown reason=launch_pending\n" +
+		"recovered group=detached-child pgid=944 outcome=unknown reason=leader_gone live_members=1 members=950\n" +
+		"recovered group=stubborn pgid=930 leader_start=51340 outcome=terminated reason=leader_proven signals=SIGTERM,SIGKILL members=930,931\n" +
+		"recovered group=web pgid=13 outcome=empty reason=no_members\n" +
+		"recovered group=web pgid=912 leader_start=51301 outcome=terminated reason=leader_proven signals=SIGTERM members=912,915\n" +
+		"recovered group=worker pgid=960 leader_start=51400 outcome=unknown reason=boot_unknown"
+	if got := FormatRecovery(groups); got != want {
+		t.Fatalf("FormatRecovery =\n%s\nwant\n%s", got, want)
+	}
+	if got := FormatRecovery([]RecoveredGroup{{GroupResult: GroupResult{Name: "my api", PGID: 7}, Outcome: OutcomeEmpty, Reason: "no_members"}}); got != `recovered group="my api" pgid=7 outcome=empty reason=no_members` {
+		t.Fatalf("a name with a space must stay one field: %s", got)
+	}
 }

@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/daemon"
 )
 
 type processRunResult struct {
@@ -80,9 +84,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 
 	for {
 		// Readiness settings belong to an incarnation, including after reload.
-		if updated, ok := r.getProc(p.name); ok {
-			p.proc = updated
-		}
+		r.refreshProc(&p)
 		var logRe *regexp.Regexp
 		if p.proc.ReadyWhen != nil && p.proc.ReadyWhen.Log != "" {
 			logRe = regexp.MustCompile(p.proc.ReadyWhen.Log)
@@ -93,8 +95,14 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		st.state = "starting"
 		st.pid = 0
 		st.generation++
+		gen := st.generation
 		st.lastError = ""
 		st.exitCode = nil
+		st.probeFailed = false
+		st.health, st.healthFailures, st.healthError = "", 0, ""
+		if p.proc.HealthWhen != nil {
+			st.health = healthUnknown
+		}
 		st.mu.Unlock()
 		r.broadcastState(p, st)
 
@@ -111,7 +119,18 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			}
 		}()
 
-		onStart, onLine := r.buildReadinessCallbacks(p, maxName, st, logRe, readyTimeout, procCtx, procCancel, func(msg string) {
+		// A cmd probe runs processes, so it is joined on every exit from this
+		// incarnation: none of its events may outlive the incarnation or Run.
+		// The health monitor is joined the same way.
+		var probes sync.WaitGroup
+		if p.proc.HealthWhen != nil {
+			probes.Add(1)
+			go func() {
+				defer probes.Done()
+				r.monitorHealth(procCtx, procCancel, p, st, gen, handoff)
+			}()
+		}
+		onStart, onLine := r.buildReadinessCallbacks(p, maxName, st, gen, logRe, readyTimeout, procCtx, procCancel, handoff, &probes, func(msg string) {
 			r.processLog(p, "debug", "readiness.progress", msg)
 		})
 
@@ -119,9 +138,11 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		err := r.exec(procCtx, p, maxName, st, onStart, onLine, handoff)
 		if errors.Is(err, errCleanupHandoff) {
 			procCancel()
+			probes.Wait()
 			return processRunResult{quiesced: true}
 		}
 		procCancel() // clean up the restartCh goroutine
+		probes.Wait()
 
 		// Reset backoff if the process ran successfully for a meaningful duration.
 		if time.Since(startTime) > backoff {
@@ -151,9 +172,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 
 		if wasRestart {
 			// Pick up any config changes applied by Reload().
-			if updated, ok := r.getProc(p.name); ok {
-				p.proc = updated
-			}
+			r.refreshProc(&p)
 			st.resetReady()
 			r.processLog(p, "info", "process.restart_requested", "restarting (requested)...")
 			st.mu.Lock()
@@ -163,6 +182,19 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			r.broadcastState(p, st)
 			backoff = time.Second
 			continue
+		}
+
+		// A readiness failure cancelled this incarnation. The reap can still
+		// report a clean exit: os/exec returns the context error only when its
+		// own cancel hook signalled the group, and when the group was already
+		// withdrawn a command that exited 0 on SIGTERM is reaped as status 0.
+		// The probe's verdict decides instead: this is a failure for restart,
+		// max_restarts and the run's result.
+		st.mu.Lock()
+		probeFailed, probeError := st.probeFailed, st.lastError
+		st.mu.Unlock()
+		if err == nil && probeFailed {
+			err = errors.New(probeError)
 		}
 
 		if err == nil {
@@ -296,20 +328,27 @@ func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st
 // buildReadinessCallbacks builds onStart and onLine hooks bound to the
 // current run iteration's context. Each ready_when probe wires its own pair.
 // progressFn is called periodically during probe to show waiting progress.
+// A cmd probe runs under handoff and is counted in probes, which the caller
+// joins before the incarnation ends.
 func (r *Runner) buildReadinessCallbacks(
 	p procInfo,
 	maxName int,
 	st *procState,
+	gen uint64,
 	logRe *regexp.Regexp,
 	readyTimeout time.Duration,
 	procCtx context.Context,
 	procCancel context.CancelFunc,
+	handoff <-chan struct{},
+	probes *sync.WaitGroup,
 	progressFn func(string),
 ) (onStart func(), onLine func(string)) {
 	switch {
 	case p.proc.ReadyWhen == nil:
 		onStart = func() {
-			st.markReady(true)
+			if !st.markReadyFor(procCtx, gen, true) {
+				return
+			}
 			r.broadcastState(p, st)
 			r.processLog(p, "info", "process.ready", "ready")
 		}
@@ -322,7 +361,7 @@ func (r *Runner) buildReadinessCallbacks(
 				}, func(msg string) {
 					r.processLog(p, "debug", "readiness.progress", msg)
 				})
-				r.handleProbeResult(p, maxName, st, "http", ok, procCtx, procCancel)
+				r.handleProbeResult(p, st, gen, "http", ok, "", procCtx, procCancel)
 			}()
 		}
 	case p.proc.ReadyWhen.TCP != "":
@@ -334,7 +373,18 @@ func (r *Runner) buildReadinessCallbacks(
 				}, func(msg string) {
 					r.processLog(p, "debug", "readiness.progress", msg)
 				})
-				r.handleProbeResult(p, maxName, st, "tcp", ok, procCtx, procCancel)
+				r.handleProbeResult(p, st, gen, "tcp", ok, "", procCtx, procCancel)
+			}()
+		}
+	case p.proc.ReadyWhen.Cmd != "":
+		onStart = func() {
+			probes.Add(1)
+			go func() {
+				defer probes.Done()
+				ok, detail := r.probeCmd(procCtx, p, handoff, readyTimeout, func(msg string) {
+					r.processLog(p, "debug", "readiness.progress", msg)
+				}, progressFn)
+				r.handleProbeResult(p, st, gen, "cmd", ok, detail, procCtx, procCancel)
 			}()
 		}
 	case logRe != nil:
@@ -343,14 +393,8 @@ func (r *Runner) buildReadinessCallbacks(
 				select {
 				case <-procCtx.Done():
 				case <-time.After(readyTimeout):
-					st.mu.Lock()
-					alreadyReady := st.readyClosed && st.readyOK
-					st.mu.Unlock()
-					if !alreadyReady && procCtx.Err() == nil {
-						msg := fmt.Sprintf("readiness probe (log) timed out after %s", readyTimeout)
-						st.mu.Lock()
-						st.lastError = msg
-						st.mu.Unlock()
+					msg := fmt.Sprintf("readiness probe (log) timed out after %s", readyTimeout)
+					if st.failReadinessFor(procCtx, gen, msg) {
 						r.processLog(p, "error", "readiness.failed", msg)
 						procCancel()
 					}
@@ -358,7 +402,7 @@ func (r *Runner) buildReadinessCallbacks(
 			}()
 		}
 		onLine = func(line string) {
-			if logRe.MatchString(line) && st.markReady(true) {
+			if logRe.MatchString(line) && st.markReadyFor(procCtx, gen, true) {
 				r.broadcastState(p, st)
 				r.processLog(p, "info", "process.ready", "ready (log match)")
 			}
@@ -414,14 +458,26 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	// shutdown can take its sealing snapshot; if admission already closed, nothing
 	// is launched.
 	r.lifecycleMu.Lock()
-	if r.stopping.Load() || ctx.Err() != nil {
+	if (r.stopping.Load() && !(p.teardown && r.teardownOpen)) || ctx.Err() != nil {
 		r.lifecycleMu.Unlock()
 		_ = stdout.Close()
 		_ = stderr.Close()
 		_ = pg.Close()
 		return context.Canceled
 	}
+	// Record the launch before it happens. A crash after Start must find the
+	// group in the record, so a launch that cannot be recorded is refused
+	// (unless the PID file itself is gone; see recordPending).
+	entry, err := r.recordPending(p.name, pg)
+	if err != nil {
+		r.lifecycleMu.Unlock()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		_ = pg.Close()
+		return fmt.Errorf("record process group: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
+		r.recordDrop(entry)
 		r.lifecycleMu.Unlock()
 		_ = stdout.Close()
 		_ = stderr.Close()
@@ -435,6 +491,9 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 			}
 		}
 		observation, sealErr := pg.Seal()
+		if observation.State == GroupEmpty && sealErr == nil {
+			r.recordDrop(entry)
+		}
 		reap := &singleReap{}
 		r.startReap(p.name, observation.Identity, cmd, reap)
 		r.lifecycleMu.Unlock()
@@ -458,6 +517,9 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	// a successfully started process.
 	groupIdentity := pg.Identify()
 	r.trackGroup(p.name, pg, grace)
+	// The leader is this runner's unreaped child here, so its pid and start
+	// time still describe it.
+	r.recordTracked(entry, cmd.Process.Pid)
 	r.lifecycleMu.Unlock()
 
 	st.mu.Lock()
@@ -715,7 +777,9 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 
 	// Verify now that every signal has been sent and the leader is collected.
 	r.lifecycleMu.Lock()
-	if handoff != nil && r.sealing.Load() {
+	// The terminal sweep took the registry, so this group is its to report.
+	// A teardown group was registered after that sweep and is verified here.
+	if handoff != nil && r.sealing.Load() && !p.teardown {
 		r.lifecycleMu.Unlock()
 		return errCleanupHandoff
 	}
@@ -725,7 +789,8 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 		// entirely; either way it is not ours to signal any more. Report it.
 		r.recordSurvivor(p.name, groupIdentity, survivorsError(groupResult(p.name, pg, state)))
 		// Keep the group registered so the stack-level sweep can still name
-		// it; Close would discard the only handle the operator could use.
+		// it; Close would discard the only handle the operator could use. Its
+		// record entry stays for the same reason.
 		r.lifecycleMu.Unlock()
 		return err
 	}
@@ -739,6 +804,7 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	}
 
 	r.untrackGroup(p.name, pg)
+	r.recordDropGroup(pg)
 	pg.Close()
 	r.lifecycleMu.Unlock()
 	return err
@@ -796,6 +862,8 @@ func (r *Runner) trackGroup(name string, pg ProcessGroup, _ time.Duration) {
 	if state := prev.State(); state != GroupEmpty {
 		r.recordSurvivor(name, prev.Identify(), fmt.Errorf("previous incarnation: %w",
 			survivorsError(groupResult(name, prev, state))))
+	} else {
+		r.recordDropGroup(prev)
 	}
 	prev.Close()
 }
@@ -832,6 +900,145 @@ func (r *Runner) takeGroups() map[string]ProcessGroup {
 	groups := r.groups
 	r.groups = nil
 	return groups
+}
+
+// ── process-group record ─────────────────────────────────────────────────────
+//
+// The record is the on-disk counterpart of the registry above, written to
+// RecordPath (the daemon's PID file) so that groups outlive a crashed daemon
+// in a form a later stop can check. Every change rewrites the whole list while
+// recordMu is held, so writes land in mutation order. A failed write leaves the
+// previous record, which still covers every group that may be running: entries
+// are added before a launch and removed only after their group is proven empty.
+
+// recEntry is one launched process group. pg identifies it in memory; on disk
+// it is identified by name and pgid.
+type recEntry struct {
+	pg    ProcessGroup
+	group daemon.Group
+}
+
+// beginRecord starts the run's record with an empty list. If that cannot be
+// written, recording is disabled for the run with one warning: the PID file
+// then carries no record, which a later stop reports as unverifiable.
+func (r *Runner) beginRecord() {
+	r.recordMu.Lock()
+	defer r.recordMu.Unlock()
+	r.records = nil
+	r.recordOn = r.RecordPath != "" && runtime.GOOS != "windows"
+	if !r.recordOn {
+		return
+	}
+	if err := r.writeRecordLocked(); err != nil {
+		r.recordOn = false
+		r.systemEvent(fmt.Sprintf("warning: process groups will not be recorded for crash recovery: %v", err), true)
+	}
+}
+
+// recordPending adds a launch that has not started yet. An error means the
+// entry could not be persisted and the launch must not proceed. With recording
+// disabled it returns a nil entry, which every other record helper ignores.
+//
+// A PID file that has disappeared mid-run (a removed runtime or temp
+// directory), or that another daemon has since recreated as its own, disables
+// recording with one warning, as beginRecord does, instead of refusing: no
+// record of this run is left on disk to keep complete, and refusing would stop
+// every later restart for the rest of the run.
+func (r *Runner) recordPending(name string, pg ProcessGroup) (*recEntry, error) {
+	entry, lost, err := r.recordPendingLocked(name, pg)
+	if lost != nil {
+		r.systemEvent(fmt.Sprintf("warning: process groups will no longer be recorded for crash recovery: %v", lost), true)
+	}
+	return entry, err
+}
+
+func (r *Runner) recordPendingLocked(name string, pg ProcessGroup) (entry *recEntry, lost, err error) {
+	r.recordMu.Lock()
+	defer r.recordMu.Unlock()
+	if !r.recordOn {
+		return nil, nil, nil
+	}
+	entry = &recEntry{pg: pg, group: daemon.Group{Name: name}}
+	r.records = append(r.records, entry)
+	if err := r.writeRecordLocked(); err != nil {
+		r.records = r.records[:len(r.records)-1]
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, daemon.ErrNotOwner) {
+			r.recordOn = false
+			clear(r.records)
+			r.records = nil
+			return nil, err, nil
+		}
+		return nil, nil, err
+	}
+	return entry, nil, nil
+}
+
+// recordTracked fills in a started launch's leader. pid must be the command's
+// own pid, not the group's identifier, which a wrapping group may not expose.
+// On a failed write the entry stays pending on disk, which reads as unknown.
+func (r *Runner) recordTracked(entry *recEntry, pid int) {
+	if entry == nil {
+		return
+	}
+	var start uint64
+	if info, err := daemon.ProcStat(pid); err == nil {
+		start = info.StartTime
+	}
+	r.recordMu.Lock()
+	defer r.recordMu.Unlock()
+	if !r.recordOn {
+		return
+	}
+	entry.group.PGID = pid
+	entry.group.LeaderStart = start
+	_ = r.writeRecordLocked()
+}
+
+// recordDrop removes one entry. The caller must have proven its group empty or
+// never started.
+func (r *Runner) recordDrop(entry *recEntry) {
+	if entry == nil {
+		return
+	}
+	r.recordMu.Lock()
+	defer r.recordMu.Unlock()
+	r.removeRecordsLocked(func(e *recEntry) bool { return e == entry })
+}
+
+// recordDropGroup removes the entry for a group the caller has proven empty.
+func (r *Runner) recordDropGroup(pg ProcessGroup) {
+	r.recordMu.Lock()
+	defer r.recordMu.Unlock()
+	r.removeRecordsLocked(func(e *recEntry) bool { return e.pg == pg })
+}
+
+func (r *Runner) removeRecordsLocked(match func(*recEntry) bool) {
+	if !r.recordOn {
+		return
+	}
+	kept := r.records[:0]
+	for _, e := range r.records {
+		if !match(e) {
+			kept = append(kept, e)
+		}
+	}
+	if len(kept) == len(r.records) {
+		return
+	}
+	clear(r.records[len(kept):])
+	r.records = kept
+	// A failed write leaves the removed entry on disk, a superset of the truth.
+	_ = r.writeRecordLocked()
+}
+
+func (r *Runner) writeRecordLocked() error {
+	groups := make([]daemon.Group, 0, len(r.records))
+	for _, e := range r.records {
+		groups = append(groups, e.group)
+	}
+	// The runner lives in the daemon, which wrote the PID file under its own
+	// pid; a file naming anyone else is not this run's record.
+	return daemon.WriteGroups(r.RecordPath, os.Getpid(), groups)
 }
 
 // recordSurvivor notes a managed process that could not be terminated, so the
@@ -902,6 +1109,13 @@ func (r *Runner) sweepGroups(runCtx context.Context) {
 	if runCtx.Err() == nil {
 		return
 	}
+	r.sealGroups()
+}
+
+// sealGroups closes admission, takes every tracked group, seals it, and
+// reports the ones that are not empty. sweepGroups runs it at shutdown; the
+// teardown phase runs it again for the groups its processes registered.
+func (r *Runner) sealGroups() {
 	// Close admission before atomically taking the registry. Launchers hold the
 	// same lock through Start, Track, and registration.
 	r.lifecycleMu.Lock()
@@ -920,6 +1134,9 @@ func (r *Runner) sweepGroups(runCtx context.Context) {
 		// Seal remaining authority before Run returns. On Windows, this preserves
 		// the final membership observation before kill-on-close invalidates it.
 		observation, sealErr := pg.Seal()
+		if observation.State == GroupEmpty && sealErr == nil {
+			r.recordDropGroup(pg)
+		}
 		if observation.State != GroupEmpty {
 			r.recordSurvivor(name, observation.Identity, survivorsError(sealedGroupResult(name, observation)))
 		}
@@ -946,9 +1163,16 @@ func (r *Runner) startReap(name, identity string, cmd *exec.Cmd, reap *singleRea
 	}
 	tracked := &trackedReap{process: name, identity: identity, reap: reap}
 	r.reapersMu.Lock()
+	// Prune before appending: launchers that never stop, such as a
+	// ready_when.cmd probe retried every second under ready_timeout -1, would
+	// otherwise keep every completed attempt's exec.Cmd alive until Run
+	// returns. Unresolved waits stay for reportPendingReaps. The reap starts
+	// under the lock because pruning reads every registered reap's state from
+	// other launchers' goroutines.
+	r.pruneTakenReapsLocked()
+	reap.start(wait)
 	r.reapers = append(r.reapers, tracked)
 	r.reapersMu.Unlock()
-	reap.start(wait)
 	if r.reapStarted != nil {
 		r.reapStarted(reap)
 	}
@@ -959,20 +1183,25 @@ func (r *Runner) startReap(name, identity string, cmd *exec.Cmd, reap *singleRea
 // they never update this registry or Runner state after Run returns.
 func (r *Runner) reportPendingReaps() {
 	r.reapersMu.Lock()
-	var pending []*trackedReap
-	keep := r.reapers[:0]
-	for _, tracked := range r.reapers {
-		if tracked.reap.taken() {
-			continue
-		}
-		pending = append(pending, tracked)
-		keep = append(keep, tracked)
-	}
-	r.reapers = keep
+	r.pruneTakenReapsLocked()
+	pending := slices.Clone(r.reapers)
 	r.reapersMu.Unlock()
 	for _, tracked := range pending {
 		r.recordUnverified(tracked.process, tracked.identity, fmt.Sprintf("%s: process leader %s was not reaped before cleanup handoff", tracked.process, tracked.identity))
 	}
+}
+
+// pruneTakenReapsLocked drops every registered wait whose result has been
+// published, keeping only the unresolved ones. Callers hold reapersMu.
+func (r *Runner) pruneTakenReapsLocked() {
+	keep := r.reapers[:0]
+	for _, tracked := range r.reapers {
+		if !tracked.reap.taken() {
+			keep = append(keep, tracked)
+		}
+	}
+	clear(r.reapers[len(keep):])
+	r.reapers = keep
 }
 
 func waitForCleanupHandoff(delay time.Duration, handoff <-chan struct{}) bool {
@@ -1042,23 +1271,28 @@ func (r *Runner) ShutdownResult() error {
 	return errors.New(strings.Join(problems, "\n"))
 }
 
-// handleProbeResult finalises a HTTP/TCP probe outcome. On success it marks
-// the process ready; on a non-cancellation failure (e.g. ready_timeout) it
-// cancels the per-iteration context so the running command is terminated.
-func (r *Runner) handleProbeResult(p procInfo, maxName int, st *procState, kind string, ok bool, procCtx context.Context, procCancel context.CancelFunc) {
-	if procCtx.Err() != nil {
-		return // shutdown already in progress
-	}
+// handleProbeResult finalises a HTTP/TCP/cmd probe outcome for incarnation gen.
+// On success it marks the process ready; on a non-cancellation failure (e.g.
+// ready_timeout) it records the failure and cancels the per-iteration context
+// so the running command is terminated. Both are decided under st.mu against
+// procCtx, so a result that arrives after its incarnation ended is dropped.
+// A non-empty detail (the cmd probe's last attempt) is appended to the
+// failure message.
+func (r *Runner) handleProbeResult(p procInfo, st *procState, gen uint64, kind string, ok bool, detail string, procCtx context.Context, procCancel context.CancelFunc) {
 	if ok {
-		st.markReady(true)
-		r.broadcastState(p, st)
-		r.processLog(p, "info", "process.ready", "ready ("+kind+" probe)")
+		if st.markReadyFor(procCtx, gen, true) {
+			r.broadcastState(p, st)
+			r.processLog(p, "info", "process.ready", "ready ("+kind+" probe)")
+		}
 		return
 	}
 	msg := "readiness probe (" + kind + ") timed out"
-	st.mu.Lock()
-	st.lastError = msg
-	st.mu.Unlock()
+	if detail != "" {
+		msg += " (last attempt: " + detail + ")"
+	}
+	if !st.failReadinessFor(procCtx, gen, msg) {
+		return // shutdown, restart, or a later incarnation already took over
+	}
 	r.processLog(p, "error", "readiness.failed", msg)
 	procCancel()
 }

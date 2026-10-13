@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/kolesnikovae/go-winjob"
 	"golang.org/x/sys/windows"
 )
@@ -291,3 +292,26 @@ func lastProbeFailure() error { return nil }
 
 // lastTrackFailure returns why containment could not be established, or nil.
 func lastTrackFailure() error { return nil }
+
+// RecoverGroups has nothing to recover on Windows: every managed tree runs in a
+// kill-on-close Job Object that ended with the daemon, and no process groups
+// are recorded. Any group passed in is reported unknown and nothing is
+// signalled.
+func RecoverGroups(groups []daemon.Group, _ daemon.Host, _ RecoveryMode, _ time.Time) []RecoveredGroup {
+	out := make([]RecoveredGroup, len(groups))
+	for i, g := range groups {
+		out[i] = RecoveredGroup{GroupResult: GroupResult{Name: g.Name, PGID: g.PGID, State: GroupUnavailable}, LeaderStart: g.LeaderStart, Outcome: OutcomeUnknown, Reason: "signal_unavailable"}
+	}
+	return out
+}
+
+// assessCrashedRun keeps the pre-record behaviour on Windows: a live daemon
+// refuses the start, and any other PID file is stale, because its managed
+// trees ended with the daemon's kill-on-close Job Objects.
+func assessCrashedRun(pidPath string) (stale bool, err error) {
+	if alive, pid := daemon.IsAliveFromPIDFile(pidPath); alive {
+		return false, alreadyRunningError(pid)
+	}
+	_, statErr := os.Stat(pidPath)
+	return statErr == nil, nil
+}

@@ -2,11 +2,13 @@ package session
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -204,4 +206,131 @@ func TestResolve_RejectsLeaseChangesAndUnknownReferences(t *testing.T) {
 	if _, err := plan.Resolve(cfg); err == nil {
 		t.Fatal("unknown endpoint reference accepted")
 	}
+}
+
+// TestResolve_ExpandsProbeCmd pins that a ready_when.cmd or health_when probe
+// receives the same endpoint references as the process's own cmd, and that an
+// unresolved one is refused rather than run literally.
+func TestResolve_ExpandsProbeCmd(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	cfg := &config.Config{Processes: map[string]config.Process{"api": {
+		Cmd:       "serve",
+		Ports:     map[string]int{"http": 0},
+		ReadyWhen: &config.ReadyWhen{Cmd: "check ${urls.api.http}/ready ${session.name}"},
+	}}}
+	plan, err := Acquire(cfg, filepath.Join(t.TempDir(), "proc-compose.yml"), "probe-cmd", "probe", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	port := plan.Project.Ports["api"]["http"]
+	if got, want := plan.Config.Processes["api"].ReadyWhen.Cmd, "check http://127.0.0.1:"+strconv.Itoa(port)+"/ready probe"; got != want {
+		t.Fatalf("probe cmd = %q, want %q", got, want)
+	}
+	if cfg.Processes["api"].ReadyWhen.Cmd != "check ${urls.api.http}/ready ${session.name}" {
+		t.Fatal("resolving mutated the source config's probe")
+	}
+	cfg.Processes["api"] = config.Process{Cmd: "serve", Ports: map[string]int{"http": 0}, ReadyWhen: &config.ReadyWhen{Cmd: "check ${ports.missing.http}"}}
+	if _, err := plan.Resolve(cfg); err == nil {
+		t.Fatal("unresolved probe cmd reference accepted")
+	}
+
+	// health_when gets the same expansion, on every probe kind.
+	cfg.Processes["api"] = config.Process{Cmd: "serve", Ports: map[string]int{"http": 0}, HealthWhen: &config.ReadyWhen{Cmd: "live ${urls.api.http} ${session.name}"}}
+	resolved, err := plan.Resolve(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := resolved.Processes["api"].HealthWhen.Cmd, "live http://127.0.0.1:"+strconv.Itoa(port)+" probe"; got != want {
+		t.Fatalf("health cmd = %q, want %q", got, want)
+	}
+	cfg.Processes["api"] = config.Process{Cmd: "serve", Ports: map[string]int{"http": 0}, HealthWhen: &config.ReadyWhen{HTTP: "${urls.missing.http}/live"}}
+	if _, err := plan.Resolve(cfg); err == nil {
+		t.Fatal("unresolved health_when reference accepted")
+	}
+}
+
+// TestResolve_ExpandsTeardownUnderFilter pins that a teardown process gets
+// the session's expansion and environment even when a filter started only part
+// of the stack: teardown runs for the whole stack.
+func TestResolve_ExpandsTeardownUnderFilter(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	cfg := &config.Config{Processes: map[string]config.Process{
+		"api":     {Cmd: "serve", Ports: map[string]int{"http": 0}},
+		"worker":  {Cmd: "work"},
+		"cleanup": {Cmd: "clean ${session.dir}", Mode: config.ProcessModeTeardown, Env: map[string]string{"API": "${urls.api.http}"}},
+	}}
+	plan, err := Acquire(cfg, filepath.Join(t.TempDir(), "proc-compose.yml"), "teardown-filter", "td", []string{"api"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	got := plan.Config.Processes["cleanup"]
+	if want := "clean " + plan.Project.Directory; got.Cmd != want {
+		t.Fatalf("teardown cmd = %q, want %q", got.Cmd, want)
+	}
+	if want := "http://127.0.0.1:" + strconv.Itoa(plan.Project.Ports["api"]["http"]); got.Env["API"] != want {
+		t.Fatalf("teardown env API = %q, want %q", got.Env["API"], want)
+	}
+	if got.Env["PROC_COMPOSE_SESSION"] != "td" || got.Env["PROC_COMPOSE_RUN_ID"] != plan.Project.RunID {
+		t.Fatalf("teardown env = %v, want the session variables", got.Env)
+	}
+	// The session metadata names them, so stop can allow for their budget.
+	if !slices.Equal(plan.Project.Teardown, []string{"cleanup"}) {
+		t.Fatalf("Project.Teardown = %v, want [cleanup]", plan.Project.Teardown)
+	}
+}
+
+// TestLeaseInstance_BusyWhileHeld pins the lease crash recovery runs under: it
+// is the same instance lease Acquire holds for a run's lifetime, it is refused
+// without blocking while any owner holds it, and releasing it frees it.
+func TestLeaseInstance_BusyWhileHeld(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	cfg := &config.Config{Processes: map[string]config.Process{"api": {Cmd: "serve"}}}
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	plan, err := Acquire(cfg, path, "held", "held", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	release, err := LeaseInstance("held")
+	if err == nil {
+		release()
+		plan.Close()
+		t.Fatal("LeaseInstance admitted a second owner while Acquire held the instance lease")
+	}
+	var lease *LeaseError
+	if !errors.As(err, &lease) || !lease.Instance() {
+		t.Fatalf("LeaseInstance error = %v, want an instance *LeaseError", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("LeaseInstance blocked for %s on a held lease", elapsed)
+	}
+	plan.Close()
+
+	release, err = LeaseInstance("held")
+	if err != nil {
+		t.Fatalf("LeaseInstance after the owner closed: %v", err)
+	}
+	if held, _ := InstanceHeld("held"); !held {
+		t.Fatal("InstanceHeld = false while LeaseInstance holds the lease")
+	}
+	if _, err := Acquire(cfg, path, "held", "held", nil); err == nil {
+		t.Fatal("Acquire admitted an owner while LeaseInstance held the instance lease")
+	}
+	release()
+	if held, _ := InstanceHeld("held"); held {
+		t.Fatal("instance lease still held after release")
+	}
+}
+
+// TestLeaseInstance_CreatesLeaseDir covers recovery on a host where no run ever
+// created the lease directory, such as after a reboot cleared the runtime dir.
+func TestLeaseInstance_CreatesLeaseDir(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "fresh"))
+	release, err := LeaseInstance("fresh")
+	if err != nil {
+		t.Fatalf("LeaseInstance without a lease dir: %v", err)
+	}
+	release()
 }

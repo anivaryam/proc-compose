@@ -121,7 +121,7 @@ func newResult(opts Options, started time.Time) *Result {
 		Endpoints:         map[string]Endpoint{},
 		Startup:           Startup{Status: StatusNotRun, Validation: StatusNotRun, ReadinessObservations: []ReadinessObservation{}, UnprobedProcesses: []string{}, Errors: []ErrorRecord{}},
 		Check:             Check{Status: StatusNotRun, Argv: []string{}},
-		Cleanup:           Cleanup{Status: StatusNotNeeded, SignalingAuthority: "none", UnresolvedProcesses: []UnresolvedProcess{}, Errors: []ErrorRecord{}},
+		Cleanup:           Cleanup{Status: StatusNotNeeded, SignalingAuthority: "none", UnresolvedProcesses: []UnresolvedProcess{}, Errors: []ErrorRecord{}, Teardown: []TeardownRecord{}},
 		Evidence:          Evidence{ExcerptStatus: "not_collected", Events: []EvidenceEvent{}},
 		Errors:            []ErrorRecord{},
 		Retention:         "no receipt created",
@@ -200,8 +200,8 @@ func Run(ctx context.Context, opts Options) *Result {
 		return result
 	}
 	for _, name := range opts.Selectors {
-		if _, ok := cfg.Processes[name]; !ok {
-			fmt.Fprintf(opts.Log, "verify: unknown process %q\n", name)
+		if err := config.CheckSelector(cfg, name); err != nil {
+			fmt.Fprintf(opts.Log, "verify: %v\n", err)
 			failPreAcquisition(result, CodeUsage, opts.now())
 			return result
 		}
@@ -255,6 +255,16 @@ func Run(ctx context.Context, opts Options) *Result {
 		default:
 			failPreAcquisition(result, CodeInvalidConfig, opts.now())
 		}
+		result.Endpoints = map[string]Endpoint{}
+		result.EndpointsNote = ptr("acquisition_incomplete")
+		return result
+	}
+	// verify runs no preflight, so it gates on a crashed run here, under the
+	// lease, before it would overwrite that run's PID file record.
+	if err := runner.ResolveCrashedRun(paths.PID(opts.Hash), paths.Socket(opts.Hash)); err != nil {
+		plan.Close()
+		fmt.Fprintf(opts.Log, "verify: %v\n", err)
+		failPreAcquisition(result, CodeSessionOccupied, opts.now())
 		result.Endpoints = map[string]Endpoint{}
 		result.EndpointsNote = ptr("acquisition_incomplete")
 		return result
@@ -407,7 +417,15 @@ func (a *attempt) startAndCheck(ctx context.Context) {
 		Project:               plan.Project,
 		ResolveConfig:         plan.Resolve,
 		CleanupHandoffTimeout: opts.CleanupTimeout - opts.sealReserve(),
-		AttemptID:             *res.AttemptID,
+		// Stack teardown gets what remains of the one cleanup budget minus the
+		// seal reserve, from whichever trigger started it: verify's cleanup,
+		// or the stack stopping on its own (a required process failing). A
+		// check teardown that already spent the budget leaves only sealing.
+		CleanupHandoffDeadline: func() time.Time { return a.beginCleanup().Add(-opts.sealReserve()) },
+		// Teardown spends the same cleanup budget and leaves the seal reserve.
+		TeardownDeadline: func() time.Time { return a.beginCleanup().Add(-opts.sealReserve()) },
+		AttemptID:        *res.AttemptID,
+		RecordPath:       pidPath,
 	}
 	if server != nil {
 		r.IPC = server
@@ -594,14 +612,17 @@ func probeKind(proc config.Process) *string {
 		return ptr("http")
 	case proc.ReadyWhen.TCP != "":
 		return ptr("tcp")
+	case proc.ReadyWhen.Cmd != "":
+		return ptr("cmd")
 	case proc.ReadyWhen.Log != "":
 		return ptr("log")
 	}
 	return nil
 }
 
-// monitorRequired records selected services that stop running or change
-// generation while the check runs; a zero check exit cannot hide them.
+// monitorRequired records selected services that stop running, change
+// generation, or become unhealthy (health_when) while the check runs; a zero
+// check exit cannot hide them.
 func (a *attempt) monitorRequired(baseline map[string]uint64, stop <-chan struct{}) map[string]bool {
 	failed := map[string]bool{}
 	ticker := time.NewTicker(50 * time.Millisecond)
@@ -611,7 +632,7 @@ func (a *attempt) monitorRequired(baseline map[string]uint64, stop <-chan struct
 			if st.Mode == config.ProcessModeTask {
 				continue
 			}
-			if st.State != "running" || st.Generation != baseline[st.Name] {
+			if st.State != "running" || st.Generation != baseline[st.Name] || st.Health == "unhealthy" {
 				failed[st.Name] = true
 			}
 		}
@@ -727,12 +748,8 @@ func (a *attempt) cleanup() {
 		res.Cleanup.FinishedAt = timestamp(a.opts.now())
 		return
 	}
-	// The handoff budget is read when Run observes cancellation; cancel() is the
-	// happens-before edge for this write.
-	// Stack teardown gets what remains of the one budget minus the seal
-	// reserve; a check teardown that already spent it leaves only sealing.
-	handoff := max(time.Until(deadline)-a.opts.sealReserve(), time.Millisecond)
-	a.runner.CleanupHandoffTimeout = handoff
+	// Run reads its handoff budget through CleanupHandoffDeadline when it
+	// observes this cancellation, or an earlier one of its own.
 	a.cancelRun()
 	returned := false
 	timer := time.NewTimer(time.Until(deadline))
@@ -746,6 +763,7 @@ func (a *attempt) cleanup() {
 		a.closeRuntime()
 	}
 	res.Cleanup.FinishedAt = timestamp(a.opts.now())
+	a.recordTeardown()
 	generation := generations(a.runner.Snapshot())
 	if !returned {
 		// Signalling authority was not proven sealed inside the budget.
@@ -779,6 +797,23 @@ func (a *attempt) cleanup() {
 	}
 	res.Cleanup.Errors = []ErrorRecord{{Code: CodeCleanupUnverified, Count: 1}}
 	a.errs.Add(CodeCleanupUnverified)
+}
+
+// recordTeardown copies the runner's teardown outcomes into the receipt and
+// fails the attempt with teardown_failed when any did not pass. When Run did
+// not return in time, only the outcomes recorded so far are present.
+func (a *attempt) recordTeardown() {
+	failed := false
+	for _, t := range a.runner.TeardownResults() {
+		a.result.Cleanup.Teardown = append(a.result.Cleanup.Teardown, TeardownRecord{
+			Name: t.Name, Status: t.Status, ExitCode: t.ExitCode,
+			StartedAt: timestamp(t.StartedAt), FinishedAt: timestamp(t.FinishedAt), Error: t.Error,
+		})
+		failed = failed || t.Status != runner.TeardownPassed
+	}
+	if failed {
+		a.errs.Add(CodeTeardownFailed)
+	}
 }
 
 // collectEvidence freezes the journal high-water mark for this run.

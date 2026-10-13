@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -153,6 +154,54 @@ func pidFromFile(t *testing.T, path string) int {
 	return pid
 }
 
+// recordedGroupFor pins verify's wiring of Runner.RecordPath: the attempt's
+// PID file must record a tracked process group for name. On Linux the recorded
+// pgid must be the group of the pid the service wrote to servicePIDFile. It
+// returns an error instead of failing because the afterStartup seam is not
+// guaranteed to run on the test goroutine. Windows records no groups.
+func recordedGroupFor(pidPath, name, servicePIDFile string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rec, err := daemon.ReadRecord(pidPath)
+		if err != nil {
+			return err
+		}
+		var tracked *daemon.Group
+		if rec.Groups != nil {
+			for i, g := range *rec.Groups {
+				if g.Name == name && g.PGID > 0 {
+					tracked = &(*rec.Groups)[i]
+				}
+			}
+		}
+		if tracked != nil {
+			if runtime.GOOS != "linux" {
+				return nil
+			}
+			data, err := os.ReadFile(servicePIDFile)
+			if err != nil {
+				return err
+			}
+			pid, _ := strconv.Atoi(string(data))
+			info, err := daemon.ProcStat(pid)
+			if err != nil {
+				return fmt.Errorf("ProcStat(%d): %w", pid, err)
+			}
+			if tracked.PGID != info.PGID || tracked.LeaderStart == 0 {
+				return fmt.Errorf("recorded %+v, want pgid %d with a leader start time", *tracked, info.PGID)
+			}
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("%s records no tracked group %q: %+v (groups %v)", pidPath, name, rec, rec.Groups)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func assertGone(t *testing.T, pid int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -169,9 +218,14 @@ func TestRun_HappyPathLiteralArgvEndpointsAndReceipt(t *testing.T) {
 	t.Setenv(helperEnv, "get")
 	literal := `two words "quoted" $HOME;|&`
 	opts := f.options(t, "happy", os.Args[0], "-test.run=^$", literal)
+	var recordErr error
+	opts.afterStartup = func(*runner.Runner) { recordErr = recordedGroupFor(paths.PID(opts.Hash), "api", f.pidFile) }
 	// The service is told its mode through config env; the check inherits the
 	// caller's environment, which carries the check mode.
 	result := Run(context.Background(), opts)
+	if recordErr != nil {
+		t.Fatalf("process-group record: %v", recordErr)
+	}
 	if result.Status != StatusPassed || result.ExitCode != 0 {
 		t.Fatalf("result = %s/%d errors=%v stderr=%q", result.Status, result.ExitCode, result.Errors, result.Check.Stderr)
 	}
@@ -202,6 +256,21 @@ func TestRun_HappyPathLiteralArgvEndpointsAndReceipt(t *testing.T) {
 	held, err := session.InstanceHeld(opts.Hash)
 	if err != nil || held {
 		t.Fatalf("instance lease after attempt held=%t err=%v", held, err)
+	}
+}
+
+// TestProbeKind_NamesEveryReadinessKind keeps the receipt's probe field in step
+// with the probe kinds config accepts: a cmd probe is a probe, not unprobed.
+func TestProbeKind_NamesEveryReadinessKind(t *testing.T) {
+	for want, rw := range map[string]*config.ReadyWhen{
+		"http": {HTTP: "http://localhost:1/"},
+		"tcp":  {TCP: "localhost:1"},
+		"cmd":  {Cmd: "check"},
+		"log":  {Log: "ready"},
+	} {
+		if got := probeKind(config.Process{Cmd: "serve", ReadyWhen: rw}); got == nil || *got != want {
+			t.Errorf("probeKind(%+v) = %v, want %q", rw, got, want)
+		}
 	}
 }
 
@@ -357,6 +426,27 @@ func TestRun_RequiredServiceFailureCannotBeMaskedByCheckSuccess(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("errors = %v", result.Errors)
+	}
+}
+
+// TestRun_UnhealthyRequiredServiceFailsCheck pins that a required service
+// that becomes unhealthy during the check fails the attempt as
+// required_failed even though it keeps running and the check passes.
+func TestRun_UnhealthyRequiredServiceFailsCheck(t *testing.T) {
+	f := newFixture(t, serviceConfig+`    health_when:
+      tcp: 127.0.0.1:1
+    health_interval: 1
+`)
+	withHelper(t, "sleep")
+	result := Run(context.Background(), f.options(t, "", checkArgv("sleep", "6s")...))
+	if result.Check.Status != StatusPassed || result.Status != StatusFailed {
+		t.Fatalf("check %s overall %s errors=%v", result.Check.Status, result.Status, result.Errors)
+	}
+	if len(result.Errors) == 0 || result.Errors[0].Code != CodeRequiredFailed {
+		t.Fatalf("errors = %v, want %s", result.Errors, CodeRequiredFailed)
+	}
+	if result.Cleanup.Status != StatusPassed {
+		t.Fatalf("cleanup = %+v", result.Cleanup)
 	}
 }
 
@@ -898,6 +988,105 @@ func TestRun_BlockedCheckReapSpendsOneCleanupBudget(t *testing.T) {
 	releaseOnce()
 	if pid := int(checkPID.Load()); pid != 0 {
 		assertGone(t, pid)
+	}
+	assertGone(t, pidFromFile(t, f.pidFile))
+}
+
+// teardownConfig adds a teardown process to serviceConfig, run as the helper
+// in mode {{TEARDOWN_MODE}} with argument {{TEARDOWN_ARG}}.
+const teardownConfig = serviceConfig + `  cleanup:
+    mode: teardown
+    cmd: {{BIN}} {{TEARDOWN_ARG}}
+    shutdown_timeout: 1
+    env:
+      ` + helperEnv + `: {{TEARDOWN_MODE}}
+`
+
+// TestRun_TeardownRecordedInReceipt pins the receipt's teardown section: it is
+// always present, records each teardown process's outcome, and a failed
+// teardown fails the attempt with teardown_failed while cleanup.status and
+// termination_verified keep describing termination only.
+func TestRun_TeardownRecordedInReceipt(t *testing.T) {
+	for _, tc := range []struct {
+		name, code string
+		wantStatus string
+	}{
+		{"passed", "0", runner.TeardownPassed},
+		{"failed", "3", runner.TeardownFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.NewReplacer("{{TEARDOWN_MODE}}", "exit", "{{TEARDOWN_ARG}}", tc.code).Replace(teardownConfig)
+			f := newFixture(t, body)
+			withHelper(t, "exit")
+			result := Run(context.Background(), f.options(t, "", checkArgv("exit", "0")...))
+			if result.Cleanup.Status != StatusPassed || result.Cleanup.TerminationVerified == nil || !*result.Cleanup.TerminationVerified {
+				t.Fatalf("cleanup = %+v, want termination verified", result.Cleanup)
+			}
+			got := result.Cleanup.Teardown
+			if len(got) != 1 || got[0].Name != "cleanup" || got[0].Status != tc.wantStatus || got[0].ExitCode == nil || strconv.Itoa(*got[0].ExitCode) != tc.code {
+				t.Fatalf("cleanup.teardown = %+v, want cleanup %s with exit %s", got, tc.wantStatus, tc.code)
+			}
+			hasCode := false
+			for _, e := range result.Errors {
+				hasCode = hasCode || e.Code == CodeTeardownFailed
+			}
+			if tc.wantStatus == runner.TeardownPassed {
+				if result.Status != StatusPassed || hasCode || got[0].Error != "" {
+					t.Fatalf("result = %s errors=%v teardown=%+v, want passed", result.Status, result.Errors, got)
+				}
+			} else if result.Status != StatusFailed || result.ExitCode != ExitFailed || !hasCode || !strings.Contains(got[0].Error, "exit 3") {
+				t.Fatalf("result = %s/%d errors=%v teardown=%+v, want failed with %s", result.Status, result.ExitCode, result.Errors, got, CodeTeardownFailed)
+			}
+			receipt, err := ReadReceipt(*result.ReceiptPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(receipt.Cleanup.Teardown) != 1 || receipt.Cleanup.Teardown[0].Status != tc.wantStatus {
+				t.Fatalf("receipt teardown = %+v", receipt.Cleanup.Teardown)
+			}
+		})
+	}
+
+	// Without teardown processes the section is an empty list, never absent.
+	f := newFixture(t, serviceConfig)
+	withHelper(t, "exit")
+	result := Run(context.Background(), f.options(t, "", checkArgv("exit", "0")...))
+	data, err := json.Marshal(result.Cleanup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"teardown":[]`) {
+		t.Fatalf("cleanup = %s, want an empty teardown list", data)
+	}
+}
+
+// TestRun_TeardownFitsCleanupBudget: teardown spends the attempt's one cleanup
+// budget. A hung teardown is cut off before the seal reserve, so verify still
+// returns at the cleanup deadline with termination verified and the teardown
+// reported as timed out.
+func TestRun_TeardownFitsCleanupBudget(t *testing.T) {
+	body := strings.NewReplacer("{{TEARDOWN_MODE}}", "sleep", "{{TEARDOWN_ARG}}", "60s").Replace(teardownConfig)
+	f := newFixture(t, body)
+	withHelper(t, "exit")
+	opts := f.options(t, "", checkArgv("exit", "0")...)
+	opts.cleanupBudget = 8 * time.Second
+	result := Run(context.Background(), opts)
+	returned := time.Now()
+	deadline, err := time.Parse(time.RFC3339Nano, *result.Cleanup.DeadlineAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if over := returned.Sub(deadline); over > time.Second {
+		t.Fatalf("verify returned %s after the cleanup deadline", over)
+	}
+	if result.Cleanup.Status != StatusPassed {
+		t.Fatalf("cleanup = %+v, want the hung teardown terminated and sealed", result.Cleanup)
+	}
+	if got := result.Cleanup.Teardown; len(got) != 1 || got[0].Status != runner.TeardownTimedOut {
+		t.Fatalf("cleanup.teardown = %+v, want cleanup timed_out", got)
+	}
+	if result.Status != StatusFailed {
+		t.Fatalf("result = %s errors=%v, want failed", result.Status, result.Errors)
 	}
 	assertGone(t, pidFromFile(t, f.pidFile))
 }

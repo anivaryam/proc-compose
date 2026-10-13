@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/anivaryam/proc-compose/internal/daemon"
 )
 
 // RetainedTerminalReceipts is how many terminal receipts a session keeps.
@@ -67,23 +69,7 @@ func WriteReceipt(path string, result *Result) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".receipt-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return daemon.WriteFileAtomic(path, append(data, '\n'), 0600)
 }
 
 // ReadReceipt loads one receipt.

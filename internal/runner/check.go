@@ -121,19 +121,10 @@ func (r *Runner) RunCheck(ctx context.Context, spec CheckSpec) CheckResult {
 	r.checks[spec.Name] = st
 	r.checksMu.Unlock()
 
-	stdout := &cappedBuffer{limit: spec.MaxOutputBytes}
-	stderr := &cappedBuffer{limit: spec.MaxOutputBytes}
 	p := procInfo{
 		name: spec.Name,
 		proc: config.Process{Dir: spec.Dir, Env: spec.Env, Mode: config.ProcessModeTask},
 		argv: append([]string(nil), spec.Argv...),
-		capture: func(stream, line string) {
-			if stream == "stderr" {
-				stderr.writeLine(line)
-			} else {
-				stdout.writeLine(line)
-			}
-		},
 	}
 
 	handoff := make(chan struct{})
@@ -161,13 +152,37 @@ func (r *Runner) RunCheck(ctx context.Context, spec CheckSpec) CheckResult {
 		}
 	}()
 
-	result := CheckResult{Generation: 1}
+	result := r.runOwned(ctx, p, st, handoff, spec.MaxOutputBytes)
+	close(execDone)
+	<-handoffDone
+	return result
+}
+
+// runOwned executes p once inside a runner-owned process group, under ctx and
+// bounded by handoff, and reports what was observed. Output is captured up to
+// maxOutput bytes per stream. st is the execution's own state, outside the
+// managed store; its final state is broadcast unless p is quiet.
+//
+// It is the core shared by RunCheck and ready_when.cmd probes. The caller owns
+// admission into the run and how handoff is closed.
+func (r *Runner) runOwned(ctx context.Context, p procInfo, st *procState, handoff <-chan struct{}, maxOutput int) CheckResult {
+	stdout := &cappedBuffer{limit: maxOutput}
+	stderr := &cappedBuffer{limit: maxOutput}
+	p.capture = func(stream, line string) {
+		if stream == "stderr" {
+			stderr.writeLine(line)
+		} else {
+			stdout.writeLine(line)
+		}
+	}
+
+	st.mu.Lock()
+	result := CheckResult{Generation: st.generation}
+	st.mu.Unlock()
 	started := time.Now()
 	var startedOnce sync.Once
 	onStart := func() { startedOnce.Do(func() { result.Started = true }) }
 	err := r.exec(ctx, p, r.maxName, st, onStart, nil, handoff)
-	close(execDone)
-	<-handoffDone
 	result.FinishedAt = time.Now()
 
 	st.mu.Lock()

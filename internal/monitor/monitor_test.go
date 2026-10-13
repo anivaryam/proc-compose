@@ -311,6 +311,24 @@ func TestReadinessDisplayShowsDoneForCompletedReadyTask(t *testing.T) {
 	}
 }
 
+// TestReadinessDisplayAndRankShowUnhealthy pins how a running service failing
+// its health_when appears: "unhealthy" in the readiness column, sorted after
+// restarting rows and before every merely running one.
+func TestReadinessDisplayAndRankShowUnhealthy(t *testing.T) {
+	unhealthy := &ipc.ProcState{Name: "worker", State: "running", Ready: true, Health: "unhealthy"}
+	if got := readinessDisplay(unhealthy); got != "unhealthy" {
+		t.Errorf("readinessDisplay(unhealthy) = %q, want unhealthy", got)
+	}
+	if got := readinessDisplay(&ipc.ProcState{State: "running", Ready: true, Health: "healthy"}); got != "ready" {
+		t.Errorf("readinessDisplay(healthy) = %q, want ready", got)
+	}
+	restarting := healthRank(&ipc.ProcState{State: "restarting"})
+	waiting := healthRank(&ipc.ProcState{State: "running"})
+	if rank := healthRank(unhealthy); rank <= restarting || rank >= waiting {
+		t.Errorf("healthRank(unhealthy) = %d, want between restarting (%d) and waiting (%d)", rank, restarting, waiting)
+	}
+}
+
 func TestProcColorIdx_Stable(t *testing.T) {
 	m := newTestMonitor()
 	m.procs["x"] = &ipc.ProcState{Name: "x", ColorIndex: 3}

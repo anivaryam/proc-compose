@@ -5,6 +5,7 @@ package main
 import (
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"testing"
 	"time"
@@ -37,3 +38,7 @@ func testEndpointForTest(t *testing.T) string {
 	return `\\.\pipe\pc-test-` + strconv.FormatInt(time.Now().UnixNano(), 36) +
 		"-" + strconv.Itoa(os.Getpid())
 }
+
+// startInOwnProcessGroup reports false: Windows contains managed trees in Job
+// Objects and records no process groups.
+func startInOwnProcessGroup(*exec.Cmd) (bool, error) { return false, nil }

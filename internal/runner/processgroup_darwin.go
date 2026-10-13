@@ -2,7 +2,11 @@
 
 package runner
 
-import "golang.org/x/sys/unix"
+import (
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
 
 // szomb is Darwin's process state for a process that has terminated and is
 // awaiting collection by its parent.
@@ -36,12 +40,20 @@ const szomb = 5
 // the table as a zombie; treating those as live would turn a successful shutdown
 // into a reported failure.
 func groupMembers(pgid int) (int, bool) {
+	pids, ok := groupMemberPIDs(pgid)
+	return len(pids), ok
+}
+
+// groupMemberPIDs lists the live members of a process group from the kernel
+// process table; groupMembers counts over it. See groupMembers for why
+// membership is read from Eproc.Pgid and why SZOMB entries are not live.
+func groupMemberPIDs(pgid int) ([]int, bool) {
 	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
 	if err != nil {
-		return 0, false
+		return nil, false
 	}
 	want := int32(pgid)
-	live := 0
+	var live []int
 	for i := range procs {
 		if procs[i].Eproc.Pgid != want {
 			continue
@@ -49,7 +61,41 @@ func groupMembers(pgid int) (int, bool) {
 		if procs[i].Proc.P_stat == szomb {
 			continue
 		}
-		live++
+		live = append(live, int(procs[i].Proc.P_pid))
 	}
 	return live, true
 }
+
+// probeEPERMProvesMember is false: macOS answers kill(-pgid, 0) with EPERM
+// for a group the kernel does not know; see unixProcessGroup.State.
+const probeEPERMProvesMember = false
+
+// recoveryMemberPIDs is groupMemberPIDs: macOS keeps one process state for
+// the whole process, so a running process is never reported as SZOMB.
+func recoveryMemberPIDs(pgid int) ([]int, bool) { return groupMemberPIDs(pgid) }
+
+// recoveryGroupHolders counts every process in pgid, SZOMB entries included.
+func recoveryGroupHolders(pgid int) (int, bool) {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return 0, false
+	}
+	n := 0
+	for i := range procs {
+		if procs[i].Eproc.Pgid == int32(pgid) {
+			n++
+		}
+	}
+	return n, true
+}
+
+// procfsIsOwn is true: macOS reads the process table through sysctl, which has
+// no pid namespaces to disagree with.
+func procfsIsOwn() bool { return true }
+
+// openPidfd is unavailable: macOS has no pidfd, so crash recovery never signals
+// here and reports a live group as unknown.
+func openPidfd(int) (int, error) { return -1, errSignalUnavailable }
+
+// sendPidfd is unavailable on macOS; see openPidfd.
+func sendPidfd(int, syscall.Signal) error { return errSignalUnavailable }

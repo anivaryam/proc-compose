@@ -12,6 +12,12 @@ import (
 // Includes worst-case JSON escaping and the legacy IPC line alias.
 const MaxEventBytes = 16 << 20
 
+// TeardownPrefix starts every line of a shutdown verdict that reports a
+// teardown process rather than a managed process that could not be stopped.
+// A verdict whose every line carries it means termination was verified and
+// only teardown failed.
+const TeardownPrefix = "teardown: "
+
 // Event types sent over the Unix socket (newline-delimited JSON).
 const (
 	TypeSnapshot = "snapshot"
@@ -42,6 +48,12 @@ type ProcState struct {
 	LastError  string    `json:"last_error,omitempty"`
 	ExitCode   *int      `json:"exit_code,omitempty"`
 	DependsOn  []string  `json:"depends_on,omitempty"`
+	// Health is the health_when verdict for the current incarnation: unknown,
+	// healthy or unhealthy; empty when the process has no health_when. It is
+	// unknown whenever the process is not running. It is separate from Ready,
+	// which latches once per incarnation.
+	Health      string `json:"health,omitempty"`
+	HealthError string `json:"health_error,omitempty"` // the last failed health check, while it is failing
 }
 
 // LogEntry is a single log line emitted by a managed process.
@@ -119,6 +131,9 @@ type Project struct {
 	LogPath     string                       `json:"log_path,omitempty"`
 	JournalPath string                       `json:"journal_path"`
 	Owner       *Owner                       `json:"owner,omitempty"`
+	// Teardown names the run's teardown processes, so stop can allow for
+	// their budget and report that they did not run after a crash.
+	Teardown []string `json:"teardown,omitempty"`
 }
 
 // Owner describes who created a session, for human/agent handoff. It is

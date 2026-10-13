@@ -86,7 +86,19 @@ An event contains `schema_version`, `id`, `run_id`, `sequence`, `session`,
 `message`. State events include readiness, dependency names, last errors, and
 exit status. Application output is data (`kind: output`); supervisor codes such
 as `readiness.failed`, `process.failed`, and `shutdown.verified` are generated
-by proc-compose. Explicit application JSON `level` or `severity` strings are
+by proc-compose. Health checks (`health_when`) produce `kind: probe` events:
+`health.check_failed` (debug, one per failed check, with its detail),
+`health.unhealthy` (error, once when three checks in a row have failed),
+`health.recovered` (info, the first pass after that), and
+`health.check_skipped` (warn, when proc-compose itself cannot launch a `cmd`
+check, for example because the crash-recovery record cannot be written; such
+checks count neither way). Every health change also
+writes a `process.state` event carrying `health`. A health restart is reported
+with the usual `process.failed` and `process.restarting` events. Teardown
+processes (`mode: teardown`) produce `teardown.started` (info),
+`teardown.completed` (info), `teardown.failed` (error, with the reason), and
+`teardown.skipped` (error, from `proc-compose`, when termination was not
+verified and no teardown ran). Explicit application JSON `level` or `severity` strings are
 normalized; ordinary stderr preserves its stream without assuming it is an error.
 
 JSON query pages contain `events`, `next_cursor`, `has_more`, `gap`,

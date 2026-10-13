@@ -19,24 +19,45 @@ import (
 )
 
 // ReadyWhen defines a probe that proc-compose uses to detect when a process is
-// accepting traffic. Exactly one of HTTP, TCP, or Log must be set.
+// accepting traffic. Exactly one of HTTP, TCP, Cmd, or Log must be set.
 type ReadyWhen struct {
 	HTTP string `yaml:"http,omitempty"` // URL to GET; ready when response is 2xx
 	TCP  string `yaml:"tcp,omitempty"`  // host:port; ready when TCP connect succeeds
+	Cmd  string `yaml:"cmd,omitempty"`  // shell command run in the process's dir and env; ready when it exits 0
 	Log  string `yaml:"log,omitempty"`  // Go regex; ready when matched in stdout
 }
 
 const (
 	ProcessModeService = "service"
 	ProcessModeTask    = "task"
+	// ProcessModeTeardown runs once after the stack has stopped and every
+	// managed process is verified terminated, to release what the stack
+	// held. It never starts with the stack and nothing can depend on it.
+	ProcessModeTeardown = "teardown"
 )
+
+// MaxTeardownShutdownTimeout caps a teardown process's shutdown_timeout so
+// its termination grace always leaves the command most of the fixed teardown
+// budget.
+const MaxTeardownShutdownTimeout = 5
+
+// Health actions: what proc-compose does when a running service fails its
+// health_when probe healthThreshold times in a row.
+const (
+	HealthActionReport  = "report"  // mark the service unhealthy and keep it running
+	HealthActionRestart = "restart" // cancel the incarnation through the restart policy
+)
+
+// DefaultHealthInterval is the health_when period in seconds when
+// health_interval is unset.
+const DefaultHealthInterval = 10
 
 type Process struct {
 	Cmd             string            `yaml:"cmd"`
 	Dir             string            `yaml:"dir,omitempty"`
 	EnvFile         string            `yaml:"env_file,omitempty"` // path to .env file; merged before env block
 	Env             map[string]string `yaml:"env,omitempty"`
-	Mode            string            `yaml:"mode,omitempty"`             // "service" (default), "task"
+	Mode            string            `yaml:"mode,omitempty"`             // "service" (default), "task", "teardown"
 	Restart         string            `yaml:"restart,omitempty"`          // "never" (default), "on-failure", "always"
 	MaxRestarts     int               `yaml:"max_restarts,omitempty"`     // 0 = unlimited; only applies when restart != "never"
 	ShutdownTimeout int               `yaml:"shutdown_timeout,omitempty"` // seconds before SIGKILL; 0 = platform default (5s on Unix)
@@ -44,6 +65,9 @@ type Process struct {
 	ReadyTimeout    int               `yaml:"ready_timeout,omitempty"`    // seconds to wait for readiness before failing; 0 = default (60s); -1 = no limit
 	DependsOn       []string          `yaml:"depends_on,omitempty"`       // wait for these processes to be ready before starting
 	Ports           map[string]int    `yaml:"ports,omitempty"`            // named preferred ports; 0 selects an ephemeral port
+	HealthWhen      *ReadyWhen        `yaml:"health_when,omitempty"`      // ongoing probe after readiness: http, tcp or cmd (no log)
+	HealthInterval  int               `yaml:"health_interval,omitempty"`  // seconds between health checks; 0 = default (10); requires health_when
+	HealthAction    string            `yaml:"health_action,omitempty"`    // "report" (default) or "restart"; requires health_when
 }
 
 func (p Process) EffectiveMode() string {
@@ -51,6 +75,22 @@ func (p Process) EffectiveMode() string {
 		return ProcessModeService
 	}
 	return p.Mode
+}
+
+// EffectiveHealthInterval is the health_when period in seconds.
+func (p Process) EffectiveHealthInterval() int {
+	if p.HealthInterval <= 0 {
+		return DefaultHealthInterval
+	}
+	return p.HealthInterval
+}
+
+// EffectiveHealthAction is the configured health_action or its default.
+func (p Process) EffectiveHealthAction() string {
+	if p.HealthAction == "" {
+		return HealthActionReport
+	}
+	return p.HealthAction
 }
 
 type Merge struct {
@@ -178,7 +218,12 @@ func Load(path string) (*Config, error) {
 			return nil, invalid(CodeInvalidRestart, at("restart"), nil, "process %q has invalid restart policy %q (use never, on-failure, or always)", name, proc.Restart)
 		}
 		if proc.Mode != "" && !slices.Contains(ProcessModes, proc.Mode) {
-			return nil, invalid(CodeInvalidMode, at("mode"), nil, "process %q: invalid mode %q (use service or task)", name, proc.Mode)
+			return nil, invalid(CodeInvalidMode, at("mode"), nil, "process %q: invalid mode %q (use service, task, or teardown)", name, proc.Mode)
+		}
+		if proc.Mode == ProcessModeTeardown {
+			if err := validateTeardown(name, at, proc); err != nil {
+				return nil, err
+			}
 		}
 		if proc.Mode == ProcessModeTask {
 			if proc.ReadyWhen != nil {
@@ -193,6 +238,15 @@ func Load(path string) (*Config, error) {
 			if proc.MaxRestarts > 0 {
 				return nil, invalid(CodeTaskIncompatible, at("max_restarts"), nil, "process %q: mode: task cannot use max_restarts", name)
 			}
+			if proc.HealthWhen != nil {
+				return nil, invalid(CodeTaskIncompatible, at("health_when"), nil, "process %q: mode: task cannot use health_when", name)
+			}
+			if proc.HealthInterval != 0 {
+				return nil, invalid(CodeTaskIncompatible, at("health_interval"), nil, "process %q: mode: task cannot use health_interval", name)
+			}
+			if proc.HealthAction != "" {
+				return nil, invalid(CodeTaskIncompatible, at("health_action"), nil, "process %q: mode: task cannot use health_action", name)
+			}
 		}
 		if proc.MaxRestarts < 0 {
 			return nil, invalid(CodeInvalidValue, at("max_restarts"), nil, "process %q: max_restarts must be >= 0", name)
@@ -203,25 +257,13 @@ func Load(path string) (*Config, error) {
 		if proc.ShutdownTimeout < 0 {
 			return nil, invalid(CodeInvalidValue, at("shutdown_timeout"), nil, "process %q: shutdown_timeout must be >= 0", name)
 		}
-		if rw := proc.ReadyWhen; rw != nil {
-			n := 0
-			if rw.HTTP != "" {
-				n++
+		if proc.ReadyWhen != nil {
+			if err := validateProbe(name, at("ready_when"), proc.ReadyWhen, true); err != nil {
+				return nil, err
 			}
-			if rw.TCP != "" {
-				n++
-			}
-			if rw.Log != "" {
-				n++
-			}
-			if n != 1 {
-				return nil, invalid(CodeInvalidReadyWhen, at("ready_when"), nil, "process %q: ready_when must specify exactly one of http, tcp, or log", name)
-			}
-			if rw.Log != "" {
-				if _, err := regexp.Compile(rw.Log); err != nil {
-					return nil, invalid(CodeInvalidReadyWhen, at("ready_when", "log"), err, "process %q: ready_when.log is not a valid regex: %w", name, err)
-				}
-			}
+		}
+		if err := validateHealth(name, at, proc); err != nil {
+			return nil, err
 		}
 		if proc.EnvFile != "" {
 			envFilePath := proc.EnvFile
@@ -253,8 +295,12 @@ func Load(path string) (*Config, error) {
 			if dep == name {
 				return nil, invalid(CodeSelfDependency, []any{"processes", name, "depends_on", i}, nil, "process %q cannot depend on itself", name)
 			}
-			if _, ok := cfg.Processes[dep]; !ok {
+			depProc, ok := cfg.Processes[dep]
+			if !ok {
 				return nil, invalid(CodeUnknownDependency, []any{"processes", name, "depends_on", i}, nil, "process %q depends_on unknown process %q", name, dep)
+			}
+			if depProc.Mode == ProcessModeTeardown {
+				return nil, invalid(CodeTeardownDependency, []any{"processes", name, "depends_on", i}, nil, "process %q depends_on teardown process %q, which runs only after the stack stops", name, dep)
 			}
 		}
 	}
@@ -273,6 +319,97 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// validateTeardown refuses every field a teardown process cannot use: it
+// runs once, after the stack stopped, so it has no readiness, restarts,
+// health checks, ports or dependencies. Its shutdown_timeout is capped so the
+// command keeps most of the teardown budget.
+func validateTeardown(name string, at func(...any) []any, proc Process) error {
+	refuse := func(field string) error {
+		return invalid(CodeTaskIncompatible, at(field), nil, "process %q: mode: teardown cannot use %s", name, field)
+	}
+	switch {
+	case proc.ReadyWhen != nil:
+		return refuse("ready_when")
+	case proc.ReadyTimeout != 0:
+		return refuse("ready_timeout")
+	case proc.Restart != "never":
+		return invalid(CodeTaskIncompatible, at("restart"), nil, "process %q: mode: teardown cannot use restart: %s (only restart: never is allowed)", name, proc.Restart)
+	case proc.MaxRestarts > 0:
+		return refuse("max_restarts")
+	case proc.HealthWhen != nil:
+		return refuse("health_when")
+	case proc.HealthInterval != 0:
+		return refuse("health_interval")
+	case proc.HealthAction != "":
+		return refuse("health_action")
+	case len(proc.Ports) > 0:
+		return refuse("ports")
+	case len(proc.DependsOn) > 0:
+		return refuse("depends_on")
+	case proc.ShutdownTimeout > MaxTeardownShutdownTimeout:
+		return invalid(CodeInvalidValue, at("shutdown_timeout"), nil, "process %q: mode: teardown allows shutdown_timeout up to %d", name, MaxTeardownShutdownTimeout)
+	}
+	return nil
+}
+
+// validateProbe checks one probe block at path (processes.<name>.<field>):
+// exactly one kind is set, and a log probe is a valid regex. allowLog is false
+// for health_when: a log line matches once, so it cannot be re-checked.
+func validateProbe(name string, path []any, rw *ReadyWhen, allowLog bool) error {
+	field := FormatPath(path[2:])
+	n := 0
+	for _, kind := range []string{rw.HTTP, rw.TCP, rw.Cmd, rw.Log} {
+		if kind != "" {
+			n++
+		}
+	}
+	if !allowLog {
+		if n == 1 && rw.Log != "" {
+			return invalid(CodeInvalidReadyWhen, append(slices.Clone(path), "log"), nil, "process %q: %s cannot use log (use http, tcp, or cmd)", name, field)
+		}
+		if n != 1 {
+			return invalid(CodeInvalidReadyWhen, path, nil, "process %q: %s must specify exactly one of http, tcp, or cmd", name, field)
+		}
+		return nil
+	}
+	if n != 1 {
+		return invalid(CodeInvalidReadyWhen, path, nil, "process %q: %s must specify exactly one of http, tcp, cmd, or log", name, field)
+	}
+	if rw.Log != "" {
+		if _, err := regexp.Compile(rw.Log); err != nil {
+			return invalid(CodeInvalidReadyWhen, append(slices.Clone(path), "log"), err, "process %q: %s.log is not a valid regex: %w", name, field, err)
+		}
+	}
+	return nil
+}
+
+// validateHealth checks the health_* fields of a service. proc.Restart must
+// already carry its default. Task processes are refused earlier.
+func validateHealth(name string, at func(...any) []any, proc Process) error {
+	if proc.HealthWhen == nil {
+		if proc.HealthInterval != 0 {
+			return invalid(CodeInvalidValue, at("health_interval"), nil, "process %q: health_interval requires health_when", name)
+		}
+		if proc.HealthAction != "" {
+			return invalid(CodeInvalidValue, at("health_action"), nil, "process %q: health_action requires health_when", name)
+		}
+		return nil
+	}
+	if err := validateProbe(name, at("health_when"), proc.HealthWhen, false); err != nil {
+		return err
+	}
+	if proc.HealthInterval < 0 {
+		return invalid(CodeInvalidValue, at("health_interval"), nil, "process %q: health_interval must be >= 0 (0 = default %d)", name, DefaultHealthInterval)
+	}
+	if proc.HealthAction != "" && !slices.Contains(HealthActions, proc.HealthAction) {
+		return invalid(CodeInvalidValue, at("health_action"), nil, "process %q: invalid health_action %q (use report or restart)", name, proc.HealthAction)
+	}
+	if proc.HealthAction == HealthActionRestart && proc.Restart == "never" {
+		return invalid(CodeInvalidValue, at("health_action"), nil, "process %q: health_action: restart needs restart: on-failure or always", name)
+	}
+	return nil
+}
+
 func normalizeProcessDirs(processes map[string]Process, configDir string) {
 	for name, proc := range processes {
 		if proc.Dir == "" || strings.Contains(proc.Dir, "${session.") || strings.Contains(proc.Dir, "${config.") {
@@ -288,7 +425,8 @@ func normalizeProcessDirs(processes map[string]Process, configDir string) {
 }
 
 // SelectedNames is the single dependency-closure used by planning, startup,
-// readiness waiting, and dry-run output.
+// readiness waiting, and dry-run output. Teardown processes are never
+// selected; TeardownNames lists them.
 func SelectedNames(cfg *Config, filter []string) []string {
 	selected := make(map[string]bool)
 	var include func(string)
@@ -297,7 +435,7 @@ func SelectedNames(cfg *Config, filter []string) []string {
 			return
 		}
 		proc, exists := cfg.Processes[name]
-		if !exists {
+		if !exists || proc.Mode == ProcessModeTeardown {
 			return
 		}
 		selected[name] = true
@@ -320,6 +458,32 @@ func SelectedNames(cfg *Config, filter []string) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// TeardownNames lists the teardown processes in the order they run: by name.
+// They run for the whole stack, whatever filter started it.
+func TeardownNames(cfg *Config) []string {
+	var names []string
+	for name, proc := range cfg.Processes {
+		if proc.Mode == ProcessModeTeardown {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// CheckSelector reports whether name can be selected to start: it must be a
+// configured process and not a teardown process.
+func CheckSelector(cfg *Config, name string) error {
+	proc, ok := cfg.Processes[name]
+	switch {
+	case !ok:
+		return fmt.Errorf("unknown process %q", name)
+	case proc.Mode == ProcessModeTeardown:
+		return fmt.Errorf("process %q is a teardown process; it runs only after the stack stops and cannot be selected", name)
+	}
+	return nil
 }
 
 // detectCycles checks for circular dependencies using DFS with three-color marking.

@@ -297,7 +297,7 @@ func (m *monitor) rebuildOrder() {
 
 func healthRank(st *ipc.ProcState) int {
 	if st == nil {
-		return 5
+		return 6
 	}
 	switch st.State {
 	case "failed":
@@ -305,14 +305,18 @@ func healthRank(st *ipc.ProcState) int {
 	case "restarting":
 		return 1
 	case "running":
-		if st.Ready {
+		switch {
+		case st.Health == "unhealthy":
+			return 2
+		case st.Ready:
+			return 4
+		default:
 			return 3
 		}
-		return 2
 	case "completed":
-		return 4
-	default:
 		return 5
+	default:
+		return 6
 	}
 }
 
@@ -557,7 +561,7 @@ func (m *monitor) renderFrame() []byte {
 	}
 
 	// ── Process table header ──────────────────────────────────────────────────
-	writeBorderedRow(row, fmt.Sprintf("%s  %s  %-13s  %-8s  %-6s  %-8s  %-8s  %s%s",
+	writeBorderedRow(row, fmt.Sprintf("%s  %s  %-13s  %-8s  %-6s  %-8s  %-9s  %s%s",
 		ansiDim,
 		padRight("PROCESS", m.maxProcNameLen()), "STATUS", "RESTARTS", "CPU%", "MEM", "READY", "UPTIME", ansiReset))
 	row++
@@ -586,7 +590,7 @@ func (m *monitor) renderFrame() []byte {
 		memStr := formatMemory(st.MemoryMB)
 		readyStr := readinessDisplay(st)
 
-		writeBorderedRow(row, fmt.Sprintf("%s%s%s%s%s  %s%s%-11s%s  %-8s  %-6s  %-8s  %-8s  %s%s",
+		writeBorderedRow(row, fmt.Sprintf("%s%s%s%s%s  %s%s%-11s%s  %-8s  %-6s  %-8s  %-9s  %s%s",
 			cursor, prefix,
 			ansiBold+c, padRight(name, m.maxProcNameLen()), ansiReset,
 			stateColor, stateSym, st.State, ansiReset,
@@ -927,6 +931,9 @@ func readinessDisplay(st *ipc.ProcState) string {
 	}
 	if st.State != "running" {
 		return "-"
+	}
+	if st.Health == "unhealthy" {
+		return "unhealthy"
 	}
 	if st.Ready {
 		return "ready"

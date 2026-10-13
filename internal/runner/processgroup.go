@@ -4,10 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anivaryam/proc-compose/internal/daemon"
 )
 
 // GroupState reports what is known about a managed command's process tree.
@@ -279,4 +283,145 @@ func (r *singleReap) recv() error {
 	}
 	<-r.done
 	return r.result
+}
+
+// RecoveryMode selects what RecoverGroups may do to a group it proves ours.
+type RecoveryMode int
+
+const (
+	// RecoverGraceful sends SIGTERM to proven members, waits until the
+	// deadline, then sends SIGKILL to whatever is left.
+	RecoverGraceful RecoveryMode = iota
+	// RecoverForce sends SIGKILL to proven members at once.
+	RecoverForce
+	// RecoverAssessOnly classifies groups without opening a pidfd or sending
+	// any signal; a proven group with live members reports OutcomeLive.
+	RecoverAssessOnly
+)
+
+// Outcomes of a recovered group.
+const (
+	OutcomeEmpty      = "empty"      // proven empty without a signal
+	OutcomeTerminated = "terminated" // proven ours, signalled, then proven empty
+	OutcomeUnknown    = "unknown"    // could not be proven empty; may still be running
+	OutcomeLive       = "live"       // RecoverAssessOnly: proven ours and still running
+)
+
+// RecoveredGroup is the evidence for one process group recorded by a daemon
+// that exited without a shutdown verdict.
+type RecoveredGroup struct {
+	GroupResult // Name, PGID and State in the shutdown vocabulary
+	// LeaderStart is the recorded leader start time, 0 when none was recorded.
+	LeaderStart uint64
+	Outcome     string
+	// Reason names the rule that decided Outcome: rebooted, boot_unknown,
+	// no_members, pgid_reused, leader_proven, launch_pending, invalid_pgid,
+	// own_group, leader_gone, leader_left_group, leader_start_unknown,
+	// namespace_mismatch, enumeration_failed, signal_unavailable,
+	// survived_sigkill or unproven_members.
+	Reason string
+	// Signals lists the signals delivered to the group's proven members.
+	Signals []string
+	// PIDs are the members signalled for a terminated group, and the live
+	// members found for a live or unknown one.
+	PIDs []int
+	// LiveMembers counts the members still running when the group stayed
+	// unknown or live.
+	LiveMembers int
+}
+
+// CrashedRunError refuses a start over a run whose daemon exited without a
+// shutdown verdict while some of its recorded process groups may still be
+// running. Starting would overwrite the only record of those groups.
+type CrashedRunError struct {
+	PID    int
+	Groups []RecoveredGroup
+}
+
+func (e *CrashedRunError) Error() string {
+	return fmt.Sprintf("a previous daemon (PID %d) exited without a shutdown verdict and left process groups "+
+		"that may still be running:\n    %s\n  stop them first: proc-compose stop",
+		e.PID, strings.ReplaceAll(FormatRecovery(e.Groups), "\n", "\n    "))
+}
+
+// CheckCrashedRun reports whether a new run may take over pidPath, without
+// changing anything: nil when there is no PID file, or when its daemon is gone
+// and nothing it recorded can still be running. It refuses a live daemon and,
+// on Unix, a crashed run whose recorded groups may still run or whose PID file
+// is unreadable. It never signals.
+//
+// It is the early answer `up` gives before taking the session lease. Removing
+// stale state there could delete the PID file of a run that took the lease and
+// wrote it meanwhile, so only ResolveCrashedRun, under the lease, removes it.
+func CheckCrashedRun(pidPath string) error {
+	_, err := assessCrashedRun(pidPath)
+	return err
+}
+
+// ResolveCrashedRun is CheckCrashedRun followed, when the PID file is stale, by
+// removing it and its socket. Callers hold the session's instance lease, so no
+// other run can have written the file being removed.
+func ResolveCrashedRun(pidPath, socketPath string) error {
+	stale, err := assessCrashedRun(pidPath)
+	if err != nil {
+		return err
+	}
+	if stale {
+		daemon.Cleanup(pidPath, socketPath)
+	}
+	return nil
+}
+
+// alreadyRunningError is the refusal to start a second daemon for a config.
+func alreadyRunningError(pid int) error {
+	return fmt.Errorf(
+		"proc-compose is already running for this config (PID %d)\n"+
+			"  stop it first:  proc-compose stop\n"+
+			"  or monitor it:  proc-compose monitor",
+		pid,
+	)
+}
+
+// FormatRecovery renders one stable key=value evidence line per group, sorted
+// by name and then pgid. Fields with nothing to report are left out.
+func FormatRecovery(groups []RecoveredGroup) string {
+	sorted := slices.Clone(groups)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Name != sorted[j].Name {
+			return sorted[i].Name < sorted[j].Name
+		}
+		return sorted[i].PGID < sorted[j].PGID
+	})
+	lines := make([]string, len(sorted))
+	for i, g := range sorted {
+		lines[i] = g.evidence()
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (g RecoveredGroup) evidence() string {
+	var b strings.Builder
+	name := g.Name
+	if name == "" || strings.ContainsFunc(name, func(r rune) bool { return r <= ' ' || r == '"' || r == '=' || r == 0x7f }) {
+		name = strconv.Quote(name)
+	}
+	fmt.Fprintf(&b, "recovered group=%s pgid=%d", name, g.PGID)
+	if g.LeaderStart != 0 {
+		fmt.Fprintf(&b, " leader_start=%d", g.LeaderStart)
+	}
+	fmt.Fprintf(&b, " outcome=%s reason=%s", g.Outcome, g.Reason)
+	if len(g.Signals) > 0 {
+		fmt.Fprintf(&b, " signals=%s", strings.Join(g.Signals, ","))
+	}
+	if g.LiveMembers > 0 {
+		fmt.Fprintf(&b, " live_members=%d", g.LiveMembers)
+	}
+	if len(g.PIDs) > 0 {
+		pids := make([]string, len(g.PIDs))
+		for i, pid := range g.PIDs {
+			pids[i] = strconv.Itoa(pid)
+		}
+		fmt.Fprintf(&b, " members=%s", strings.Join(pids, ","))
+	}
+	return b.String()
 }

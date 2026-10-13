@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -182,7 +184,7 @@ func TestIsAliveFromPIDFile_StartTimeMismatch(t *testing.T) {
 	if startedAt == 0 {
 		t.Skip("procStartTime unavailable on this platform")
 	}
-	stale := pidFile{PID: os.Getpid(), Addr: "/tmp/x.sock", StartedAt: 1}
+	stale := Record{PID: os.Getpid(), Addr: "/tmp/x.sock", StartedAt: 1}
 	data, _ := json.Marshal(stale)
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
@@ -190,5 +192,161 @@ func TestIsAliveFromPIDFile_StartTimeMismatch(t *testing.T) {
 	alive, pid := IsAliveFromPIDFile(path)
 	if alive {
 		t.Errorf("expected stale=true to surface as alive=false, got alive=true (pid=%d)", pid)
+	}
+}
+
+// TestWriteGroups_PreservesPIDAddrAndStart pins the record contract: writing
+// the process-group record keeps the daemon's own identity intact, so liveness
+// checks still recognise the daemon, and the atomic writer leaves no temporary
+// file behind.
+func TestWriteGroups_PreservesPIDAddrAndStart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "self.pid")
+	if err := WritePID(path, os.Getpid(), "/tmp/x.sock"); err != nil {
+		t.Fatalf("WritePID: %v", err)
+	}
+	before, err := ReadRecord(path)
+	if err != nil {
+		t.Fatalf("ReadRecord before: %v", err)
+	}
+	want := []Group{{Name: "web", PGID: 42, LeaderStart: 7}}
+	if err := WriteGroups(path, os.Getpid(), want); err != nil {
+		t.Fatalf("WriteGroups: %v", err)
+	}
+	rec, err := ReadRecord(path)
+	if err != nil {
+		t.Fatalf("ReadRecord: %v", err)
+	}
+	if rec.Groups == nil || !reflect.DeepEqual(*rec.Groups, want) {
+		t.Fatalf("groups = %v, want %v", rec.Groups, want)
+	}
+	if rec.PID != os.Getpid() || rec.Addr != "/tmp/x.sock" || rec.StartedAt != before.StartedAt {
+		t.Fatalf("record = %+v, want pid=%d addr=/tmp/x.sock started_at=%d", rec, os.Getpid(), before.StartedAt)
+	}
+	if rec.Host != HostIdentity() {
+		t.Fatalf("host = %+v, want %+v", rec.Host, HostIdentity())
+	}
+	if alive, pid := IsAliveFromPIDFile(path); !alive || pid != os.Getpid() {
+		t.Fatalf("IsAliveFromPIDFile = %v, %d after WriteGroups; want true, %d", alive, pid, os.Getpid())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "self.pid" {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("directory holds %v, want only self.pid (no temporary files)", names)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := info.Mode().Perm(); mode != 0600 {
+			t.Fatalf("PID file mode after WriteGroups = %o, want 0600", mode)
+		}
+	}
+}
+
+// TestWriteGroups_EmptyListIsRecorded distinguishes "recorded, nothing live"
+// from "no record at all": an empty list must survive the round trip.
+func TestWriteGroups_EmptyListIsRecorded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.pid")
+	if err := WritePID(path, 4242, "/tmp/x.sock"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteGroups(path, 4242, nil); err != nil {
+		t.Fatalf("WriteGroups: %v", err)
+	}
+	rec, err := ReadRecord(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Groups == nil || len(*rec.Groups) != 0 {
+		t.Fatalf("groups = %v, want a recorded empty list", rec.Groups)
+	}
+}
+
+// TestWriteGroups_MissingPIDFileFails ensures a record is never written into a
+// PID file that no longer exists (for example after Cleanup).
+func TestWriteGroups_MissingPIDFileFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gone.pid")
+	if err := WriteGroups(path, os.Getpid(), []Group{{Name: "web"}}); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("WriteGroups on a missing PID file = %v, want fs.ErrNotExist", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("WriteGroups created %s: %v", path, err)
+	}
+}
+
+// TestWriteGroups_OtherOwnerIsRefused: a PID file that now names another
+// daemon (one that recreated it after this daemon's file was deleted) is left
+// exactly as it is, so neither daemon's record replaces the other's.
+func TestWriteGroups_OtherOwnerIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "other.pid")
+	if err := WritePID(path, 4242, "/tmp/other.sock"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteGroups(path, 4242, []Group{{Name: "theirs", PGID: 4300}}); err != nil {
+		t.Fatalf("WriteGroups by the owner: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = WriteGroups(path, 4243, []Group{{Name: "ours", PGID: 4400}})
+	if !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("WriteGroups by another pid = %v, want ErrNotOwner", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("refused WriteGroups changed the file:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// TestReadRecord_LegacyFileHasNoGroups: a PID file written before group
+// recording has nil groups, which is distinct from a recorded empty list.
+func TestReadRecord_LegacyFileHasNoGroups(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.pid")
+	if err := os.WriteFile(path, []byte(`{"pid":900,"addr":"/tmp/x.sock","started_at":51234}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := ReadRecord(path)
+	if err != nil {
+		t.Fatalf("ReadRecord: %v", err)
+	}
+	if rec.Groups != nil {
+		t.Fatalf("legacy groups = %v, want nil", *rec.Groups)
+	}
+	if rec.PID != 900 || rec.Addr != "/tmp/x.sock" || rec.StartedAt != 51234 {
+		t.Fatalf("legacy record = %+v", rec)
+	}
+	if err := os.WriteFile(path, []byte(`{"pid":900,"addr":"/tmp/x.sock","groups":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rec, err = ReadRecord(path)
+	if err != nil {
+		t.Fatalf("ReadRecord: %v", err)
+	}
+	if rec.Groups == nil || len(*rec.Groups) != 0 {
+		t.Fatalf("recorded empty groups = %v, want non-nil empty", rec.Groups)
+	}
+}
+
+// TestReadRecord_CorruptIsError: an unreadable record is an error, never a
+// legacy file with no groups.
+func TestReadRecord_CorruptIsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad.pid")
+	if err := os.WriteFile(path, []byte(`{"pid":900,"groups":[{"name":`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadRecord(path); err == nil {
+		t.Fatal("ReadRecord accepted a corrupt PID file")
 	}
 }

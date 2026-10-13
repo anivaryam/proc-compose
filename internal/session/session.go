@@ -34,7 +34,9 @@ type Plan struct {
 func Acquire(cfg *config.Config, configPath, hash, name string, filter []string) (_ *Plan, err error) {
 	p := &Plan{
 		Project:   &ipc.Project{Session: name, RunID: ipc.NewRunID(), ConfigPath: configPath, Directory: paths.SessionDir(hash), Ports: make(map[string]map[string]int), URLs: make(map[string]map[string]string), JournalPath: paths.Journal(hash)},
-		variables: make(map[string]string), preferred: make(map[string]map[string]int), resources: slices.Clone(cfg.Resources), names: config.SelectedNames(cfg, filter),
+		variables: make(map[string]string), preferred: make(map[string]map[string]int), resources: slices.Clone(cfg.Resources),
+		// Teardown processes run for the whole stack, whatever the filter.
+		names: append(config.SelectedNames(cfg, filter), config.TeardownNames(cfg)...),
 	}
 	defer func() {
 		if err != nil {
@@ -44,9 +46,6 @@ func Acquire(cfg *config.Config, configPath, hash, name string, filter []string)
 	if err = os.MkdirAll(p.Project.Directory, 0700); err != nil {
 		return nil, err
 	}
-	if err = os.MkdirAll(paths.LeaseDir(), 0700); err != nil {
-		return nil, err
-	}
 	if err = p.lease("instance:" + hash); err != nil {
 		return nil, err
 	}
@@ -54,6 +53,7 @@ func Acquire(cfg *config.Config, configPath, hash, name string, filter []string)
 	if name == "" {
 		p.variables["session.name"] = "default"
 	}
+	p.Project.Teardown = config.TeardownNames(cfg)
 	p.variables["session.id"] = hash
 	p.variables["session.dir"] = p.Project.Directory
 	p.variables["config.dir"] = filepath.Dir(configPath)
@@ -148,20 +148,31 @@ func (p *Plan) Resolve(cfg *config.Config) (*config.Config, error) {
 		if proc.Dir != "" && !filepath.IsAbs(proc.Dir) {
 			proc.Dir = filepath.Join(filepath.Dir(p.Project.ConfigPath), proc.Dir)
 		}
-		if proc.ReadyWhen != nil {
-			probe := *proc.ReadyWhen
-			probe.HTTP, err = p.expand(probe.HTTP)
-			if err == nil {
-				probe.TCP, err = p.expand(probe.TCP)
-			}
-			if err != nil {
-				return nil, fmt.Errorf("process %q probe: %w", name, err)
-			}
-			proc.ReadyWhen = &probe
+		if proc.ReadyWhen, err = p.expandProbe(proc.ReadyWhen); err != nil {
+			return nil, fmt.Errorf("process %q probe: %w", name, err)
+		}
+		if proc.HealthWhen, err = p.expandProbe(proc.HealthWhen); err != nil {
+			return nil, fmt.Errorf("process %q health_when: %w", name, err)
 		}
 		result.Processes[name] = proc
 	}
 	return &result, nil
+}
+
+// expandProbe returns a copy of probe with its endpoint references resolved,
+// or nil for no probe. A log probe is a regex and is left as written.
+func (p *Plan) expandProbe(probe *config.ReadyWhen) (*config.ReadyWhen, error) {
+	if probe == nil {
+		return nil, nil
+	}
+	expanded := *probe
+	var err error
+	for _, field := range []*string{&expanded.HTTP, &expanded.TCP, &expanded.Cmd} {
+		if *field, err = p.expand(*field); err != nil {
+			return nil, err
+		}
+	}
+	return &expanded, nil
 }
 
 func (p *Plan) expand(value string) (string, error) {
@@ -199,17 +210,44 @@ func leasePath(label string) string {
 	return filepath.Join(paths.LeaseDir(), fmt.Sprintf("%016x.lock", h.Sum64()))
 }
 
-func (p *Plan) lease(label string) error {
+// acquireLease takes the named lease without blocking and returns the open
+// lock file that holds it; closing the file releases it. A lease another owner
+// holds is a *LeaseError.
+func acquireLease(label string) (*os.File, error) {
+	if err := os.MkdirAll(paths.LeaseDir(), 0700); err != nil {
+		return nil, err
+	}
 	file, err := os.OpenFile(leasePath(label), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := lock(file); err != nil {
 		file.Close()
-		return &LeaseError{Label: label, Err: err}
+		return nil, &LeaseError{Label: label, Err: err}
+	}
+	return file, nil
+}
+
+func (p *Plan) lease(label string) error {
+	file, err := acquireLease(label)
+	if err != nil {
+		return err
 	}
 	p.leases = append(p.leases, file)
 	return nil
+}
+
+// LeaseInstance takes the session's instance lease, the one Acquire holds for a
+// run's whole lifetime, without blocking. Holding it excludes every other
+// command that would start or reclaim the session, so crash recovery can act on
+// the PID file without racing a fresh `up`. A held lease is an instance
+// *LeaseError. release frees the lease.
+func LeaseInstance(hash string) (release func(), err error) {
+	file, err := acquireLease("instance:" + hash)
+	if err != nil {
+		return nil, err
+	}
+	return func() { _ = file.Close() }, nil
 }
 
 // InstanceHeld observes whether some owner holds the session's instance lease.

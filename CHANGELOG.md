@@ -5,12 +5,130 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.7.0] - 2026-10-13
+
+### Added
+
+- `ready_when.cmd`: a readiness probe that runs a shell command in the
+  process's directory and environment and passes when it exits 0, for
+  processes that open no port and print no ready line. Failed attempts are
+  retried one second apart until `ready_timeout`; each attempt is limited to
+  10 seconds; a timeout's error names the last attempt's exit status and the
+  start of its stderr. The state and output of probe runs stay out of `status`, the
+  monitor and the logs; probe runs are stopped and verified with the process
+  they probe. `config plan` reports the
+  probe as `cmd`, and `verify` receipts record it as the readiness probe.
+- `health_when`, `health_interval` and `health_action`: ongoing health checks
+  for services after they become ready. `health_when` takes an `http`, `tcp`
+  or `cmd` probe (`log` is rejected); checks run one at a time every
+  `health_interval` seconds (default 10, also used for 0), each limited to the
+  interval or 10 seconds, whichever is shorter. Three failed checks in a row
+  make the service `unhealthy`, and one pass makes it `healthy` again.
+  `health_action: report` (the default) keeps the service running;
+  `health_action: restart` restarts it through its restart policy, counting
+  toward `max_restarts`, and is rejected with `restart: never`. `status
+  --json` and IPC state report `health` and `health_error`, the monitor shows
+  `unhealthy` in its readiness column, `/health` returns 503 while a service
+  is unhealthy (`/ready` and `--wait-ready` are unchanged), `verify` fails the
+  attempt with `required_failed` when a required service becomes unhealthy
+  during the check, and the journal records `health.check_failed`,
+  `health.unhealthy` and `health.recovered` events. A `cmd` check that
+  proc-compose cannot launch (for example when the crash-recovery record
+  cannot be written) is logged as `health.check_skipped` and never counts as a
+  failure; `health` reads `unknown` until a check runs again. `health` is also
+  `unknown` whenever the process is not running. `config plan --json`
+  reports each process's health check.
+- `mode: teardown`: processes that run once after the stack stops, to release
+  what it held. They run only after every managed process is verified
+  terminated (otherwise they are skipped and reported), one at a time in name
+  order within a fixed 15-second budget, after `stop`, `stop --force`, Ctrl+C,
+  a stack that ends on its own, or a failed task, and for the whole stack
+  under `up <process>`. They take `cmd`, `dir`, `env`, `env_file` and a
+  `shutdown_timeout` of at most 5, get the session's variables and
+  references, and cannot be depended on or selected. A teardown process that
+  does not pass fails `up` and the stop verdict with lines starting
+  `teardown:`, without changing whether termination was verified. The journal
+  records `teardown.started`, `teardown.completed`, `teardown.failed` and
+  `teardown.skipped`; `config plan` lists them under `teardown`. A changed
+  teardown definition applies on `reload` without a restart. `verify` runs
+  teardown inside its cleanup budget and records it in the receipt's
+  `cleanup.teardown`; a teardown that does not pass fails the attempt with
+  `teardown_failed`. `stop` waits 15 seconds longer by default when the
+  session declares teardown processes, says "termination was verified, but
+  teardown did not pass" when only teardown failed, and reports "teardown did
+  not run" after a daemon crash. Session metadata lists the teardown
+  processes (`teardown`).
+- Docs: a reset → seed → services recipe with chained tasks.
+
+### Fixed
+
+- `verify` no longer races on its stack cleanup budget when the stack stops
+  on its own, for example after a required process fails. The budget now
+  starts at that stop, like any other cleanup trigger, instead of being
+  written after the runner may already have read it.
+- `stop` no longer reports success on Linux and macOS when the daemon has
+  crashed and its managed processes cannot be verified as terminated (see the
+  next entry for how recorded process groups are recovered). For a PID file
+  without a group record, or one that cannot be read, `stop` exits non-zero,
+  keeps the PID file, and says the processes were not verified; `stop --force`
+  clears that stale state with a warning; it exits 0 for a readable file and
+  non-zero for an unreadable one, which may have recorded groups. On
+  Windows a crashed daemon's managed processes end with its job objects, so
+  `stop` clears the stale state and exits 0.
+- After a daemon crash, `stop` now recovers from the PID file's process-group
+  record. On Linux it terminates every recorded group whose leader is still
+  alive with its recorded start time, signalling each member through a pidfd
+  (SIGTERM, then SIGKILL at `--timeout`; SIGKILL at once with `--force`). It
+  reports groups that are already gone as empty and leaves the rest unknown
+  without signalling them: a group whose leader was reaped while members keep
+  running, a launch that never started, a record or machine without a
+  readable boot ID, pids from another namespace (or a
+  `/proc` mounted for another PID namespace), or a kernel without pidfds.
+  Processes that left their group with `setsid` or `setpgid` are not in the
+  record, so `stop` neither reports nor signals them. On macOS it never
+  signals; it only reports groups as empty or unknown. `stop` prints one `recovered group=... outcome=...
+  reason=...` line per group, exits 0 only when every group is empty or
+  terminated, and refuses without signalling while another command holds the
+  session. With a group left unknown, `stop --force` clears the state but
+  exits non-zero. A PID file without a group record keeps the earlier
+  behaviour, and an unreadable PID file can now be cleared with `stop --force`,
+  which still exits non-zero because its groups are unknown.
+- `up` and `verify` no longer overwrite a crashed run's PID file while its
+  recorded process groups may still be running. `up` refuses and points at
+  `proc-compose stop`; `verify` fails with `session_occupied`. Neither
+  signals anything. On Unix an unreadable PID file also refuses the start
+  instead of being deleted.
+- A service stopped because its readiness probe timed out (`ready_when` with
+  `ready_timeout`) now always counts as failed, even when it exits 0 on
+  SIGTERM. Before, depending on timing, it could be reported as `exited`: it
+  did not restart under `restart: on-failure`, did not count toward
+  `max_restarts`, and did not fail the run under `restart: never`.
+- A readiness probe that finishes after its process was restarted or stopped
+  no longer marks the next incarnation ready.
+- After `reload` replaces a process definition, `status`, `/ready`, and
+  `/health` describe the running incarnation's definition, the same one the
+  event stream reports, instead of the definition loaded at startup. Both now
+  come from one builder. `reload` already refuses mode and `depends_on`
+  changes, so no field in today's output differed.
 
 ### Changed
 
 - Documentation reorganized: a shorter README, guides under `docs/`, this
   changelog, and `FEATURES.md`. Command help links point to the new pages.
+- `docs/cli.md` now describes how `stop` and `stop --force` actually work: the
+  daemon terminates its managed processes and reports a verdict. It no longer
+  says `stop` sends SIGTERM and then SIGKILL to the daemon.
+- On Linux and macOS, the daemon's PID file now records each process group it
+  launches until that group is proven empty, so a crashed run can be
+  recovered. The entry is written before the command starts; if it
+  cannot be written, that launch fails and the process's restart policy
+  applies. If the PID file cannot be updated when the stack starts, or it is
+  deleted while the stack runs (for example when its runtime directory is
+  removed), recording is turned off for the rest of that run with a warning
+  and launches continue. A PID file that another daemon has recreated in the
+  meantime is never overwritten.
+- PID files are now written atomically (temporary file, sync, rename), the
+  same way verification receipts already were.
 
 ## [1.6.0] - 2026-10-13
 
@@ -227,7 +345,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policies, readiness probes, dependencies, background daemon, monitor TUI,
   and merge-port integration.
 
-[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/anivaryam/proc-compose/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/anivaryam/proc-compose/compare/v1.5.2...v1.6.0
 [1.5.2]: https://github.com/anivaryam/proc-compose/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/anivaryam/proc-compose/compare/v1.5.0...v1.5.1

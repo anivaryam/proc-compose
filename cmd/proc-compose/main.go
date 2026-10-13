@@ -142,6 +142,10 @@ A task-only invocation always runs in the foreground: --silent
 requires at least one service in the started closure so the daemon
 has something to manage after tasks finish.
 
+If a previous daemon crashed and the process groups its PID file
+records may still be running, up refuses and asks you to run
+proc-compose stop first. up never signals anything itself.
+
 merge: and tunnel patterns, restart policies, readiness probes, env
 auto-injection — see:
   https://github.com/anivaryam/proc-compose/blob/main/docs/configuration.md`,
@@ -181,8 +185,8 @@ auto-injection — see:
 
 			if len(args) > 0 {
 				for _, name := range args {
-					if _, ok := cfg.Processes[name]; !ok {
-						return fmt.Errorf("unknown process %q", name)
+					if err := config.CheckSelector(cfg, name); err != nil {
+						return err
 					}
 				}
 			}
@@ -236,7 +240,7 @@ auto-injection — see:
 			}
 
 			// ── Pre-flight checks ─────────────────────────────────────────────
-			if err := preflightCheck(pidPath, socketPath, cfg); err != nil {
+			if err := preflightCheck(pidPath, cfg); err != nil {
 				return err
 			}
 
@@ -285,7 +289,9 @@ auto-injection — see:
 			}
 
 			// ── Foreground ───────────────────────────────────────────────────
-			plan, err := session.Acquire(cfg, absConfig, hash, sessionName, args)
+			// Takes the session and, under its lease, the authoritative
+			// crashed-run check.
+			plan, err := acquireRun(cfg, absConfig, hash, sessionName, args, pidPath, socketPath)
 			if err != nil {
 				return err
 			}
@@ -366,6 +372,7 @@ auto-injection — see:
 				Journal:       journal,
 				Project:       plan.Project,
 				ResolveConfig: plan.Resolve,
+				RecordPath:    pidPath,
 			}
 			if daemonChild {
 				r.Output, r.LogFile = logWriter, nil
@@ -448,8 +455,8 @@ Screenshots and full key reference:
 		Long: `Stop the proc-compose daemon associated with the resolved config file.
 
 Daemons are scoped per absolute config path. Use -f to stop a daemon
-started with a different config file. Sends SIGTERM, waits up to
---timeout seconds, then escalates to SIGKILL.
+started with a different config file. Asks the daemon to shut down and
+waits up to --timeout seconds for its verdict.
 
 A stop is only reported as successful once the daemon has confirmed that
 every managed process it started — not just the command leaders — has
@@ -462,25 +469,52 @@ exit, rather than signalling the daemon itself. If the daemon cannot be
 reached (an older proc-compose, or a dead socket), it is killed and the
 command warns that managed processes could not be verified.
 
+If the daemon already crashed, stop recovers from the process groups its
+PID file records, under the session lease. On Linux a group whose leader is
+still alive with its recorded start time is terminated through pidfds
+(SIGTERM, then SIGKILL at --timeout; --force sends SIGKILL at once). A group
+already gone is reported empty. Anything else is reported unknown and never
+signalled: a group whose leader was reaped while members remain, pids from
+another PID namespace, and every live group on macOS, which only reports.
+Processes that left their group with setsid or setpgid are not in the
+record, so stop neither reports nor signals them. One "recovered group=..."
+evidence line is printed per group. stop exits 0 and removes the PID file only when every group is empty
+or terminated; otherwise it keeps the file. --force then clears the stale
+state but still exits non-zero. A PID file with no group record (an older
+daemon) or one that cannot be read proves nothing: stop fails, and --force
+clears it with a warning. --force exits 0 for a readable file with no group
+record, and non-zero for an unreadable one, which may have recorded groups.
+On Windows the managed processes ended with the
+daemon's job objects, so the stale state is simply cleared. A crashed daemon
+never ran its teardown processes; stop then reports "teardown did not run".
+
+Teardown processes run after termination is verified, also with --force.
+The default --timeout grows by their 15s budget; an explicit one is kept.
+If only teardown failed, stop says termination was verified but teardown did
+not pass, and exits non-zero.
+
 On Windows the graceful path is unavailable; --timeout is ignored and
 managed processes are always terminated with taskkill /T /F.`,
 		Example:       "  proc-compose stop              # graceful, 10s timeout\n  proc-compose stop --timeout 30 # graceful, 30s timeout\n  proc-compose stop --force      # force-terminate managed processes\n  proc-compose stop -f myapp.yml # stop daemon for a specific config",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, _, socketPath, pidPath, err := resolveLiveDaemonPaths(configFile)
+			_, hash, socketPath, pidPath, err := resolveLiveDaemonPaths(configFile)
 			if err != nil {
 				return err
 			}
 
+			stopTimeout := time.Duration(stopTimeoutSeconds) * time.Second
 			alive, pid := daemon.IsAliveFromPIDFile(pidPath)
 			if pid == 0 {
-				return fmt.Errorf("no running proc-compose found for this config (tried %s)", sanitizePath(pidPath))
+				if _, statErr := os.Stat(pidPath); statErr != nil {
+					return fmt.Errorf("no running proc-compose found for this config (tried %s)", sanitizePath(pidPath))
+				}
+				// A PID file that does not parse proves nothing; --force can clear it.
+				return stopDeadDaemon(pidPath, socketPath, hash, 0, stopForce, stopTimeout)
 			}
 			if !alive {
-				fmt.Printf("daemon (PID %d) is no longer running — cleaning up\n", pid)
-				daemon.Cleanup(pidPath, socketPath)
-				return nil
+				return stopDeadDaemon(pidPath, socketPath, hash, pid, stopForce, stopTimeout)
 			}
 
 			proc, err := os.FindProcess(pid)
@@ -488,11 +522,13 @@ managed processes are always terminated with taskkill /T /F.`,
 				return err
 			}
 
-			stopTimeout := time.Duration(stopTimeoutSeconds) * time.Second
+			// Teardown runs after termination is verified, so a default
+			// --timeout leaves room for its budget.
+			stopTimeout = stopBudget(paths.Metadata(hash), stopTimeout, cmd.Flags().Changed("timeout"))
 			return stopDaemon(socketPath, pidPath, pid, proc, stopForce, stopTimeout)
 		},
 	}
-	stopCmd.Flags().IntVar(&stopTimeoutSeconds, "timeout", 10, "seconds to wait for graceful shutdown before SIGKILL")
+	stopCmd.Flags().IntVar(&stopTimeoutSeconds, "timeout", 10, "seconds to wait for a verified shutdown")
 	stopCmd.Flags().BoolVar(&stopForce, "force", false, "force-terminate managed processes instead of shutting down gracefully")
 
 	// ── list ──────────────────────────────────────────────────────────────────
@@ -1040,8 +1076,7 @@ func computeClosure(procs map[string]config.Process, args []string) []string {
 }
 
 func validateSilentSelection(cfg *config.Config, args []string) error {
-	closure := computeClosure(cfg.Processes, args)
-	for _, name := range closure {
+	for _, name := range config.SelectedNames(cfg, args) {
 		if cfg.Processes[name].EffectiveMode() != config.ProcessModeTask {
 			return nil
 		}

@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,32 +37,66 @@ func KillProcess(proc *os.Process) error {
 }
 
 // procStartTime returns a stable, reuse-resistant identifier for a running
-// process. On Linux it returns field 22 (start-time in jiffies) from
-// /proc/<pid>/stat. On other Unixes (no /proc) it returns 0 with a nil error
-// so callers fall back to PID-only liveness checks.
+// process: on Linux the procfs start time from ProcStat. On other Unixes (no
+// /proc) it returns 0 with a nil error so callers fall back to PID-only
+// liveness checks.
 func procStartTime(pid int) (uint64, error) {
 	if runtime.GOOS != "linux" {
 		return 0, nil
 	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	info, err := ProcStat(pid)
 	if err != nil {
 		return 0, err
 	}
-	// /proc/<pid>/stat: "<pid> (comm) state ppid ..." — the comm field can
+	return info.StartTime, nil
+}
+
+// ProcStat reads a process's state, process group and start time from
+// /proc/<pid>/stat. It is the single parser of that file. Off Linux it
+// returns errors.ErrUnsupported.
+func ProcStat(pid int) (ProcInfo, error) {
+	if runtime.GOOS != "linux" {
+		return ProcInfo{}, errors.ErrUnsupported
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return ProcInfo{}, err
+	}
+	// /proc/<pid>/stat: "<pid> (comm) state ppid pgrp ..." — the comm field can
 	// contain spaces and parentheses, so split on the LAST ')' to skip it.
 	close := strings.LastIndexByte(string(data), ')')
 	if close < 0 || close+2 > len(data) {
-		return 0, fmt.Errorf("unexpected /proc/%d/stat format", pid)
+		return ProcInfo{}, fmt.Errorf("unexpected /proc/%d/stat format", pid)
 	}
 	rest := strings.Fields(string(data[close+2:]))
-	// After the (comm) field, fields are 3..N; field 22 (1-indexed in proc(5))
-	// is starttime, which is index 19 in this 0-based slice (3 + 19 = 22).
-	if len(rest) < 20 {
-		return 0, fmt.Errorf("unexpected /proc/%d/stat field count", pid)
+	// After the (comm) field, fields are 3..N (1-indexed in proc(5)): state is
+	// index 0 here, pgrp (field 5) index 2, and starttime (field 22) index 19.
+	if len(rest) < 20 || len(rest[0]) == 0 {
+		return ProcInfo{}, fmt.Errorf("unexpected /proc/%d/stat field count", pid)
 	}
-	v, err := strconv.ParseUint(rest[19], 10, 64)
+	pgid, err := strconv.Atoi(rest[2])
 	if err != nil {
-		return 0, err
+		return ProcInfo{}, fmt.Errorf("unexpected /proc/%d/stat pgrp: %w", pid, err)
 	}
-	return v, nil
+	start, err := strconv.ParseUint(rest[19], 10, 64)
+	if err != nil {
+		return ProcInfo{}, fmt.Errorf("unexpected /proc/%d/stat starttime: %w", pid, err)
+	}
+	return ProcInfo{State: rest[0][0], PGID: pgid, StartTime: start}, nil
+}
+
+// HostIdentity returns the current boot id and the pid and time namespaces of
+// this process. Values that cannot be read, and every value off Linux, are
+// empty.
+func HostIdentity() Host {
+	if runtime.GOOS != "linux" {
+		return Host{}
+	}
+	var h Host
+	if data, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
+		h.BootID = strings.TrimSpace(string(data))
+	}
+	h.PIDNS, _ = os.Readlink("/proc/self/ns/pid")
+	h.TimeNS, _ = os.Readlink("/proc/self/ns/time")
+	return h
 }

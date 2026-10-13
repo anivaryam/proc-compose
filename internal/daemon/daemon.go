@@ -3,15 +3,54 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
-type pidFile struct {
+// Record is the PID file's content: the daemon's own identity and, on Unix,
+// the process groups it launched. Fields added after the first release are
+// optional so older readers ignore them.
+type Record struct {
 	PID       int    `json:"pid"`
 	Addr      string `json:"addr"`
 	StartedAt uint64 `json:"started_at,omitempty"` // platform-specific start-time for PID-reuse defence
+	Host
+	// Groups is nil when nothing was recorded (a legacy file, Windows, or
+	// recording disabled for the run) and an empty list when recording ran and
+	// no launched group is still unaccounted for.
+	Groups *[]Group `json:"groups,omitempty"`
+}
+
+// Host identifies the boot and namespaces a record's pids belong to. Every
+// field is empty off Linux; TimeNS is also empty on kernels without time
+// namespaces.
+type Host struct {
+	BootID string `json:"boot_id,omitempty"` // /proc/sys/kernel/random/boot_id
+	PIDNS  string `json:"pid_ns,omitempty"`  // readlink /proc/self/ns/pid
+	TimeNS string `json:"time_ns,omitempty"` // readlink /proc/self/ns/time
+}
+
+// Group is one launched process group. Entries are kept as a superset of the
+// groups that may still be running: one leaves the record only once its group
+// is proven empty.
+type Group struct {
+	Name string `json:"name"`
+	// PGID is 0 while the launch is pending: the entry is written before the
+	// command starts, so a crash in between cannot lose it.
+	PGID int `json:"pgid"`
+	// LeaderStart is the leader's procfs start time in clock ticks, or 0 where
+	// the platform has none.
+	LeaderStart uint64 `json:"leader_start,omitempty"`
+}
+
+// ProcInfo is what ProcStat reads from /proc/<pid>/stat.
+type ProcInfo struct {
+	State     byte   // single-letter process state
+	PGID      int    // process group
+	StartTime uint64 // start time in clock ticks since boot
 }
 
 // Reexec re-executes the current binary with args, fully detached from the
@@ -45,17 +84,89 @@ func Reexec(args []string, logPath string) (int, error) {
 	return pid, nil
 }
 
-// WritePID writes pid, addr, and start-time to pidPath as JSON.
+// WritePID atomically writes pid, addr, and start-time to pidPath as JSON,
+// replacing any previous record.
 // The start-time is captured from the live PID (best-effort) so ReadPID
 // callers can verify the PID has not been reused after a daemon crash.
 func WritePID(pidPath string, pid int, addr string) error {
 	startedAt, _ := procStartTime(pid)
-	pf := pidFile{PID: pid, Addr: addr, StartedAt: startedAt}
-	data, err := json.Marshal(pf)
+	return writeRecord(pidPath, Record{PID: pid, Addr: addr, StartedAt: startedAt})
+}
+
+// ErrNotOwner reports a PID file that now names another process, such as a
+// second daemon that recreated it after the first one's file was deleted.
+var ErrNotOwner = errors.New("PID file belongs to another process")
+
+// WriteGroups replaces the process-group record in an existing PID file,
+// keeping the daemon's pid, address and start time and stamping the current
+// host identity. owner is the pid the file must name, normally os.Getpid().
+// It fails, and changes nothing, when the PID file is missing or unreadable
+// (an fs.ErrNotExist error for a missing one) or names a pid other than owner
+// (ErrNotOwner): another daemon's record is never overwritten. A nil list is
+// written as an empty record.
+func WriteGroups(pidPath string, owner int, groups []Group) error {
+	rec, err := ReadRecord(pidPath)
+	if err != nil {
+		return err
+	}
+	if rec.PID != owner {
+		return fmt.Errorf("%w: %s names pid %d, not %d", ErrNotOwner, pidPath, rec.PID, owner)
+	}
+	if groups == nil {
+		groups = []Group{}
+	}
+	rec.Host = HostIdentity()
+	rec.Groups = &groups
+	return writeRecord(pidPath, rec)
+}
+
+func writeRecord(pidPath string, rec Record) error {
+	data, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("cannot marshal PID file: %w", err)
 	}
-	return os.WriteFile(pidPath, data, 0600)
+	return WriteFileAtomic(pidPath, data, 0600)
+}
+
+// WriteFileAtomic writes data to path through a temporary file in the same
+// directory that is synced and then renamed over path, so a reader never
+// observes a partial file. The directory must already exist.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// ReadRecord reads the whole PID file. A file that does not parse is an error;
+// it is never treated as a legacy file without groups.
+func ReadRecord(pidPath string) (Record, error) {
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		return Record{}, err
+	}
+	var rec Record
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return Record{}, fmt.Errorf("invalid PID file %s: %w", pidPath, err)
+	}
+	return rec, nil
 }
 
 // ReadPID reads pid, addr, and start-time from pidPath.
@@ -66,15 +177,11 @@ func ReadPID(pidPath string) (int, string, error) {
 
 // readPIDFull returns pid, recorded start-time (or 0 if unset), and addr.
 func readPIDFull(pidPath string) (int, uint64, string, error) {
-	data, err := os.ReadFile(pidPath)
+	rec, err := ReadRecord(pidPath)
 	if err != nil {
 		return 0, 0, "", err
 	}
-	var pf pidFile
-	if err := json.Unmarshal(data, &pf); err != nil {
-		return 0, 0, "", fmt.Errorf("invalid PID file %s: %w", pidPath, err)
-	}
-	return pf.PID, pf.StartedAt, pf.Addr, nil
+	return rec.PID, rec.StartedAt, rec.Addr, nil
 }
 
 // IsAliveFromPIDFile reads the pidfile and verifies the recorded process is
