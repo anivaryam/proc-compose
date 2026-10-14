@@ -101,6 +101,32 @@ func TestVerifyCLI_ExitCodesAndJSONContract(t *testing.T) {
 	if code != 0 || !strings.Contains(stdout, "verify PASSED") || !strings.Contains(stdout, "cleanup:  passed") {
 		t.Fatalf("human: code %d\n%s", code, stdout)
 	}
+
+	stdout, _, code = runVerifyCLI(t, bin, dir, "verify", "--json", "--require-environment", "--", "true")
+	if result := decodeOne(t, stdout); code != 1 || result["environment"].(map[string]any)["status"] != "unknown" {
+		t.Fatalf("--require-environment without a report: code %d result %v", code, result)
+	}
+
+	report := `{"observations":[{"name":"api.build","status":"mismatched","expected":"b2","observed":"b1"}]}`
+	stdout, _, code = runVerifyCLI(t, bin, dir, "verify", "--", "sh", "-c", `printf '%s' "$1" > "$PROC_COMPOSE_ENVIRONMENT_REPORT"`, "sh", report)
+	if code != 1 || !strings.Contains(stdout, "environment: ineligible") || !strings.Contains(stdout, `api.build mismatched: expected "b2", observed "b1"`) {
+		t.Fatalf("human environment: code %d\n%s", code, stdout)
+	}
+
+	base, cand := t.TempDir(), t.TempDir()
+	for _, root := range []string{base, cand} {
+		writeCLIFile(t, filepath.Join(root, "proc-compose.yml"), "processes:\n  api:\n    cmd: exec sleep 30\n")
+	}
+	stdout, _, code = runVerifyCLI(t, bin, dir, "compare", "--json", "--require-environment", "--baseline", base, "--candidate", cand, "--", "true")
+	if result := decodeOne(t, stdout); code != 1 || result["status"] != "not_comparable" || !strings.Contains(stdout, `"code":"environment_unverified"`) {
+		t.Fatalf("compare --require-environment without reports: code %d result %v", code, result)
+	}
+	// A repeated member must not let a later "matched" replace a mismatch.
+	repeated := `{"observations":[{"name":"api.build","status":"mismatched","status":"matched"}]}`
+	stdout, _, code = runVerifyCLI(t, bin, dir, "compare", "--json", "--baseline", base, "--candidate", cand, "--", "sh", "-c", `printf '%s' "$1" > "$PROC_COMPOSE_ENVIRONMENT_REPORT"`, "sh", repeated)
+	if result := decodeOne(t, stdout); code != 1 || result["status"] != "not_comparable" || !strings.Contains(stdout, `"code":"environment_unverified"`) {
+		t.Fatalf("compare with a repeated status: code %d result %v", code, result)
+	}
 }
 
 func TestVerifyCLI_InvalidConfigJSON(t *testing.T) {

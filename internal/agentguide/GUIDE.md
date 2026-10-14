@@ -30,8 +30,9 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why --attempt latest --j
   `startup.status`, `check.status`/`check.exit_code`, `cleanup.status`, and
   `errors` (`{code,count}`: `startup_timeout`, `startup_failed`,
   `check_exit_nonzero`, `check_timeout`, `required_process_failed`,
-  `cleanup_unverified`, `receipt_persistence_failed`, `session_occupied`,
-  `invalid_configuration`). `check.stdout`/`stderr` hold up to 4 KiB each.
+  `environment_ineligible`, `environment_unverified`, `cleanup_unverified`,
+  `receipt_persistence_failed`, `session_occupied`, `invalid_configuration`).
+  `check.stdout`/`stderr` hold up to 4 KiB each.
 - Only `status: passed` means the check passed against a ready stack with
   verified cleanup. It proves that check, not general health;
   `source.loaded_code_proven` is always false. Readiness `not_configured`
@@ -39,8 +40,19 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why --attempt latest --j
   (result over 64 KiB) is never success.
 - The check receives `PROC_COMPOSE_URL_<PROCESS>_<PORT>`,
   `PROC_COMPOSE_PORT_<PROCESS>_<PORT>`, `PROC_COMPOSE_SESSION`,
-  `PROC_COMPOSE_SESSION_DIR`, `PROC_COMPOSE_RUN_ID`. Names are uppercased;
-  other characters become `_`. Use these rather than guessing ports.
+  `PROC_COMPOSE_SESSION_DIR`, `PROC_COMPOSE_RUN_ID`,
+  `PROC_COMPOSE_ENVIRONMENT_REPORT`. Names are uppercased; other characters
+  become `_`. Use these rather than guessing ports.
+- If the check writes `{"observations":[{"name","status","expected","observed"}]}`
+  (`status`: `matched`/`mismatched`/`unobserved`) to
+  `PROC_COMPOSE_ENVIRONMENT_REPORT`, `environment.status` says whether it
+  exercised the intended build, endpoint, and data: `eligible`, `ineligible`
+  (fails with `environment_ineligible`), `unknown` with a `reason`, or
+  `not_run`. `--require-environment` fails an attempt without an eligible
+  report. `check: failed` with `environment: eligible` is a real failure;
+  `environment: ineligible` means the check hit the wrong environment, so fix
+  the environment before reading the check result. `compare` calls such
+  attempts `not_comparable`.
 - Application output stays in the journal, not on stderr; `--stream-logs`
   overrides that. Flag-parse errors before `verify --json` is recognised are
   plain text.

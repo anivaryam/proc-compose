@@ -69,6 +69,31 @@ const (
 	CodeReceiptPersistence  = "receipt_persistence_failed"
 	CodeResultSizeLimit     = "result_size_limit"
 	CodeEvidenceUnavailable = "evidence_unavailable"
+	// The check's environment report found a mismatch.
+	CodeEnvironmentIneligible = "environment_ineligible"
+	// The environment report was invalid, or required and missing or empty.
+	CodeEnvironmentUnverified = "environment_unverified"
+)
+
+// Environment statuses. A check that never started leaves StatusNotRun.
+const (
+	EnvironmentEligible   = "eligible"
+	EnvironmentIneligible = "ineligible"
+	EnvironmentUnknown    = "unknown"
+)
+
+// Reasons an environment is unknown.
+const (
+	ReasonReportMissing  = "report_missing"
+	ReasonReportInvalid  = "report_invalid"
+	ReasonNoObservations = "no_observations"
+)
+
+// Observation statuses, as reported by the check.
+const (
+	ObservationMatched    = "matched"
+	ObservationMismatched = "mismatched"
+	ObservationUnobserved = "unobserved"
 )
 
 // Exit codes.
@@ -164,6 +189,26 @@ type Check struct {
 	OutputTruncated bool     `json:"output_truncated"`
 }
 
+// Environment is the check's own report of whether the attempt exercised the
+// environment it intended: build, endpoints, data, fixtures. proc-compose
+// records the report and enforces its verdict; the observations are the
+// application's, not proof by this tool.
+type Environment struct {
+	Required     bool          `json:"required"`
+	Status       string        `json:"status"`
+	Reason       *string       `json:"reason"`
+	Observations []Observation `json:"observations"`
+}
+
+// Observation is one named fact the check compared, such as the build an
+// endpoint reports or the fixture a query reads back.
+type Observation struct {
+	Name     string  `json:"name"`
+	Status   string  `json:"status"`
+	Expected *string `json:"expected"`
+	Observed *string `json:"observed"`
+}
+
 type UnresolvedProcess struct {
 	Name       string  `json:"name"`
 	Generation *uint64 `json:"generation"`
@@ -247,6 +292,7 @@ type Result struct {
 	EndpointsNote     *string             `json:"endpoints_not_available"`
 	Startup           Startup             `json:"startup"`
 	Check             Check               `json:"check"`
+	Environment       Environment         `json:"environment"`
 	Cleanup           Cleanup             `json:"cleanup"`
 	Evidence          Evidence            `json:"evidence"`
 	Errors            []ErrorRecord       `json:"errors"`
@@ -294,6 +340,10 @@ const (
 	MaxSelectionBytes = 8 << 10
 	MaxEndpointBytes  = 8 << 10
 	MaxOutputBytes    = 4 << 10
+	// MaxEnvironmentBytes bounds the environment report file and its
+	// observations as encoded in the result.
+	MaxEnvironmentBytes = 8 << 10
+	MaxObservations     = 32
 )
 
 func digest(data []byte) string {
@@ -394,7 +444,7 @@ func Compact(result *Result) CompactError {
 		Phase:         result.Phase,
 		ExitCode:      exit,
 		AttemptState:  attemptState,
-		PhaseStatuses: map[string]string{"validation": validation, "startup": result.Startup.Status, "check": result.Check.Status, "cleanup": result.Cleanup.Status},
+		PhaseStatuses: map[string]string{"validation": validation, "startup": result.Startup.Status, "check": result.Check.Status, "environment": result.Environment.Status, "cleanup": result.Cleanup.Status},
 		Errors:        errs.Records(),
 		Identity: CompactIdentity{
 			ConfigSHA256:                      result.ConfigSHA256,
@@ -404,7 +454,7 @@ func Compact(result *Result) CompactError {
 			ArgvSHA256:                        argvDigest,
 			SelectionEndpointGenerationSHA256: selectionDigest(result),
 			Complete:                          false,
-			OmittedFields:                     []string{"config_path", "workdir", "session", "run_id", "attempt_id", "argv", "selected_processes", "process_generations", "endpoints", "source", "tool_version", "startup", "check", "cleanup", "evidence", "receipt_path", "retention", "started_at", "finished_at"},
+			OmittedFields:                     []string{"config_path", "workdir", "session", "run_id", "attempt_id", "argv", "selected_processes", "process_generations", "endpoints", "source", "tool_version", "startup", "check", "environment", "cleanup", "evidence", "receipt_path", "retention", "started_at", "finished_at"},
 		},
 	}
 }

@@ -93,6 +93,10 @@ func Diagnose(receipt *Result, state string, processes []string) Diagnosis {
 	if receipt.AttemptID != nil {
 		d.AttemptID = *receipt.AttemptID
 	}
+	// Receipts written before environment reports existed carry no status.
+	if receipt.Environment.Status != "" {
+		d.Phases["environment"] = receipt.Environment.Status
+	}
 	if receipt.Errors == nil {
 		d.Errors = []ErrorRecord{}
 	}

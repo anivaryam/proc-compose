@@ -1,0 +1,23 @@
+processes:
+  prepare:
+    mode: task
+    cmd: python3 prepare.py
+    env: &state
+      APP_DB: ${session.dir}/app.db
+      APP_QUEUE: ${session.dir}/queue
+  api:
+    cmd: python3 build/app.py api
+    depends_on: [prepare]
+    env: *state
+    ports:
+      http: 18100
+    ready_when:
+      http: ${urls.api.http}/health
+  worker:
+    cmd: python3 build/app.py worker
+    depends_on: [prepare]
+    env: *state
+  release:
+    mode: teardown
+    cmd: python3 prepare.py release
+    env: *state

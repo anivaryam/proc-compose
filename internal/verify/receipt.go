@@ -1,10 +1,12 @@
 package verify
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,6 +26,123 @@ const Retention = "runtime-directory; may disappear at logout/reboot"
 
 // AttemptsDir is where a session's receipts live.
 func AttemptsDir(sessionDir string) string { return filepath.Join(sessionDir, "attempts") }
+
+// environmentReportPath is where one attempt's check may write its
+// environment report. It is not a .json file, so ListReceipts skips it.
+func environmentReportPath(sessionDir, attemptID string) string {
+	return filepath.Join(AttemptsDir(sessionDir), attemptID+".environment")
+}
+
+// environmentReport is the file a check writes to
+// PROC_COMPOSE_ENVIRONMENT_REPORT.
+type environmentReport struct {
+	Observations []Observation `json:"observations"`
+}
+
+// readEnvironmentReport loads and validates a check's environment report. A
+// missing file is os.ErrNotExist. Anything but a regular file holding one JSON
+// object, repeated or unknown fields, non-string values, unknown statuses, and
+// empty or duplicate names make the report invalid, so a typo cannot pass as
+// evidence.
+func readEnvironmentReport(path string) ([]Observation, error) {
+	// Opening a FIFO or device the check left there could block or never end.
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("report is not a regular file (%s)", info.Mode().Type())
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, MaxEnvironmentBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxEnvironmentBytes {
+		return nil, fmt.Errorf("report exceeds %d bytes", MaxEnvironmentBytes)
+	}
+	// Decoding null into a struct is a silent no-op.
+	if trimmed := bytes.TrimLeft(data, " \t\r\n"); len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, errors.New("report must be a JSON object")
+	}
+	if err := uniqueMembers(json.NewDecoder(bytes.NewReader(data))); err != nil {
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var report environmentReport
+	if err := dec.Decode(&report); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("report must be exactly one JSON object")
+	}
+	if len(report.Observations) > MaxObservations {
+		return nil, fmt.Errorf("report has %d observations, above the limit of %d", len(report.Observations), MaxObservations)
+	}
+	seen := map[string]bool{}
+	for _, o := range report.Observations {
+		if o.Name == "" || seen[o.Name] {
+			return nil, fmt.Errorf("observation name %q is empty or repeated", o.Name)
+		}
+		seen[o.Name] = true
+		switch o.Status {
+		case ObservationMatched, ObservationMismatched, ObservationUnobserved:
+		default:
+			return nil, fmt.Errorf("observation %q has status %q, want matched, mismatched, or unobserved", o.Name, o.Status)
+		}
+	}
+	// Escaping can grow values when they are re-encoded into the result.
+	if encoded, _ := json.Marshal(report.Observations); len(encoded) > MaxEnvironmentBytes {
+		return nil, fmt.Errorf("observations exceed %d bytes when encoded", MaxEnvironmentBytes)
+	}
+	return report.Observations, nil
+}
+
+// uniqueMembers reads one JSON value and fails if any object in it repeats a
+// member. encoding/json keeps the last value and matches names
+// case-insensitively, so a later "status" or "Status" could turn a mismatch
+// into a match.
+func uniqueMembers(dec *json.Decoder) error {
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	switch token {
+	case json.Delim('{'):
+		var names []string
+		for dec.More() {
+			token, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			name, _ := token.(string)
+			for _, seen := range names {
+				if strings.EqualFold(seen, name) {
+					return fmt.Errorf("member %q is repeated", name)
+				}
+			}
+			names = append(names, name)
+			if err := uniqueMembers(dec); err != nil {
+				return err
+			}
+		}
+	case json.Delim('['):
+		for dec.More() {
+			if err := uniqueMembers(dec); err != nil {
+				return err
+			}
+		}
+	default:
+		return nil
+	}
+	_, err = dec.Token() // the closing delimiter
+	return err
+}
 
 const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 

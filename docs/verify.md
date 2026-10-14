@@ -14,14 +14,15 @@ running instead of reusing or stopping it), starts the selected processes,
 waits for readiness, runs the check, stops everything it started, and records a
 receipt under the session runtime directory. The check after `--` is executed
 directly, never through an implicit shell. It inherits your environment plus
-`PROC_COMPOSE_SESSION`, `PROC_COMPOSE_SESSION_DIR`, `PROC_COMPOSE_RUN_ID`, and
-`PROC_COMPOSE_PORT_<PROCESS>_<PORT>` / `PROC_COMPOSE_URL_<PROCESS>_<PORT>` for
+`PROC_COMPOSE_SESSION`, `PROC_COMPOSE_SESSION_DIR`, `PROC_COMPOSE_RUN_ID`,
+`PROC_COMPOSE_ENVIRONMENT_REPORT` (see [Environment reports](#environment-reports)),
+and `PROC_COMPOSE_PORT_<PROCESS>_<PORT>` / `PROC_COMPOSE_URL_<PROCESS>_<PORT>` for
 every declared named port.
 
 | Exit | Meaning |
 |---|---|
 | 0 | Startup, check, and verified cleanup all passed; receipt persisted |
-| 1 | Startup/readiness, check, required process, cleanup, teardown, or receipt failure |
+| 1 | Startup/readiness, check, [environment](#environment-reports), required process, cleanup, teardown, or receipt failure |
 | 2 | Usage, invalid config, or occupied session (including a crashed run whose process groups may still be running; run `stop` first) — nothing was started |
 | 130 | Interrupted (cleanup still ran) |
 
@@ -71,6 +72,86 @@ same check against two worktrees with separate sessions and reports outcome
 differences; it neither isolates external data nor attributes differences to
 the code change.
 
+## Environment reports
+
+A passing check proves only that the check passed against whatever it reached.
+It can reach a dev server from another worktree, a stale build, a database
+another session shares, or a fixture left over from an earlier attempt, and
+still pass. An environment report lets the check say what it actually
+exercised, and keeps that verdict separate from its own pass or fail.
+
+The check receives `PROC_COMPOSE_ENVIRONMENT_REPORT`, a per-attempt file path.
+To report, it writes one JSON object there:
+
+```json
+{"observations": [
+  {"name": "api.build", "status": "matched", "expected": "sha256:9f…", "observed": "sha256:9f…"},
+  {"name": "db.fixture_run", "status": "mismatched", "expected": "177406-1791…", "observed": "177311-5402…"}
+]}
+```
+
+- `status` is `matched`, `mismatched`, or `unobserved` (the evidence could not
+  be read). `name` is required and unique; `expected` and `observed` are
+  optional strings or `null`. No other fields are allowed, and no field may
+  appear twice in one object (names compare case-insensitively). The report
+  must be a regular file (not a symlink or FIFO) of at most 8 KiB with at most
+  32 observations. Write it atomically (to a temporary file, then rename).
+- The result records it under `environment`: `status` is `eligible` (at least
+  one observation, all `matched`), `ineligible` (any other status), `unknown`
+  with a `reason` (`report_missing`, `report_invalid`, `no_observations`), or
+  `not_run` when the check never started. verify removes the file after it has
+  read it; the receipt and the `--json` response keep its content.
+- An `ineligible` environment fails the attempt with `environment_ineligible`,
+  and an invalid report fails it with `environment_unverified`, with or
+  without a flag. `check.status` still reports only the check's exit, so a real
+  regression reads `check: failed` with `environment: eligible`, and a check
+  aimed at the wrong environment reads `environment: ineligible`.
+- `--require-environment` also fails the attempt with `environment_unverified`
+  when the report is missing or has no observations, so a check that never
+  validated its environment cannot pass.
+- `compare` reports `not_comparable` when an attempt on either side has either
+  environment error, and accepts `--require-environment` for both sides. Each
+  attempt shows its `environment_status`.
+
+The observations are the check's own. proc-compose does not inspect the
+application, and it does not prove isolation or the loaded code. Evidence is
+stronger when it comes from the application's real paths instead of from the
+check's own environment: an `/identity` endpoint that reports the
+`PROC_COMPOSE_RUN_ID` its process received and a digest of the code it
+loaded, a query that reads a fixture marker back through the application's
+own database connection, a worker that stamps the jobs it processes. Echoing
+an environment variable proves nothing.
+
+A setup task can give the services and the check one shared, per-attempt
+expectation without new configuration:
+
+```yaml
+processes:
+  prepare:                       # build, reset + seed, write the expectation
+    mode: task
+    cmd: ./scripts/prepare-env   # stamps the fixture with $PROC_COMPOSE_RUN_ID and
+                                 # writes $PROC_COMPOSE_SESSION_DIR/expected.json
+    env: &state
+      DATABASE_PATH: ${session.dir}/app.db
+      QUEUE_DIR: ${session.dir}/queue
+  api:
+    cmd: ./bin/api
+    depends_on: [prepare]
+    env: *state
+    ports: { http: 3000 }
+    ready_when: { http: '${urls.api.http}/health' }
+```
+
+The check reads `$PROC_COMPOSE_SESSION_DIR/expected.json`, compares the
+API's identity and fixture with it before and after its own assertions, and
+writes the report. `PROC_COMPOSE_RUN_ID` changes on every attempt, and a reused
+session keeps its directory, so a fixture stamped with an earlier run ID shows
+that the reset did not run. Check that a path is inside
+`PROC_COMPOSE_SESSION_DIR` before you delete or reset it, in teardown processes
+too: they run even when setup refused to start.
+[`examples/environment-report`](../examples/environment-report) is a runnable
+version with a pilot of seeded faults and acceptance gates.
+
 ## Recipes
 
 CI (GitHub Actions step):
@@ -79,9 +160,22 @@ CI (GitHub Actions step):
 - name: Verified smoke test
   run: proc-compose verify --json -- npm run test:smoke > verify.json
 - if: always()
+  run: proc-compose why --attempt latest --json > why.json
+- if: always()
   uses: actions/upload-artifact@v4
-  with: { name: verify-receipt, path: verify.json }
+  with:
+    name: verify-evidence
+    path: |
+      verify.json
+      why.json
 ```
+
+`verify.json` is the receipt: startup, check, environment observations with
+their expected values, cleanup, and source provenance. `why.json` is the
+attempt's process history, read from the journal while the runtime directory
+still exists. Together they stay readable after the runner and its runtime
+directory are gone. Add any expectation file your check used; the check runs
+with your environment, so it can copy it to a directory you name.
 
 Agent tool action or worktree setup script:
 

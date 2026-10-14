@@ -4,6 +4,7 @@ package verify
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/paths"
@@ -99,5 +101,36 @@ func TestVerify_RefusesCrashedRunRecord(t *testing.T) {
 	}
 	if held, _ := session.InstanceHeld(opts.Hash); held {
 		t.Fatal("refusal kept the instance lease")
+	}
+}
+
+// TestReadEnvironmentReport_RefusesNonRegularFiles: a FIFO or a symlink the
+// check leaves at the report path is invalid evidence, and reading it must not
+// block verify.
+func TestReadEnvironmentReport_RefusesNonRegularFiles(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte(eligibleReport), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{fifo, link} {
+		done := make(chan error, 1)
+		go func() { _, err := readEnvironmentReport(path); done <- err }()
+		select {
+		case err := <-done:
+			if err == nil || errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s: err = %v, want an invalid report", filepath.Base(path), err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: reading the report blocked", filepath.Base(path))
+		}
 	}
 }

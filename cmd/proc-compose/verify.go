@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -41,6 +42,7 @@ func newVerifyCommand(configFile *string) *cobra.Command {
 	var (
 		machine        bool
 		streamLogs     bool
+		requireEnv     bool
 		dir            string
 		startupTimeout string
 		checkTimeout   string
@@ -60,12 +62,20 @@ PROC_COMPOSE_SESSION_DIR, PROC_COMPOSE_RUN_ID and, for each declared named
 port, PROC_COMPOSE_PORT_<PROCESS>_<PORT> and PROC_COMPOSE_URL_<PROCESS>_<PORT>.
 It runs in the config directory unless --dir is given (relative to it).
 
+The check may write an environment report, a JSON object
+{"observations": [{"name", "status", "expected", "observed"}]} with status
+matched, mismatched, or unobserved, to the path in
+PROC_COMPOSE_ENVIRONMENT_REPORT. It is recorded under environment in the
+result. Any observation that did not match, or an invalid report, fails the
+attempt; --require-environment also fails it when the report is missing or
+empty. The observations are the check's own; proc-compose does not verify them.
+
 The target session must not already be running; verify refuses rather than
 reusing or stopping it. Receipts live under the session runtime directory
 (attempts/<attempt_id>.json) and may disappear at logout or reboot.
 
-Exit status: 0 passed; 1 failed (startup, check, required process, cleanup,
-or receipt persistence); 2 usage, configuration, or occupied session before
+Exit status: 0 passed; 1 failed (startup, check, environment, required
+process, cleanup, or receipt persistence); 2 usage, configuration, or occupied session before
 anything started; 130 interrupted. With --json, stdout is exactly one JSON
 object (kind verify.response, or verify.compact_error if the full result
 cannot fit 64 KiB). Process output streams to stderr in human mode; with
@@ -88,12 +98,13 @@ Default budgets (unmeasured policy): startup 120s (1s-10m), check 10m
 			}
 			stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 			opts := verify.Options{
-				Session:     sessionName,
-				Selectors:   selectors,
-				Argv:        argv,
-				Dir:         dir,
-				ToolVersion: version,
-				Log:         stderr,
+				Session:            sessionName,
+				Selectors:          selectors,
+				Argv:               argv,
+				Dir:                dir,
+				ToolVersion:        version,
+				Log:                stderr,
+				RequireEnvironment: requireEnv,
 			}
 			if !machine || streamLogs {
 				opts.ProcessOutput = stderr
@@ -128,6 +139,7 @@ Default budgets (unmeasured policy): startup 120s (1s-10m), check 10m
 	usageFlagErrors(command)
 	command.Flags().BoolVar(&machine, "json", false, "emit exactly one JSON result object on stdout")
 	command.Flags().BoolVar(&streamLogs, "stream-logs", false, "with --json, also stream process output to stderr (default: journal only)")
+	addRequireEnvironmentFlag(command, &requireEnv)
 	addBudgetFlags(command, &dir, &startupTimeout, &checkTimeout, &cleanupTimeout)
 	return command
 }
@@ -187,6 +199,7 @@ func printVerifyHuman(w io.Writer, r *verify.Result) {
 		fmt.Fprint(w, " (timed out)")
 	}
 	fmt.Fprintf(w, "  %s\n", strings.Join(r.Check.Argv, " "))
+	printEnvironmentHuman(w, r.Environment)
 	fmt.Fprintf(w, "  cleanup:  %s (signalling authority %s)\n", r.Cleanup.Status, r.Cleanup.SignalingAuthority)
 	for _, u := range r.Cleanup.UnresolvedProcesses {
 		fmt.Fprintf(w, "    unresolved: %s (%s)\n", u.Name, u.Identity)
@@ -212,6 +225,43 @@ func printVerifyHuman(w io.Writer, r *verify.Result) {
 		}
 		fmt.Fprintf(w, "  source:   %s%s — provenance only; loaded code is not proven\n", *r.Source.Revision, dirty)
 	}
+}
+
+// printEnvironmentHuman prints the environment verdict when the check reported
+// one or the attempt required it. Receipts from before environment reports
+// have no status and print nothing.
+func printEnvironmentHuman(w io.Writer, env verify.Environment) {
+	reported := env.Status == verify.EnvironmentEligible || env.Status == verify.EnvironmentIneligible ||
+		(env.Reason != nil && *env.Reason != verify.ReasonReportMissing)
+	if env.Status == "" || !(env.Required || reported) {
+		return
+	}
+	fmt.Fprintf(w, "  environment: %s", env.Status)
+	if env.Reason != nil {
+		fmt.Fprintf(w, " (%s)", *env.Reason)
+	}
+	if env.Required {
+		fmt.Fprint(w, " [required]")
+	}
+	fmt.Fprintln(w)
+	for _, o := range env.Observations {
+		if o.Status == verify.ObservationMatched {
+			continue
+		}
+		fmt.Fprintf(w, "    %s %s: expected %s, observed %s\n", o.Name, o.Status, orNone(o.Expected), orNone(o.Observed))
+	}
+}
+
+func orNone(value *string) string {
+	if value == nil {
+		return "(none)"
+	}
+	return strconv.Quote(*value)
+}
+
+// addRequireEnvironmentFlag registers --require-environment for verify and compare.
+func addRequireEnvironmentFlag(command *cobra.Command, target *bool) {
+	command.Flags().BoolVar(target, "require-environment", false, "fail unless the check reports an eligible environment to PROC_COMPOSE_ENVIRONMENT_REPORT")
 }
 
 // parseBudgets parses phase budget flags. Range checks belong to the

@@ -64,6 +64,12 @@ func helper(mode, arg string) int {
 		d, _ := time.ParseDuration(arg)
 		time.Sleep(d)
 		return 0
+	case "report":
+		if err := os.WriteFile(os.Getenv("PROC_COMPOSE_ENVIRONMENT_REPORT"), []byte(arg), 0600); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 5
+		}
+		return 0
 	}
 	return 99
 }
@@ -136,7 +142,7 @@ func assertComplete(t *testing.T, result *Result) map[string]any {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"schema_version", "kind", "state", "attempt_id", "status", "phase", "session", "run_id", "config_path", "config_sha256", "workdir", "source", "tool_version", "selected_processes", "endpoints", "startup", "check", "cleanup", "evidence", "errors", "exit_code", "precedence", "receipt_path", "receipt_persisted", "retention", "started_at", "finished_at"} {
+	for _, key := range []string{"schema_version", "kind", "state", "attempt_id", "status", "phase", "session", "run_id", "config_path", "config_sha256", "workdir", "source", "tool_version", "selected_processes", "endpoints", "startup", "check", "environment", "cleanup", "evidence", "errors", "exit_code", "precedence", "receipt_path", "receipt_persisted", "retention", "started_at", "finished_at"} {
 		if _, ok := fields[key]; !ok {
 			t.Errorf("result omits %q", key)
 		}
@@ -378,6 +384,14 @@ func TestRun_StartupTimeoutSkipsCheckAndCleansUp(t *testing.T) {
 		t.Fatalf("cleanup = %+v", result.Cleanup)
 	}
 	assertGone(t, pidFromFile(t, f.pidFile))
+
+	// A check that never ran reports no environment, and a required one adds
+	// no error beyond the startup failure itself.
+	opts.RequireEnvironment = true
+	result = Run(context.Background(), opts)
+	if result.Environment.Status != StatusNotRun || !result.Environment.Required || len(result.Errors) != 1 || result.Errors[0].Code != CodeStartupTimeout {
+		t.Fatalf("environment after startup timeout = %+v errors %v", result.Environment, result.Errors)
+	}
 }
 
 func TestRun_CheckFailuresAndTimeoutKeepPhaseFacts(t *testing.T) {
@@ -755,6 +769,9 @@ func TestEncode_CompactErrorNeverReportsSuccess(t *testing.T) {
 	if out["kind"] != KindCompactError || out["status"] != StatusFailed || out["exit_code"] != float64(ExitFailed) || out["attempt_state"] != StateIndeterminate || out["terminal_receipt_persisted"] != false {
 		t.Fatalf("compact = %v", out)
 	}
+	if phases := out["phase_statuses"].(map[string]any); phases["environment"] != StatusNotRun {
+		t.Fatalf("phase_statuses = %v", phases)
+	}
 	identity := out["identity"].(map[string]any)
 	if identity["complete"] != false || len(identity["omitted_fields"].([]any)) == 0 || !strings.HasPrefix(identity["session_sha256"].(string), "sha256:") {
 		t.Fatalf("identity = %v", identity)
@@ -923,6 +940,154 @@ func TestCompare_ReportsDifferencesWithoutAttribution(t *testing.T) {
 	}
 	if bad := Compare(context.Background(), b, c, 0); bad.ExitCode != ExitUsage {
 		t.Fatalf("repeat 0 = %+v", bad)
+	}
+}
+
+const (
+	eligibleReport   = `{"observations":[{"name":"api.build","status":"matched","expected":"b1","observed":"b1"},{"name":"db.fixture","status":"matched"}]}`
+	ineligibleReport = `{"observations":[{"name":"api.build","status":"mismatched","expected":"b2","observed":"b1"},{"name":"db.fixture","status":"unobserved","expected":"run-1","observed":null}]}`
+)
+
+// TestRun_EnvironmentReportVerdicts pins how the check's environment report
+// changes the attempt: a mismatch or invalid report always fails it, a
+// missing or empty one only when required, and the semantic check status is
+// kept as its own fact.
+func TestRun_EnvironmentReportVerdicts(t *testing.T) {
+	f := newFixture(t, serviceConfig)
+	cases := []struct {
+		name, mode, arg string
+		required        bool
+		status, reason  string
+		errs            []string
+	}{
+		{"eligible", "report", eligibleReport, true, EnvironmentEligible, "", nil},
+		{"ineligible", "report", ineligibleReport, false, EnvironmentIneligible, "", []string{CodeEnvironmentIneligible}},
+		{"missing optional", "exit", "0", false, EnvironmentUnknown, ReasonReportMissing, nil},
+		{"missing required", "exit", "0", true, EnvironmentUnknown, ReasonReportMissing, []string{CodeEnvironmentUnverified}},
+		{"empty required", "report", `{"observations":[]}`, true, EnvironmentUnknown, ReasonNoObservations, []string{CodeEnvironmentUnverified}},
+		{"invalid optional", "report", `{"eligible":true,"observations":[]}`, false, EnvironmentUnknown, ReasonReportInvalid, []string{CodeEnvironmentUnverified}},
+		{"null optional", "report", `null`, false, EnvironmentUnknown, ReasonReportInvalid, []string{CodeEnvironmentUnverified}},
+		{"repeated status required", "report", `{"observations":[{"name":"a","status":"mismatched","status":"matched"}]}`, true, EnvironmentUnknown, ReasonReportInvalid, []string{CodeEnvironmentUnverified}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withHelper(t, tc.mode)
+			opts := f.options(t, "env", checkArgv(tc.mode, tc.arg)...)
+			opts.RequireEnvironment = tc.required
+			result := Run(context.Background(), opts)
+			assertComplete(t, result)
+			env := result.Environment
+			reason := ""
+			if env.Reason != nil {
+				reason = *env.Reason
+			}
+			if env.Status != tc.status || reason != tc.reason || env.Required != tc.required {
+				t.Fatalf("environment = %+v reason %q", env, reason)
+			}
+			var codes []string
+			for _, record := range result.Errors {
+				codes = append(codes, record.Code)
+			}
+			if strings.Join(codes, ",") != strings.Join(tc.errs, ",") {
+				t.Fatalf("errors = %v, want %v", codes, tc.errs)
+			}
+			wantStatus, wantExit := StatusPassed, ExitPassed
+			if len(tc.errs) > 0 {
+				wantStatus, wantExit = StatusFailed, ExitFailed
+			}
+			if result.Status != wantStatus || result.ExitCode != wantExit || result.Check.Status != StatusPassed {
+				t.Fatalf("status %s exit %d check %s", result.Status, result.ExitCode, result.Check.Status)
+			}
+			receipt, err := ReadReceipt(*result.ReceiptPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if receipt.Environment.Status != tc.status || len(receipt.Environment.Observations) != len(env.Observations) {
+				t.Fatalf("receipt environment = %+v", receipt.Environment)
+			}
+			if tc.mode == "report" && tc.status != EnvironmentUnknown && (len(env.Observations) != 2 || env.Observations[0].Name != "api.build") {
+				t.Fatalf("observations = %+v", env.Observations)
+			}
+			// The receipt carries the report; the file itself is removed.
+			if _, err := os.Stat(environmentReportPath(filepath.Dir(filepath.Dir(*result.ReceiptPath)), *result.AttemptID)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("report file left behind: %v", err)
+			}
+		})
+	}
+}
+
+func TestReadEnvironmentReport_RejectsMalformedEvidence(t *testing.T) {
+	dir := t.TempDir()
+	many := make([]string, MaxObservations+1)
+	for i := range many {
+		many[i] = fmt.Sprintf(`{"name":"o%d","status":"matched"}`, i)
+	}
+	for name, body := range map[string]string{
+		"not json":           `observations`,
+		"top-level null":     `null`,
+		"top-level array":    `[{"observations":[]}]`,
+		"repeated status":    `{"observations":[{"name":"a","status":"mismatched","status":"matched"}]}`,
+		"case-folded status": `{"observations":[{"name":"a","status":"mismatched","Status":"matched"}]}`,
+		"repeated list":      `{"observations":[{"name":"a","status":"mismatched"}],"observations":[{"name":"a","status":"matched"}]}`,
+		"unknown field":      `{"observations":[],"eligible":true}`,
+		"unknown obs field":  `{"observations":[{"name":"a","status":"matched","note":"x"}]}`,
+		"trailing value":     `{"observations":[]} {}`,
+		"number value":       `{"observations":[{"name":"a","status":"matched","expected":1}]}`,
+		"empty name":         `{"observations":[{"name":"","status":"matched"}]}`,
+		"duplicate name":     `{"observations":[{"name":"a","status":"matched"},{"name":"a","status":"matched"}]}`,
+		"unknown status":     `{"observations":[{"name":"a","status":"ok"}]}`,
+		"too many":           `{"observations":[` + strings.Join(many, ",") + `]}`,
+		"oversized file":     `{"observations":[]}` + strings.Repeat(" ", MaxEnvironmentBytes),
+		"oversized encoding": `{"observations":[{"name":"a","status":"matched","expected":"` + strings.Repeat("<", MaxEnvironmentBytes/2) + `"}]}`,
+	} {
+		path := filepath.Join(dir, "report")
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readEnvironmentReport(path); err == nil {
+			t.Errorf("%s: accepted %.80q", name, body)
+		}
+	}
+	if _, err := readEnvironmentReport(filepath.Join(dir, "absent")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing report error = %v", err)
+	}
+	path := filepath.Join(dir, "report")
+	if err := os.WriteFile(path, []byte(ineligibleReport+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	observations, err := readEnvironmentReport(path)
+	if err != nil || len(observations) != 2 || observations[1].Observed != nil || *observations[0].Expected != "b2" {
+		t.Fatalf("valid report = %+v err %v", observations, err)
+	}
+}
+
+// TestCompare_EnvironmentMismatchIsNotComparable: a side whose check reports
+// the wrong environment cannot be compared, even though both checks exit 0.
+func TestCompare_EnvironmentMismatchIsNotComparable(t *testing.T) {
+	base := newFixture(t, serviceConfig)
+	cand := newFixture(t, serviceConfig)
+	withHelper(t, "report")
+	b, c := base.options(t, "env-baseline", checkArgv("report", eligibleReport)...), cand.options(t, "env-candidate", checkArgv("report", ineligibleReport)...)
+	result := Compare(context.Background(), b, c, 1)
+	if result.Status != "not_comparable" || result.ExitCode != ExitFailed || result.OutcomesEqual != nil {
+		t.Fatalf("comparison = %+v", result)
+	}
+	if len(result.Errors) != 1 || result.Errors[0].Code != CodeEnvironmentIneligible {
+		t.Fatalf("errors = %v", result.Errors)
+	}
+	if got := result.Sides["candidate"].Attempts[0].EnvironmentStatus; got != EnvironmentIneligible {
+		t.Fatalf("candidate environment_status = %q", got)
+	}
+	if got := result.Sides["baseline"].Attempts[0].EnvironmentStatus; got != EnvironmentEligible {
+		t.Fatalf("baseline environment_status = %q", got)
+	}
+
+	// Required: a side that reports nothing is not comparable either.
+	withHelper(t, "exit")
+	b.Argv, c.Argv = checkArgv("exit", "0"), checkArgv("exit", "0")
+	b.RequireEnvironment, c.RequireEnvironment = true, true
+	if silent := Compare(context.Background(), b, c, 1); silent.Status != "not_comparable" || len(silent.Errors) != 1 || silent.Errors[0].Code != CodeEnvironmentUnverified {
+		t.Fatalf("required but unreported comparison = %+v", silent)
 	}
 }
 
