@@ -18,7 +18,7 @@ import (
 
 func newCompareCommand(configFile *string) *cobra.Command {
 	var (
-		machine, streamLogs              bool
+		machine, streamLogs, requireEnv  bool
 		baseline, candidate              string
 		repeat                           int
 		dir, startup, check, cleanupFlag string
@@ -35,6 +35,9 @@ Each worktree must contain the config named by -f (its base name). Sides run
 one after another, alternating which goes first on each repetition; the check
 receives PROC_COMPOSE_COMPARE_SIDE (baseline|candidate) and
 PROC_COMPOSE_COMPARE_REPETITION so it can select explicitly isolated data.
+An attempt whose check reports a mismatched environment (see verify --help),
+or, with --require-environment, does not report an eligible one, makes the
+comparison not comparable.
 proc-compose does not isolate databases or external services itself, and it
 never attributes a difference to the code change; both are reported as
 limitations.
@@ -70,7 +73,7 @@ verified cleanup) — read outcomes_equal for the verdict; 1 not comparable;
 				if err != nil {
 					return verify.Options{}, err
 				}
-				opts := verify.Options{ConfigPath: config, Session: sideSession, Hash: hash, Selectors: selectors, Argv: argv, Dir: dir, ToolVersion: version, Log: stderr}
+				opts := verify.Options{ConfigPath: config, Session: sideSession, Hash: hash, Selectors: selectors, Argv: argv, Dir: dir, ToolVersion: version, Log: stderr, RequireEnvironment: requireEnv}
 				if !machine || streamLogs {
 					opts.ProcessOutput = stderr
 				}
@@ -106,6 +109,7 @@ verified cleanup) — read outcomes_equal for the verdict; 1 not comparable;
 	command.Flags().StringVar(&baseline, "baseline", "", "baseline worktree directory")
 	command.Flags().StringVar(&candidate, "candidate", "", "candidate worktree directory")
 	command.Flags().IntVar(&repeat, "repeat", 1, fmt.Sprintf("attempts per side (1-%d); alternates order each repetition", verify.MaxCompareRepeat))
+	addRequireEnvironmentFlag(command, &requireEnv)
 	addBudgetFlags(command, &dir, &startup, &check, &cleanupFlag)
 	return command
 }
@@ -131,7 +135,7 @@ func renderComparison(w io.Writer, c *verify.Comparison, machine bool) error {
 				if a.CheckExitCode != nil {
 					exit = fmt.Sprint(*a.CheckExitCode)
 				}
-				fmt.Fprintf(w, "    %s check=%s exit=%s cleanup=%s\n", a.Status, a.CheckStatus, exit, a.CleanupStatus)
+				fmt.Fprintf(w, "    %s check=%s exit=%s environment=%s cleanup=%s\n", a.Status, a.CheckStatus, exit, a.EnvironmentStatus, a.CleanupStatus)
 			}
 		}
 		for _, d := range c.Differences {

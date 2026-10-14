@@ -41,21 +41,23 @@ type SideSummary struct {
 }
 
 type AttemptOutcome struct {
-	AttemptID        *string       `json:"attempt_id"`
-	Status           string        `json:"status"`
-	ExitCode         int           `json:"exit_code"`
-	StartupStatus    string        `json:"startup_status"`
-	CheckStatus      string        `json:"check_status"`
-	CheckExitCode    *int          `json:"check_exit_code"`
-	StdoutSHA256     string        `json:"stdout_sha256"`
-	StderrSHA256     string        `json:"stderr_sha256"`
-	StdoutExcerpt    string        `json:"stdout_excerpt"`
-	OutputTruncated  bool          `json:"output_truncated"`
-	CheckMs          *int64        `json:"check_ms"`
-	CleanupStatus    string        `json:"cleanup_status"`
-	ReceiptPath      *string       `json:"receipt_path"`
-	ReceiptPersisted bool          `json:"receipt_persisted"`
-	Errors           []ErrorRecord `json:"errors"`
+	AttemptID       *string `json:"attempt_id"`
+	Status          string  `json:"status"`
+	ExitCode        int     `json:"exit_code"`
+	StartupStatus   string  `json:"startup_status"`
+	CheckStatus     string  `json:"check_status"`
+	CheckExitCode   *int    `json:"check_exit_code"`
+	StdoutSHA256    string  `json:"stdout_sha256"`
+	StderrSHA256    string  `json:"stderr_sha256"`
+	StdoutExcerpt   string  `json:"stdout_excerpt"`
+	OutputTruncated bool    `json:"output_truncated"`
+	CheckMs         *int64  `json:"check_ms"`
+	CleanupStatus   string  `json:"cleanup_status"`
+	// EnvironmentStatus is the check's environment verdict (environment.status).
+	EnvironmentStatus string        `json:"environment_status"`
+	ReceiptPath       *string       `json:"receipt_path"`
+	ReceiptPersisted  bool          `json:"receipt_persisted"`
+	Errors            []ErrorRecord `json:"errors"`
 }
 
 // outcomeKey is the observable outcome compared across sides.
@@ -67,7 +69,7 @@ type outcomeKey struct {
 func outcomeOf(r *Result) AttemptOutcome {
 	o := AttemptOutcome{AttemptID: r.AttemptID, Status: r.Status, ExitCode: r.ExitCode, StartupStatus: r.Startup.Status, CheckStatus: r.Check.Status, CheckExitCode: r.Check.ExitCode,
 		StdoutSHA256: digest([]byte(r.Check.Stdout)), StderrSHA256: digest([]byte(r.Check.Stderr)), StdoutExcerpt: truncateUTF8(r.Check.Stdout, 1024), OutputTruncated: r.Check.OutputTruncated,
-		CleanupStatus: r.Cleanup.Status, ReceiptPath: r.ReceiptPath, ReceiptPersisted: r.ReceiptPersisted, Errors: r.Errors}
+		CleanupStatus: r.Cleanup.Status, EnvironmentStatus: r.Environment.Status, ReceiptPath: r.ReceiptPath, ReceiptPersisted: r.ReceiptPersisted, Errors: r.Errors}
 	if r.Check.StartedAt != nil && r.Check.FinishedAt != nil {
 		start, err1 := time.Parse(time.RFC3339Nano, *r.Check.StartedAt)
 		end, err2 := time.Parse(time.RFC3339Nano, *r.Check.FinishedAt)
@@ -144,7 +146,13 @@ func Compare(ctx context.Context, baseline, candidate Options, repeat int) *Comp
 				comparable = false
 			}
 			for _, record := range r.Errors {
-				if record.Code == CodeCleanupUnverified || record.Code == CodeReceiptPersistence || record.Code == CodeStartupFailed || record.Code == CodeStartupTimeout || record.Code == CodeCheckStartFailed {
+				switch record.Code {
+				case CodeEnvironmentIneligible, CodeEnvironmentUnverified:
+					// The check did not establish that it exercised the
+					// intended environment, so its outcome is not comparable.
+					comparable = false
+					errs[record.Code] += record.Count
+				case CodeCleanupUnverified, CodeReceiptPersistence, CodeStartupFailed, CodeStartupTimeout, CodeCheckStartFailed:
 					errs[record.Code] += record.Count
 				}
 			}

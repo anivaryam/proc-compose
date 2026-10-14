@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Environment reports for `verify` and `compare`. The check receives
+  `PROC_COMPOSE_ENVIRONMENT_REPORT`, a per-attempt path where it can write
+  `{"observations": [{"name", "status", "expected", "observed"}]}` with status
+  `matched`, `mismatched` or `unobserved`, to say whether it exercised the
+  intended build, endpoints and data. Results and receipts gain an
+  `environment` object (`required`, `status`, `reason`, `observations`) with
+  status `eligible`, `ineligible`, `unknown` or `not_run`, kept separate from
+  `check.status`. An `ineligible` environment fails the attempt with
+  `environment_ineligible`; an invalid report fails it with
+  `environment_unverified`. `--require-environment` also fails an attempt whose
+  check writes no report or no observations. `compare` reports
+  `not_comparable` when any attempt has either environment error, passes
+  `--require-environment` to both sides, and shows each attempt's
+  `environment_status`. `verify.compact_error` lists `environment` among its
+  `phase_statuses`, and `why --attempt` lists it among its phases. Receipts
+  written by earlier versions have no environment status. The observations are
+  the check's own; proc-compose does not verify them. A report that is not one
+  JSON object, or that repeats a field in any object, is invalid.
+- `examples/environment-report`: a runnable stateful example (API, worker,
+  SQLite, file queue) whose check reports its environment, with a pilot of
+  seeded faults and acceptance gates, and an evidence export that is read after
+  the runtime directory is removed. The CI recipe in `docs/verify.md` now also
+  keeps `why --attempt` output.
+
 ## [1.7.0] - 2026-10-13
 
 ### Added

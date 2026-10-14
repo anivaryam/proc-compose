@@ -60,7 +60,10 @@ type Options struct {
 	// it; the journal and the result still keep the evidence.
 	ProcessOutput io.Writer
 	ExtraEnv      map[string]string // extra check variables; generated session variables win
-	Now           func() time.Time
+	// RequireEnvironment fails the attempt unless the check reports an
+	// eligible environment through PROC_COMPOSE_ENVIRONMENT_REPORT.
+	RequireEnvironment bool
+	Now                func() time.Time
 
 	// writeReceipt is a test seam; nil uses WriteReceipt.
 	writeReceipt func(path string, result *Result) error
@@ -121,6 +124,7 @@ func newResult(opts Options, started time.Time) *Result {
 		Endpoints:         map[string]Endpoint{},
 		Startup:           Startup{Status: StatusNotRun, Validation: StatusNotRun, ReadinessObservations: []ReadinessObservation{}, UnprobedProcesses: []string{}, Errors: []ErrorRecord{}},
 		Check:             Check{Status: StatusNotRun, Argv: []string{}},
+		Environment:       Environment{Required: opts.RequireEnvironment, Status: StatusNotRun, Observations: []Observation{}},
 		Cleanup:           Cleanup{Status: StatusNotNeeded, SignalingAuthority: "none", UnresolvedProcesses: []UnresolvedProcess{}, Errors: []ErrorRecord{}, Teardown: []TeardownRecord{}},
 		Evidence:          Evidence{ExcerptStatus: "not_collected", Events: []EvidenceEvent{}},
 		Errors:            []ErrorRecord{},
@@ -479,6 +483,7 @@ func (a *attempt) startAndCheck(ctx context.Context) {
 	close(monitorStop)
 	failedRequired := <-monitorDone
 	a.recordCheck(check, ctx, checkCtx)
+	a.recordEnvironment(check.Started)
 	for range failedRequired {
 		a.errs.Add(CodeRequiredFailed)
 	}
@@ -717,6 +722,47 @@ func (a *attempt) recordCheck(check runner.CheckResult, parent, checkCtx context
 	}
 }
 
+// recordEnvironment reads the check's environment report and applies its
+// verdict. A mismatch or an invalid report always fails the attempt; a missing
+// or empty report fails it only when the environment is required. A check
+// that never started leaves the environment not_run: its own failure is
+// already recorded.
+func (a *attempt) recordEnvironment(started bool) {
+	env := &a.result.Environment
+	if !started {
+		return
+	}
+	path := environmentReportPath(a.plan.Project.Directory, *a.result.AttemptID)
+	observations, err := readEnvironmentReport(path)
+	// The receipt now carries the report; the file would only accumulate.
+	_ = os.Remove(path)
+	unknown := func(reason string) {
+		env.Status, env.Reason = EnvironmentUnknown, ptr(reason)
+		if env.Required || reason == ReasonReportInvalid {
+			a.errs.Add(CodeEnvironmentUnverified)
+		}
+	}
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		unknown(ReasonReportMissing)
+	case err != nil:
+		fmt.Fprintf(a.opts.Log, "verify: environment report: %v\n", err)
+		unknown(ReasonReportInvalid)
+	case len(observations) == 0:
+		unknown(ReasonNoObservations)
+	default:
+		env.Observations, env.Status = observations, EnvironmentEligible
+		for _, o := range observations {
+			if o.Status != ObservationMatched {
+				env.Status = EnvironmentIneligible
+			}
+		}
+		if env.Status == EnvironmentIneligible {
+			a.errs.Add(CodeEnvironmentIneligible)
+		}
+	}
+}
+
 // beginCleanup marks the first cleanup trigger, which starts the independent
 // cleanup budget, and returns its absolute deadline. Later calls keep the
 // first trigger's deadline.
@@ -929,9 +975,10 @@ func (a *attempt) checkEnv() map[string]string {
 		env[key] = value
 	}
 	for key, value := range map[string]string{
-		"PROC_COMPOSE_SESSION":     a.result.Session,
-		"PROC_COMPOSE_SESSION_DIR": project.Directory,
-		"PROC_COMPOSE_RUN_ID":      project.RunID,
+		"PROC_COMPOSE_SESSION":            a.result.Session,
+		"PROC_COMPOSE_SESSION_DIR":        project.Directory,
+		"PROC_COMPOSE_RUN_ID":             project.RunID,
+		"PROC_COMPOSE_ENVIRONMENT_REPORT": environmentReportPath(project.Directory, *a.result.AttemptID),
 	} {
 		env[key] = value
 	}
