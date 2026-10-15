@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Probe owner attribution (Linux and Windows). An `http` or `tcp` readiness
+  probe or health check passes when any process answers at its address, so a
+  server already listening there (another worktree's dev server on a
+  hardcoded port, a stale run) made a process ready before it had bound
+  anything. proc-compose now records who answered each `http` or `tcp`
+  readiness probe and health check. As soon as each attempt's connection is
+  established, before its request is sent, it finds the server side of that
+  connection and the process holding it (procfs on Linux; the TCP table on
+  Windows), then compares that process with the incarnation's process group
+  or Job Object: `owned`, `foreign` (with the holder's `pid` and process
+  name; only for a process of the same user) or `unattributable` (with a
+  `reason`; also for another user's process, which is never named, and for a
+  server outside this network namespace, such as a container address). `status --json` shows
+  `readiness_owner` and `health_owner`; `verify` readiness observations gain
+  `owner`, and human `verify` output prints a warning for a foreign one. A
+  foreign answer logs `readiness.foreign_listener` or
+  `health.foreign_listener` (warn). The named processes are only observed,
+  never signalled, and only their process name is read. macOS reports
+  `unattributable`. Receipts written by earlier versions have `owner: null`.
+- `foreign_listener` process field: `allow` (the default) keeps the behavior
+  above, where attribution only reports. `reject` makes an `http` or `tcp`
+  probe attempt answered by a foreign process count as failed: readiness
+  keeps waiting for the process's own server and, at `ready_timeout`, fails
+  with an error naming the holder; a health check counts as failed. An
+  `unattributable` answer is never refused. It requires an `http` or `tcp`
+  `ready_when` or `health_when`.
+
+### Changed
+
+- `http` probes and health checks no longer reuse connections: every
+  attempt opens its own, so who answered it can be attributed, and a
+  refused answer's connection is never used again.
+
+### Fixed
+
+- The configuration docs said `http` and `tcp` readiness probes poll every 3
+  seconds. They make their first attempt at once and retry about once a
+  second; 3 seconds is the progress-message interval.
+
 ## [1.8.0] - 2026-10-14
 
 ### Added

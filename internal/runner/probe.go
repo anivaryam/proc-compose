@@ -7,28 +7,35 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
-// httpClient is shared across all HTTP probes to benefit from connection reuse.
-var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
-	Transport: &http.Transport{
-		MaxIdleConns:        10,
-		IdleConnTimeout:     30 * time.Second,
-		DisableKeepAlives:   false,
-		MaxIdleConnsPerHost: 5,
-	},
-}
+// probeAttributor attributes the connection a probe attempt has just dialed,
+// before anything is sent on it. Every attempt dials its own connection and
+// is attributed this way, so the result describes the socket that will carry
+// the answer while it is still open: the server cannot yet have answered,
+// closed it, or left its port to a successor, and a refused connection is
+// never reused by a later attempt. A nil probeAttributor attributes nothing.
+type probeAttributor func(probeConn) *ipc.EndpointOwner
 
-// probeHTTP polls url with GET requests until a 2xx response, ctx cancellation,
-// or timeout (when timeout > 0). Returns true on 2xx, false on timeout or
-// cancellation. Callers should check ctx.Err() to distinguish those two cases.
+// probeAccept judges who answered an attempt that got an answer (nil when
+// the attempt was not attributed). A non-nil error rejects the answer: the
+// attempt counts as failed with that error and the poll continues. A nil
+// probeAccept accepts every answer.
+type probeAccept func(*ipc.EndpointOwner) error
+
+// probeHTTP polls url with GET requests until a 2xx response that accept
+// takes, ctx cancellation, or timeout (when timeout > 0). Returns true on
+// success, false on timeout or cancellation. Callers should check ctx.Err()
+// to distinguish those two cases. On a timeout whose last attempt was
+// rejected by accept, rejected is that rejection.
 // progressFn is called every 3 seconds with elapsed duration while probe is running.
-func probeHTTP(ctx context.Context, url string, timeout time.Duration, logFn func(string), progressFn func(string)) bool {
+func probeHTTP(ctx context.Context, url string, timeout time.Duration, logFn func(string), progressFn func(string), attribute probeAttributor, accept probeAccept) (ok bool, rejected string) {
 	deadline := deadlineFor(timeout)
 	failures := 0
 	elapsed := time.Duration(0)
@@ -42,15 +49,21 @@ func probeHTTP(ctx context.Context, url string, timeout time.Duration, logFn fun
 	}
 
 	for {
-		err := httpOnce(ctx, url)
+		owner, err := httpOnce(ctx, url, attribute)
+		rejected = ""
+		if err == nil && accept != nil {
+			if err = accept(owner); err != nil {
+				rejected = err.Error()
+			}
+		}
 		if err == nil {
-			return true
+			return true, ""
 		}
 		if errors.Is(err, errBadProbeURL) {
 			if logFn != nil {
 				logFn(fmt.Sprintf("probe http %s: %v", url, err))
 			}
-			return false
+			return false, ""
 		}
 		failures++
 		if logFn != nil && failures > 5 {
@@ -60,11 +73,11 @@ func probeHTTP(ctx context.Context, url string, timeout time.Duration, logFn fun
 			if logFn != nil {
 				logFn(fmt.Sprintf("probe http %s: timed out after %s", url, timeout))
 			}
-			return false
+			return false, rejected
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return false, ""
 		case <-ticker.C:
 			elapsed = time.Since(start)
 			if progressFn != nil {
@@ -88,40 +101,87 @@ func probeHTTP(ctx context.Context, url string, timeout time.Duration, logFn fun
 var errBadProbeURL = errors.New("bad URL")
 
 // httpOnce sends one GET to url and returns nil on a 2xx response. It is the
-// single attempt shared by the readiness poll and health checks.
-func httpOnce(ctx context.Context, url string) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return fmt.Errorf("%w: %v", errBadProbeURL, err)
+// single attempt shared by the readiness poll and health checks. The request
+// travels on a connection of its own (keep-alives are off and the transport
+// lives for this attempt only), attributed as soon as it is dialed. The
+// attribution travels on the connection itself, so it is read on this
+// goroutine when the request gets that connection, and a dial that finishes
+// after the request was cancelled writes nothing httpOnce reads; owner is the
+// attribution of the connection that carried the answer (the last one when a
+// redirect was followed). Requests never go through a proxy.
+func httpOnce(ctx context.Context, url string, attribute probeAttributor) (*ipc.EndpointOwner, error) {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil || attribute == nil {
+				return conn, err
+			}
+			c, ok := probeConnOf(conn)
+			if !ok {
+				return conn, nil
+			}
+			return &attributedConn{Conn: conn, owner: attribute(c)}, nil
+		},
 	}
-	resp, err := httpClient.Do(req)
+	defer transport.CloseIdleConnections()
+	var owner *ipc.EndpointOwner
+	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { owner = connOwner(info.Conn) }}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), "GET", url, nil)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("%w: %v", errBadProbeURL, err)
 	}
-	// Drain body so the connection can be reused on the next poll.
-	// Without this every probe opens a fresh TCP/TLS connection.
+	resp, err := (&http.Client{Timeout: 10 * time.Second, Transport: transport}).Do(req)
+	if err != nil {
+		return nil, err
+	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return nil
+		return owner, nil
 	}
-	return fmt.Errorf("status %d", resp.StatusCode)
+	return nil, fmt.Errorf("status %d", resp.StatusCode)
 }
 
-// tcpOnce makes one TCP connection to addr and closes it. It is the single
-// attempt shared by the readiness poll and health checks.
-func tcpOnce(ctx context.Context, dialer *net.Dialer, addr string) error {
+// attributedConn is a probe connection with who answered on it, attributed
+// when it was dialed, before the transport could use it.
+type attributedConn struct {
+	net.Conn
+	owner *ipc.EndpointOwner
+}
+
+// connOwner returns the attribution a connection the transport handed out
+// carries: the dialed connection itself, or the one under its TLS layer.
+func connOwner(conn net.Conn) *ipc.EndpointOwner {
+	if tlsConn, ok := conn.(interface{ NetConn() net.Conn }); ok {
+		conn = tlsConn.NetConn()
+	}
+	if c, ok := conn.(*attributedConn); ok {
+		return c.owner
+	}
+	return nil
+}
+
+// tcpOnce makes one TCP connection to addr, attributes it while it is open,
+// and closes it. It is the single attempt shared by the readiness poll and
+// health checks.
+func tcpOnce(ctx context.Context, dialer *net.Dialer, addr string, attribute probeAttributor) (*ipc.EndpointOwner, error) {
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return conn.Close()
+	var owner *ipc.EndpointOwner
+	if c, ok := probeConnOf(conn); ok && attribute != nil {
+		owner = attribute(c)
+	}
+	return owner, conn.Close()
 }
 
-// probeTCP polls addr (host:port) with TCP connects until success, ctx
-// cancellation, or timeout. Same return semantics as probeHTTP.
+// probeTCP polls addr (host:port) with TCP connects until one that accept
+// takes, ctx cancellation, or timeout. Same return semantics as probeHTTP.
 // progressFn is called every 3 seconds with elapsed duration while probe is running.
-func probeTCP(ctx context.Context, addr string, timeout time.Duration, logFn func(string), progressFn func(string)) bool {
+func probeTCP(ctx context.Context, addr string, timeout time.Duration, logFn func(string), progressFn func(string), attribute probeAttributor, accept probeAccept) (ok bool, rejected string) {
 	dialer := &net.Dialer{Timeout: 2 * time.Second}
 	deadline := deadlineFor(timeout)
 	failures := 0
@@ -135,9 +195,15 @@ func probeTCP(ctx context.Context, addr string, timeout time.Duration, logFn fun
 	}
 
 	for {
-		err := tcpOnce(ctx, dialer, addr)
+		owner, err := tcpOnce(ctx, dialer, addr, attribute)
+		rejected = ""
+		if err == nil && accept != nil {
+			if err = accept(owner); err != nil {
+				rejected = err.Error()
+			}
+		}
 		if err == nil {
-			return true
+			return true, ""
 		}
 		failures++
 		if logFn != nil && failures > 5 {
@@ -147,11 +213,11 @@ func probeTCP(ctx context.Context, addr string, timeout time.Duration, logFn fun
 			if logFn != nil {
 				logFn(fmt.Sprintf("probe tcp %s: timed out after %s", addr, timeout))
 			}
-			return false
+			return false, rejected
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return false, ""
 		case <-ticker.C:
 			if progressFn != nil {
 				elapsed := time.Since(start)
@@ -309,9 +375,22 @@ func (r *Runner) monitorHealth(ctx context.Context, cancel context.CancelFunc, p
 			return
 		case <-timer.C:
 		}
-		ok, detail, skipped := r.healthCheck(ctx, p, hw, timeout, handoff)
+		ok, detail, skipped, owner := r.healthCheck(ctx, p, hw, timeout, handoff)
 		if ctx.Err() != nil {
 			return
+		}
+		if ok && owner != nil {
+			reject := owner.Result == ipc.OwnerForeign && p.proc.EffectiveForeignListener() == config.ForeignListenerReject
+			if st.recordHealthOwner(ctx, gen, owner) {
+				r.processLog(p, "warn", "health.foreign_listener", foreignListenerMessage(p.name, "health check", owner, reject))
+			}
+			if reject {
+				kind := "tcp"
+				if hw.HTTP != "" {
+					kind = "http"
+				}
+				ok, detail = false, kind+": "+foreignListenerError(p.name, owner).Error()
+			}
 		}
 		// A check the supervisor could not launch is logged when refusals
 		// begin, not every interval (the detail can name a fresh temp file),
@@ -353,40 +432,45 @@ func (r *Runner) monitorHealth(ctx context.Context, cancel context.CancelFunc, p
 
 // healthCheck runs one health_when check. skipped reports a check that did
 // not run because shutdown refused it, the incarnation ended, or the
-// supervisor could not launch it; only in the last case is detail set.
-func (r *Runner) healthCheck(ctx context.Context, p procInfo, hw *config.ReadyWhen, timeout time.Duration, handoff <-chan struct{}) (ok bool, detail string, skipped bool) {
+// supervisor could not launch it; only in the last case is detail set. A
+// passing http or tcp check also returns who answered it, attributed when its
+// connection was dialed.
+func (r *Runner) healthCheck(ctx context.Context, p procInfo, hw *config.ReadyWhen, timeout time.Duration, handoff <-chan struct{}) (ok bool, detail string, skipped bool, owner *ipc.EndpointOwner) {
 	checkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	attribute := func(c probeConn) *ipc.EndpointOwner { return r.attribute(p, c) }
 	switch {
 	case hw.HTTP != "":
-		if err := httpOnce(checkCtx, hw.HTTP); err != nil {
-			return false, "http: " + err.Error(), false
+		owner, err := httpOnce(checkCtx, hw.HTTP, attribute)
+		if err != nil {
+			return false, "http: " + err.Error(), false, nil
 		}
-		return true, "", false
+		return true, "", false, owner
 	case hw.TCP != "":
-		if err := tcpOnce(checkCtx, &net.Dialer{}, hw.TCP); err != nil {
-			return false, "tcp: " + err.Error(), false
+		owner, err := tcpOnce(checkCtx, &net.Dialer{}, hw.TCP, attribute)
+		if err != nil {
+			return false, "tcp: " + err.Error(), false, nil
 		}
-		return true, "", false
+		return true, "", false, owner
 	case hw.Cmd != "":
 		st := &procState{state: "starting", generation: 1, readyCh: make(chan struct{}), restartCh: make(chan struct{}, 1)}
 		res := r.runOwned(checkCtx, cmdProbeInfo(p, hw.Cmd), st, handoff, cmdProbeOutputLimit)
 		switch {
 		case exitedZeroInTime(checkCtx, &res):
-			return true, "", false
+			return true, "", false, nil
 		case res.HandedOff || res.AdmissionRefused || ctx.Err() != nil:
-			return false, "", true
+			return false, "", true, nil
 		case !res.Started && res.Err != nil:
 			// The supervisor could not launch the check (its crash-record
 			// entry could not be written, or the shell could not start).
 			// That says nothing about the service, and counting it would
 			// let health_action: restart kill a healthy service that the
 			// same condition then stops from relaunching.
-			return false, "health check not run: " + res.Err.Error(), true
+			return false, "health check not run: " + res.Err.Error(), true, nil
 		}
-		return false, cmdProbeFailure(res), false
+		return false, cmdProbeFailure(res), false, nil
 	}
-	return false, "", true
+	return false, "", true, nil
 }
 
 // exitedZeroInTime reports whether a runner-owned execution run under

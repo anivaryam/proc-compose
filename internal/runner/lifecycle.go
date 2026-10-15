@@ -18,6 +18,7 @@ import (
 
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/daemon"
+	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
 type processRunResult struct {
@@ -99,6 +100,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		st.lastError = ""
 		st.exitCode = nil
 		st.probeFailed = false
+		st.readinessOwner, st.healthOwner = nil, nil
 		st.health, st.healthFailures, st.healthError = "", 0, ""
 		if p.proc.HealthWhen != nil {
 			st.health = healthUnknown
@@ -346,7 +348,7 @@ func (r *Runner) buildReadinessCallbacks(
 	switch {
 	case p.proc.ReadyWhen == nil:
 		onStart = func() {
-			if !st.markReadyFor(procCtx, gen, true) {
+			if !st.markReadyFor(procCtx, gen, true, nil) {
 				return
 			}
 			r.broadcastState(p, st)
@@ -356,24 +358,26 @@ func (r *Runner) buildReadinessCallbacks(
 		probeURL := p.proc.ReadyWhen.HTTP
 		onStart = func() {
 			go func() {
-				ok := probeHTTP(procCtx, probeURL, readyTimeout, func(msg string) {
+				check := r.newOwnerCheck(p, st, gen, "http")
+				ok, rejected := probeHTTP(procCtx, probeURL, readyTimeout, func(msg string) {
 					r.processLog(p, "debug", "readiness.progress", msg)
 				}, func(msg string) {
 					r.processLog(p, "debug", "readiness.progress", msg)
-				})
-				r.handleProbeResult(p, st, gen, "http", ok, "", procCtx, procCancel)
+				}, check.attribute, check.accept)
+				r.handleProbeResult(p, st, gen, "http", ok, rejected, check.owner, procCtx, procCancel)
 			}()
 		}
 	case p.proc.ReadyWhen.TCP != "":
 		probeAddr := p.proc.ReadyWhen.TCP
 		onStart = func() {
 			go func() {
-				ok := probeTCP(procCtx, probeAddr, readyTimeout, func(msg string) {
+				check := r.newOwnerCheck(p, st, gen, "tcp")
+				ok, rejected := probeTCP(procCtx, probeAddr, readyTimeout, func(msg string) {
 					r.processLog(p, "debug", "readiness.progress", msg)
 				}, func(msg string) {
 					r.processLog(p, "debug", "readiness.progress", msg)
-				})
-				r.handleProbeResult(p, st, gen, "tcp", ok, "", procCtx, procCancel)
+				}, check.attribute, check.accept)
+				r.handleProbeResult(p, st, gen, "tcp", ok, rejected, check.owner, procCtx, procCancel)
 			}()
 		}
 	case p.proc.ReadyWhen.Cmd != "":
@@ -384,7 +388,7 @@ func (r *Runner) buildReadinessCallbacks(
 				ok, detail := r.probeCmd(procCtx, p, handoff, readyTimeout, func(msg string) {
 					r.processLog(p, "debug", "readiness.progress", msg)
 				}, progressFn)
-				r.handleProbeResult(p, st, gen, "cmd", ok, detail, procCtx, procCancel)
+				r.handleProbeResult(p, st, gen, "cmd", ok, detail, nil, procCtx, procCancel)
 			}()
 		}
 	case logRe != nil:
@@ -402,7 +406,7 @@ func (r *Runner) buildReadinessCallbacks(
 			}()
 		}
 		onLine = func(line string) {
-			if logRe.MatchString(line) && st.markReadyFor(procCtx, gen, true) {
+			if logRe.MatchString(line) && st.markReadyFor(procCtx, gen, true, nil) {
 				r.broadcastState(p, st)
 				r.processLog(p, "info", "process.ready", "ready (log match)")
 			}
@@ -1276,13 +1280,18 @@ func (r *Runner) ShutdownResult() error {
 // ready_timeout) it records the failure and cancels the per-iteration context
 // so the running command is terminated. Both are decided under st.mu against
 // procCtx, so a result that arrives after its incarnation ended is dropped.
-// A non-empty detail (the cmd probe's last attempt) is appended to the
-// failure message.
-func (r *Runner) handleProbeResult(p procInfo, st *procState, gen uint64, kind string, ok bool, detail string, procCtx context.Context, procCancel context.CancelFunc) {
+// A non-empty detail (the cmd probe's last attempt, or an http or tcp
+// answer foreign_listener: reject refused) is appended to the failure
+// message. owner is who answered a passing http or tcp probe; it is recorded
+// with the readiness and reported when foreign.
+func (r *Runner) handleProbeResult(p procInfo, st *procState, gen uint64, kind string, ok bool, detail string, owner *ipc.EndpointOwner, procCtx context.Context, procCancel context.CancelFunc) {
 	if ok {
-		if st.markReadyFor(procCtx, gen, true) {
+		if st.markReadyFor(procCtx, gen, true, owner) {
 			r.broadcastState(p, st)
 			r.processLog(p, "info", "process.ready", "ready ("+kind+" probe)")
+			if owner != nil && owner.Result == ipc.OwnerForeign {
+				r.processLog(p, "warn", "readiness.foreign_listener", foreignListenerMessage(p.name, "readiness probe ("+kind+")", owner, false))
+			}
 		}
 		return
 	}

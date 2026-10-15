@@ -14,13 +14,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// RestartPolicies, ProcessModes and HealthActions are the accepted enum
-// values; Load and the published schema both read them so the two cannot
-// drift.
+// RestartPolicies, ProcessModes, HealthActions and ForeignListenerPolicies
+// are the accepted enum values; Load and the published schema both read them
+// so the two cannot drift.
 var (
-	RestartPolicies = []string{"never", "on-failure", "always"}
-	ProcessModes    = []string{ProcessModeService, ProcessModeTask, ProcessModeTeardown}
-	HealthActions   = []string{HealthActionReport, HealthActionRestart}
+	RestartPolicies         = []string{"never", "on-failure", "always"}
+	ProcessModes            = []string{ProcessModeService, ProcessModeTask, ProcessModeTeardown}
+	HealthActions           = []string{HealthActionReport, HealthActionRestart}
+	ForeignListenerPolicies = []string{ForeignListenerAllow, ForeignListenerReject}
 )
 
 // Stable diagnostic codes. Codes are a machine contract: add new ones, never
@@ -395,6 +396,7 @@ func schemaExtras() map[string]map[string]any {
 		"Process.health_when":      {"not": map[string]any{"required": []string{"log"}}}, // a log line matches once; validateProbe(allowLog=false)
 		"Process.health_interval":  {"minimum": 0, "default": DefaultHealthInterval},     // 0 = default, like shutdown_timeout
 		"Process.health_action":    {"enum": HealthActions, "default": HealthActionReport},
+		"Process.foreign_listener": {"enum": ForeignListenerPolicies, "default": ForeignListenerAllow},
 		"Process.ports":            {"propertyNames": portName, "additionalProperties": map[string]any{"type": "integer", "minimum": 0, "maximum": 65535}},
 		"ReadyWhen":                {"minProperties": 1, "maxProperties": 1},
 	}

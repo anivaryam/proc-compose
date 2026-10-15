@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/verify"
 	"github.com/spf13/cobra"
 )
@@ -181,6 +182,9 @@ func printVerifyHuman(w io.Writer, r *verify.Result) {
 			probe = *obs.Probe
 		}
 		fmt.Fprintf(w, "    %s gen %d: %s (probe %s)\n", obs.Process, obs.Generation, obs.Status, probe)
+		if o := obs.Owner; o != nil && o.Result == ipc.OwnerForeign {
+			fmt.Fprintf(w, "      warning: answered at %s by PID %d (%s), outside %s's process tree\n", o.Address, o.PID, o.Command, obs.Process)
+		}
 	}
 	if len(r.Startup.UnprobedProcesses) > 0 {
 		fmt.Fprintf(w, "    started without a readiness probe: %s\n", strings.Join(r.Startup.UnprobedProcesses, ", "))

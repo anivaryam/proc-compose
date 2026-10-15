@@ -34,7 +34,15 @@ status, so a passing check cannot hide a crashed service or an unverified
 cleanup. A required service that stops running, restarts, or becomes
 `unhealthy` through its `health_when` while the check runs fails the attempt
 with `required_failed`. A service without a readiness probe is reported as
-`not_configured`/unprobed rather than ready. Source revision and dirty state are
+`not_configured`/unprobed rather than ready. On Linux and Windows, each passing
+`http` or `tcp` readiness observation also records its `owner`: who held the
+socket that answered (`owned`, `foreign` with the holder's `pid` and `command`,
+or `unattributable` with a `reason`; `null` for other probes). A `foreign`
+owner means the check may have run against another server on that address;
+human output prints it as a warning. By default it is evidence, not a verdict.
+A process with `foreign_listener: reject` does not become ready on a foreign
+answer, so the attempt fails at startup and its readiness observation's
+`owner` is the refused holder (see [Who answered the probe](configuration.md#who-answered-the-probe)). Source revision and dirty state are
 recorded as provenance only (`loaded_code_proven: false`). Default budgets are
 startup 120s, check 10m, and an independent 30s cleanup (unmeasured policy
 defaults; override with `--startup-timeout`, `--check-timeout`,
@@ -114,7 +122,10 @@ To report, it writes one JSON object there:
   attempt shows its `environment_status`.
 
 The observations are the check's own. proc-compose does not inspect the
-application, and it does not prove isolation or the loaded code. Evidence is
+application, and it does not prove isolation or the loaded code. The one
+supervisor observation, the readiness `owner`, covers only the socket that
+answered each readiness probe at that moment; the endpoints the check itself
+connects to are not observed. Evidence is
 stronger when it comes from the application's real paths instead of from the
 check's own environment: an `/identity` endpoint that reports the
 `PROC_COMPOSE_RUN_ID` its process received and a digest of the code it

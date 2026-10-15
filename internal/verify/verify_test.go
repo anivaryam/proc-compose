@@ -20,6 +20,7 @@ import (
 
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/daemon"
+	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/paths"
 	"github.com/anivaryam/proc-compose/internal/runner"
 	"github.com/anivaryam/proc-compose/internal/session"
@@ -247,12 +248,27 @@ func TestRun_HappyPathLiteralArgvEndpointsAndReceipt(t *testing.T) {
 	if obs := result.Startup.ReadinessObservations; len(obs) != 1 || obs[0].Status != StatusPassed || *obs[0].Probe != "http" || obs[0].Generation != 1 {
 		t.Fatalf("readiness = %+v", obs)
 	}
+	// The service answers its own probe: where sockets are attributed (Linux
+	// and Windows) that is owned, by the server itself; elsewhere it is
+	// unattributable.
+	owner := result.Startup.ReadinessObservations[0].Owner
+	wantOwner := ipc.OwnerUnattributable
+	if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+		wantOwner = ipc.OwnerOwned
+	}
+	if owner == nil || owner.Result != wantOwner || owner.Address != fmt.Sprintf("127.0.0.1:%d", endpoint.Port) ||
+		(wantOwner == ipc.OwnerOwned && owner.PID != pidFromFile(t, f.pidFile)) || (wantOwner != ipc.OwnerOwned && owner.Reason == "") {
+		t.Fatalf("readiness owner = %+v, want %s at port %d", owner, wantOwner, endpoint.Port)
+	}
 	receipt, err := ReadReceipt(*result.ReceiptPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if receipt.State != StateCompleted || receipt.Status != StatusPassed || receipt.Check.Stdout != want {
 		t.Fatalf("receipt = %+v", receipt)
+	}
+	if got := receipt.Startup.ReadinessObservations[0].Owner; got == nil || *got != *owner {
+		t.Fatalf("receipt readiness owner = %+v, want %+v", got, owner)
 	}
 	if result.Evidence.FirstCursor == nil || !strings.HasPrefix(*result.Evidence.FirstCursor, *result.RunID+":") {
 		t.Fatalf("evidence = %+v", result.Evidence)
@@ -262,6 +278,54 @@ func TestRun_HappyPathLiteralArgvEndpointsAndReceipt(t *testing.T) {
 	held, err := session.InstanceHeld(opts.Hash)
 	if err != nil || held {
 		t.Fatalf("instance lease after attempt held=%t err=%v", held, err)
+	}
+}
+
+// TestRun_ForeignListenerRejectFailsStartupNamingTheHolder is the verify
+// side of foreign_listener: reject: a foreign server on the probe address
+// does not make the stack ready, the check never runs, and the receipt's
+// readiness observation names the refused holder, whether readiness times
+// out or the process exits first (as a server whose own bind fails does).
+func TestRun_ForeignListenerRejectFailsStartupNamingTheHolder(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("socket owners are not attributed on " + runtime.GOOS)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})}
+	go srv.Serve(ln)
+	defer srv.Close()
+	for name, tc := range map[string]struct{ lifetime, readyTimeout string }{
+		"times out":   {"30s", "1"},
+		"exits first": {"300ms", "30"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, `processes:
+  api:
+    cmd: {{BIN}} `+tc.lifetime+`
+    env:
+      `+helperEnv+`: sleep
+    ready_when:
+      http: http://`+ln.Addr().String()+`/
+    ready_timeout: `+tc.readyTimeout+`
+    foreign_listener: reject
+`)
+			start := time.Now()
+			result := Run(context.Background(), f.options(t, "", checkArgv("exit", "0")...))
+			if result.Status != StatusFailed || result.Startup.Status != StatusFailed || result.Check.Status != StatusNotRun {
+				t.Fatalf("result = %s startup=%s check=%s errors=%v", result.Status, result.Startup.Status, result.Check.Status, result.Errors)
+			}
+			obs := result.Startup.ReadinessObservations
+			if len(obs) != 1 || obs[0].Owner == nil || obs[0].Owner.Result != ipc.OwnerForeign || obs[0].Owner.PID != os.Getpid() || obs[0].Owner.Address != ln.Addr().String() {
+				t.Fatalf("readiness = %+v (owner %+v), want the refused foreign owner (PID %d)", obs, obs[0].Owner, os.Getpid())
+			}
+			if name == "exits first" && time.Since(start) > 10*time.Second {
+				t.Fatalf("startup took %s: readiness timed out instead of the process exiting first", time.Since(start))
+			}
+			assertComplete(t, result)
+		})
 	}
 }
 
@@ -295,7 +359,7 @@ func TestRun_UnprobedServiceIsDistinguishedFromProbeReadiness(t *testing.T) {
 		t.Fatalf("status = %s errors=%v", result.Status, result.Errors)
 	}
 	obs := result.Startup.ReadinessObservations
-	if len(obs) != 1 || obs[0].Probe != nil || obs[0].Status != StatusNotConfig || len(result.Startup.UnprobedProcesses) != 1 {
+	if len(obs) != 1 || obs[0].Probe != nil || obs[0].Status != StatusNotConfig || obs[0].Owner != nil || len(result.Startup.UnprobedProcesses) != 1 {
 		t.Fatalf("unprobed readiness = %+v / %v", obs, result.Startup.UnprobedProcesses)
 	}
 }

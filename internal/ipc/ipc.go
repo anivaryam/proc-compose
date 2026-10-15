@@ -54,6 +54,36 @@ type ProcState struct {
 	// which latches once per incarnation.
 	Health      string `json:"health,omitempty"`
 	HealthError string `json:"health_error,omitempty"` // the last failed health check, while it is failing
+	// ReadinessOwner is who answered the http or tcp readiness probe that
+	// made the current incarnation ready. HealthOwner is the same for its
+	// last passing health_when check. Both are nil for other probe kinds and
+	// before the first pass. They are observations only: no verdict depends
+	// on them.
+	ReadinessOwner *EndpointOwner `json:"readiness_owner,omitempty"`
+	HealthOwner    *EndpointOwner `json:"health_owner,omitempty"`
+}
+
+// Endpoint owner results.
+const (
+	// OwnerOwned means a process in the incarnation's own process tree holds
+	// the server socket that answered.
+	OwnerOwned = "owned"
+	// OwnerForeign means a process outside that tree, identified by PID,
+	// holds it.
+	OwnerForeign = "foreign"
+	// OwnerUnattributable means the holder could not be identified; Reason
+	// says why. It is never evidence either way.
+	OwnerUnattributable = "unattributable"
+)
+
+// EndpointOwner records which process held the server side of the connection
+// a passing http or tcp probe used, as the OS socket table reports it.
+type EndpointOwner struct {
+	Result  string `json:"result"`            // owned | foreign | unattributable
+	Address string `json:"address,omitempty"` // the server address that answered, host:port
+	PID     int    `json:"pid,omitempty"`     // the holder, when identified
+	Command string `json:"command,omitempty"` // the holder's process name
+	Reason  string `json:"reason,omitempty"`  // why the holder is unattributable
 }
 
 // LogEntry is a single log line emitted by a managed process.

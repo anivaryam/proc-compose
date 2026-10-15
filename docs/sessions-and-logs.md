@@ -59,7 +59,11 @@ Separate ports alone do not isolate databases or build directories: use separate
 worktrees and application-specific provisioning tasks, and declare shared
 resources that must serialize. Named-port leases coordinate proc-compose
 sessions; an unrelated program can still race the application's bind, which
-must succeed and pass its configured readiness check.
+must succeed and pass its configured readiness check. On Linux and Windows,
+`status --json` shows who answered that check as `readiness_owner`: `foreign`
+with the holder's PID means another program serves the port. Set
+`foreign_listener: reject` to make readiness wait for the process's own server
+instead (see [Who answered the probe](configuration.md#who-answered-the-probe)).
 
 ## Logs for coding agents
 
@@ -92,7 +96,10 @@ by proc-compose. Health checks (`health_when`) produce `kind: probe` events:
 `health.recovered` (info, the first pass after that), and
 `health.check_skipped` (warn, when proc-compose itself cannot launch a `cmd`
 check, for example because the crash-recovery record cannot be written; such
-checks count neither way). Every health change also
+checks count neither way). On Linux and Windows, `readiness.foreign_listener`
+and `health.foreign_listener` (warn) name a process outside the service's
+process tree that answered its `http` or `tcp` probe, by PID and process name;
+see [Who answered the probe](configuration.md#who-answered-the-probe). Every health change also
 writes a `process.state` event carrying `health`. A health restart is reported
 with the usual `process.failed` and `process.restarting` events. Teardown
 processes (`mode: teardown`) produce `teardown.started` (info),

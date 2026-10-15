@@ -45,6 +45,15 @@ type procState struct {
 	healthFailures int    // consecutive failed checks
 	healthError    string // the last failed check, cleared by a pass
 
+	// Who answered this incarnation's readiness probe: the answer that made
+	// it ready, or, while foreign_listener: reject waits and after it
+	// failed, the last answer it refused. healthOwner is who answered its
+	// last passing health check. Both are http and tcp probes only, reset
+	// with the generation, and never mutated once stored, so snapshots may
+	// share them.
+	readinessOwner *ipc.EndpointOwner
+	healthOwner    *ipc.EndpointOwner
+
 	// Restart signaling for restart command.
 	restartCh chan struct{} // buffered; signaled to request a restart
 }
@@ -104,11 +113,50 @@ func (st *procState) latchReady(ok bool, admit func() bool) bool {
 // st.mu. The run loop cancels the incarnation's context before it calls
 // resetReady, and resetReady runs before the next generation++, so the context
 // check is what keeps a probe that outlived its incarnation from latching the
-// next cycle; a generation check alone would miss that window.
-func (st *procState) markReadyFor(ctx context.Context, gen uint64, ok bool) bool {
+// next cycle; a generation check alone would miss that window. owner, when
+// set, is recorded in the same critical section, so no snapshot shows the
+// readiness without who answered it.
+func (st *procState) markReadyFor(ctx context.Context, gen uint64, ok bool, owner *ipc.EndpointOwner) bool {
 	return st.latchReady(ok, func() bool {
-		return !st.probeFailed && ctx.Err() == nil && st.generation == gen
+		if st.probeFailed || ctx.Err() != nil || st.generation != gen {
+			return false
+		}
+		st.readinessOwner = owner
+		return true
 	})
+}
+
+// recordRefusedOwner stores a readiness answer foreign_listener: reject
+// refused for incarnation gen, unless that incarnation became ready, so the
+// refusal stays visible after the incarnation fails. Unlike the readiness
+// latch it does not require the incarnation to be live: a server that
+// fails its own bind can exit before the refusal is recorded, and the
+// refusal is what explains it. The generation check alone keeps a late
+// refusal out of the next incarnation, whose start resets the owner under
+// st.mu together with generation++. It reports whether it was stored.
+func (st *procState) recordRefusedOwner(gen uint64, owner *ipc.EndpointOwner) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.generation != gen || (st.readyClosed && st.readyOK) {
+		return false
+	}
+	st.readinessOwner = owner
+	return true
+}
+
+// recordHealthOwner stores who answered incarnation gen's last passing
+// health check, guarded like recordHealth. It reports whether the answer has
+// just become foreign, or moved to another foreign holder, so a foreign
+// holder is logged once per change rather than on every check.
+func (st *procState) recordHealthOwner(ctx context.Context, gen uint64, owner *ipc.EndpointOwner) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if owner == nil || ctx.Err() != nil || st.generation != gen || st.state != "running" || st.exitCode != nil {
+		return false
+	}
+	known := st.healthOwner != nil && st.healthOwner.Result == ipc.OwnerForeign && st.healthOwner.PID == owner.PID
+	st.healthOwner = owner
+	return owner.Result == ipc.OwnerForeign && !known
 }
 
 // failReadinessFor records a readiness failure for one incarnation, under the
@@ -332,7 +380,20 @@ func (st *procState) ipcStateLocked(name string, proc config.Process) ipc.ProcSt
 		DependsOn:   append([]string(nil), proc.DependsOn...),
 		Health:      health,
 		HealthError: healthError,
+		// Like last_error, the readiness owner describes the latest
+		// incarnation until the next one starts, so a refused answer is
+		// still there after readiness failed. Like health, the health owner
+		// describes only a running incarnation.
+		ReadinessOwner: st.readinessOwner,
+		HealthOwner:    healthOwnerIf(st.healthOwner, st.state == "running"),
 	}
+}
+
+func healthOwnerIf(owner *ipc.EndpointOwner, running bool) *ipc.EndpointOwner {
+	if !running {
+		return nil
+	}
+	return owner
 }
 
 // setProc records the definition an incarnation picked up after a reload, so

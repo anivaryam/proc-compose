@@ -38,6 +38,14 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why --attempt latest --j
   `source.loaded_code_proven` is always false. Readiness `not_configured`
   means the process started without a probe. `kind: verify.compact_error`
   (result over 64 KiB) is never success.
+- On Linux and Windows, each passing `http`/`tcp` readiness observation has an
+  `owner`. `owner.result: foreign` (with `pid`, `command`) means a process
+  outside that service's tree answered its probe, usually another copy of the
+  stack on a hardcoded port, so the check may have hit it; `status` can still
+  be `passed`. Treat it like an ineligible environment: use named ports, stop
+  your own stale session, or set `foreign_listener: reject` on the process so
+  readiness waits for its own server. Never kill the named PID unless it is
+  yours. `unattributable` is no evidence either way.
 - The check receives `PROC_COMPOSE_URL_<PROCESS>_<PORT>`,
   `PROC_COMPOSE_PORT_<PROCESS>_<PORT>`, `PROC_COMPOSE_SESSION`,
   `PROC_COMPOSE_SESSION_DIR`, `PROC_COMPOSE_RUN_ID`,
@@ -126,7 +134,10 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why api --json
   `up --dry-run`, and `bootstrap --verify` (`validation_status`) are static and
   start nothing.
 - Readiness: without a probe, a service is ready once it starts. Tasks are ready
-  after they exit 0. `state: running` is not readiness.
+  after they exit 0. `state: running` is not readiness. An `http`/`tcp` probe
+  passes for any server on its address unless the process sets
+  `foreign_listener: reject`; `status --json` `readiness_owner` (Linux,
+  Windows) says whose.
 - `ports: {http: 0}` requests an ephemeral port and sets `PORT`. Reference ports
   as `${ports.api.http}` / `${urls.api.http}`; `${session.dir}` is the session
   runtime root. `resources` labels take exclusive leases. Databases, build

@@ -404,6 +404,36 @@ func TestRunnerHelperProcess(t *testing.T) {
 		}
 		time.Sleep(d)
 		os.Exit(0)
+	case "serve-http":
+		// serve-http <addr>: answer every request on addr with this
+		// process's PID, so a test can say which process served a probe.
+		// It exits on its own after a minute, so a failing test cannot leak it.
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		ln, err := net.Listen("tcp", args[1])
+		if err != nil {
+			os.Exit(2)
+		}
+		time.AfterFunc(time.Minute, func() { os.Exit(3) })
+		_ = http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, os.Getpid()) }))
+		os.Exit(0)
+	case "serve-http-retry":
+		// serve-http-retry <addr>: serve-http, but keep retrying the bind
+		// while another process holds addr, so it takes the port over the
+		// moment that process lets go.
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		time.AfterFunc(time.Minute, func() { os.Exit(3) })
+		for {
+			ln, err := net.Listen("tcp", args[1])
+			if err == nil {
+				_ = http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, os.Getpid()) }))
+				os.Exit(0)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 	case "touch":
 		if len(args) != 2 {
 			os.Exit(2)

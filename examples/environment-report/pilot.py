@@ -39,6 +39,7 @@ class Pilot:
         self.runs = {}
         self.order = {}
         self.gates = []
+        self.holders = {}
 
     # Workspaces: one worktree per fault, copied from this directory.
     def workspace(self, name, src=None, build=None, edit_config=None):
@@ -58,6 +59,7 @@ class Pilot:
         regress = good.replace("return qty * price", "return qty + price")
         noident = good.replace('        if self.path == "/identity":\n            return self.reply(200, identity())\n', "")
         assert regress != good and noident != good
+        self.regress = regress
         shared = self.work / "shared"
         outside = lambda text: text.replace("${session.dir}/app.db", f"{shared}/app.db").replace("${session.dir}/queue", f"{shared}/queue")
         self.workspace("good")
@@ -146,6 +148,38 @@ class Pilot:
             sessions = json.loads(self.cli("good", dev, "sessions", "--json").stdout)["sessions"]
             url = next(s["urls"]["api"]["http"] for s in sessions if s["session"] == dev)
             v("S3a-wrong-endpoint", "regress", "s3a", env={"APP_URL": url})
+            # S3c: a worktree whose config hardcodes the port the dev server
+            # already holds, as a README-style config does. Its readiness
+            # probe is answered by the dev server before its own api binds.
+            port = url.rsplit(":", 1)[1]
+            hardcode = lambda text: (text.replace("    cmd: python3 build/app.py api\n", f"    cmd: PORT={port} python3 build/app.py api\n")
+                                     .replace("    ports:\n      http: 18100\n", "")
+                                     .replace("${urls.api.http}/health", f"http://127.0.0.1:{port}/health"))
+            self.workspace(f"hardcoded-{mode}", src=self.regress, edit_config=hardcode)
+            status = json.loads(self.cli("good", dev, "status", "--json").stdout)
+            leader = next((p.get("pid") for p in status["processes"] if p["name"] == "api"), None)
+            res = v("S3c-hardcoded-port-held", f"hardcoded-{mode}", "s3c", env={"APP_URL": url})
+            # The holder is the dev api's server process, which may sit below
+            # its shell: it belongs when it is in the dev api's process group,
+            # read while the dev session still runs.
+            owner = next((o.get("owner") for o in res.get("startup", {}).get("readiness_observations", []) if o["process"] == "api"), None)
+            try:
+                group = os.getpgid(owner["pid"]) if owner and owner.get("pid") else None
+            except OSError:
+                group = None
+            self.holders[mode] = (leader, group)
+            if mode == "env-bound":
+                # S3d: the same worktree with foreign_listener: reject. The dev
+                # server's answer is refused, so the check never runs against it.
+                reject = lambda text: hardcode(text).replace("    depends_on: [prepare]\n    env: *state\n    ready_when:",
+                                                             "    depends_on: [prepare]\n    env: *state\n    foreign_listener: reject\n    ready_timeout: 5\n    ready_when:")
+                self.workspace("hardcoded-reject", src=self.regress, edit_config=reject)
+                res = v("S3d-hardcoded-port-rejected", "hardcoded-reject", "s3d", env={"APP_URL": url})
+                owner = next((o.get("owner") for o in res.get("startup", {}).get("readiness_observations", []) if o["process"] == "api"), None)
+                try:
+                    res["_holder_group"] = os.getpgid(owner["pid"]) if owner and owner.get("pid") else None
+                except OSError:
+                    res["_holder_group"] = None
         finally:
             self.cli("good", dev, "stop")
         v("S3b-stale-build", "stale", "s3b", env={"PILOT_SKIP_BUILD": "1"})
@@ -299,6 +333,33 @@ class Pilot:
         for (mode, scenario), res in sorted(self.runs.items()):
             if "cleanup" in res:
                 self.gate(f"{mode} {scenario}: termination verified", clean(res))
+        self.check_owner_gates(r)
+
+    def check_owner_gates(self, r):
+        """Readiness attribution (Linux): who answered each passing http probe."""
+        if sys.platform not in ("linux", "win32"):
+            return
+        owners = {}
+        for (mode, scenario), res in sorted(self.runs.items()):
+            if mode != "env-bound":
+                continue
+            for obs in (res.get("startup") or {}).get("readiness_observations", []):
+                if obs["status"] == "passed" and obs.get("probe") in ("http", "tcp"):
+                    owners[(scenario, obs["process"])] = obs.get("owner")
+        s3c = owners.pop(("S3c-hardcoded-port-held", "api"), None)
+        self.gate("baseline: S3c's readiness passes against the dev server",
+                  any(o["process"] == "api" and o["status"] == "passed" for o in r("S3c-hardcoded-port-held", "baseline")["startup"]["readiness_observations"]))
+        leader, group = self.holders.get("env-bound", (None, None))
+        self.gate("S3c: readiness answered by the dev server is foreign, naming a process of the dev api",
+                  s3c is not None and s3c["result"] == "foreign" and leader is not None and group == leader, (s3c, leader, group))
+        s3d = r("S3d-hardcoded-port-rejected")
+        refused = next((o.get("owner") for o in s3d["startup"]["readiness_observations"] if o["process"] == "api"), None)
+        self.gate("S3d: foreign_listener: reject refuses the dev server; startup fails, the check never runs, and the receipt names a process of the dev api",
+                  "startup_failed" in {e["code"] for e in s3d.get("errors", [])} and s3d["check"]["status"] == "not_run"
+                  and refused is not None and refused["result"] == "foreign" and s3d.get("_holder_group") == leader,
+                  (s3d.get("errors"), s3d["check"]["status"], refused, s3d.get("_holder_group"), leader))
+        wrong = {f"{scenario}/{process}": o for (scenario, process), o in owners.items() if not o or o["result"] != "owned"}
+        self.gate(f"every other passing readiness probe ({len(owners)}) is owned: no false foreign", owners and not wrong, wrong)
 
     def table(self):
         for (mode, scenario), res in sorted(self.runs.items()):

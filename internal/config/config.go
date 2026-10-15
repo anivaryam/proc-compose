@@ -48,6 +48,14 @@ const (
 	HealthActionRestart = "restart" // cancel the incarnation through the restart policy
 )
 
+// Foreign-listener policies: what an http or tcp probe does with an answer
+// from a process outside the probed process's tree (see the runner's probe
+// attribution).
+const (
+	ForeignListenerAllow  = "allow"  // the probe passes; the holder is reported
+	ForeignListenerReject = "reject" // the attempt fails, naming the holder
+)
+
 // DefaultHealthInterval is the health_when period in seconds when
 // health_interval is unset.
 const DefaultHealthInterval = 10
@@ -68,6 +76,7 @@ type Process struct {
 	HealthWhen      *ReadyWhen        `yaml:"health_when,omitempty"`      // ongoing probe after readiness: http, tcp or cmd (no log)
 	HealthInterval  int               `yaml:"health_interval,omitempty"`  // seconds between health checks; 0 = default (10); requires health_when
 	HealthAction    string            `yaml:"health_action,omitempty"`    // "report" (default) or "restart"; requires health_when
+	ForeignListener string            `yaml:"foreign_listener,omitempty"` // "allow" (default) or "reject"; requires an http or tcp ready_when or health_when
 }
 
 func (p Process) EffectiveMode() string {
@@ -83,6 +92,14 @@ func (p Process) EffectiveHealthInterval() int {
 		return DefaultHealthInterval
 	}
 	return p.HealthInterval
+}
+
+// EffectiveForeignListener is the configured foreign_listener or its default.
+func (p Process) EffectiveForeignListener() string {
+	if p.ForeignListener == "" {
+		return ForeignListenerAllow
+	}
+	return p.ForeignListener
 }
 
 // EffectiveHealthAction is the configured health_action or its default.
@@ -247,6 +264,9 @@ func Load(path string) (*Config, error) {
 			if proc.HealthAction != "" {
 				return nil, invalid(CodeTaskIncompatible, at("health_action"), nil, "process %q: mode: task cannot use health_action", name)
 			}
+			if proc.ForeignListener != "" {
+				return nil, invalid(CodeTaskIncompatible, at("foreign_listener"), nil, "process %q: mode: task cannot use foreign_listener", name)
+			}
 		}
 		if proc.MaxRestarts < 0 {
 			return nil, invalid(CodeInvalidValue, at("max_restarts"), nil, "process %q: max_restarts must be >= 0", name)
@@ -263,6 +283,9 @@ func Load(path string) (*Config, error) {
 			}
 		}
 		if err := validateHealth(name, at, proc); err != nil {
+			return nil, err
+		}
+		if err := validateForeignListener(name, at, proc); err != nil {
 			return nil, err
 		}
 		if proc.EnvFile != "" {
@@ -342,6 +365,8 @@ func validateTeardown(name string, at func(...any) []any, proc Process) error {
 		return refuse("health_interval")
 	case proc.HealthAction != "":
 		return refuse("health_action")
+	case proc.ForeignListener != "":
+		return refuse("foreign_listener")
 	case len(proc.Ports) > 0:
 		return refuse("ports")
 	case len(proc.DependsOn) > 0:
@@ -406,6 +431,22 @@ func validateHealth(name string, at func(...any) []any, proc Process) error {
 	}
 	if proc.HealthAction == HealthActionRestart && proc.Restart == "never" {
 		return invalid(CodeInvalidValue, at("health_action"), nil, "process %q: health_action: restart needs restart: on-failure or always", name)
+	}
+	return nil
+}
+
+// validateForeignListener checks foreign_listener: a known policy, on a
+// process with an http or tcp probe for it to apply to.
+func validateForeignListener(name string, at func(...any) []any, proc Process) error {
+	if proc.ForeignListener == "" {
+		return nil
+	}
+	if !slices.Contains(ForeignListenerPolicies, proc.ForeignListener) {
+		return invalid(CodeInvalidValue, at("foreign_listener"), nil, "process %q: invalid foreign_listener %q (use allow or reject)", name, proc.ForeignListener)
+	}
+	socketProbe := func(rw *ReadyWhen) bool { return rw != nil && (rw.HTTP != "" || rw.TCP != "") }
+	if !socketProbe(proc.ReadyWhen) && !socketProbe(proc.HealthWhen) {
+		return invalid(CodeInvalidValue, at("foreign_listener"), nil, "process %q: foreign_listener requires an http or tcp ready_when or health_when", name)
 	}
 	return nil
 }
