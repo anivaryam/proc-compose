@@ -46,7 +46,10 @@ See [Process modes](docs/configuration.md#process-modes).
 from an `http` (2xx response), `tcp` (connect succeeds), `cmd` (command exits
 0), or `log` (regex match) probe, with a configurable `ready_timeout`. After
 that, an optional `health_when` probe (`http`, `tcp`, or `cmd`) keeps checking
-the service and either reports it unhealthy or restarts it.
+the service and either reports it unhealthy or restarts it. On Linux and
+Windows, each `http` or `tcp` probe also records who answered it, so a server
+from another copy of the stack on the same port is named instead of silently
+counting as ready; `foreign_listener: reject` makes such an answer not count.
 
 ```yaml
 processes:
@@ -61,7 +64,8 @@ processes:
       http: http://localhost:3000/health
 ```
 
-See [Readiness probes](docs/configuration.md#readiness-probes) and
+See [Readiness probes](docs/configuration.md#readiness-probes),
+[Who answered the probe](docs/configuration.md#who-answered-the-probe) and
 [Health checks](docs/configuration.md#health-checks).
 
 ## Restart policies

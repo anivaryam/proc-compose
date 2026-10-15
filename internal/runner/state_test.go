@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
 // TestProcState_RaceMarkReadyAndReset exercises concurrent markReady/resetReady
@@ -184,7 +185,7 @@ func TestProcState_MarkReadyForRejectsStaleCycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	st.resetReady()
-	if st.markReadyFor(ctx, 1, true) {
+	if st.markReadyFor(ctx, 1, true, nil) {
 		t.Fatal("markReadyFor latched a cycle after its incarnation context was cancelled")
 	}
 	st.mu.Lock()
@@ -200,14 +201,91 @@ func TestProcState_MarkReadyForRejectsStaleCycle(t *testing.T) {
 	}
 }
 
+// TestProcState_OwnersFollowTheirIncarnation pins that who answered a probe
+// is recorded with the readiness latch and refused with it for a stale
+// generation; that the readiness owner, like last_error, outlives the
+// incarnation's readiness while the health owner describes only a running
+// one; and that a refused answer is kept only until the readiness latch.
+func TestProcState_OwnersFollowTheirIncarnation(t *testing.T) {
+	refused := &ipc.EndpointOwner{Result: ipc.OwnerForeign, Address: "127.0.0.1:3000", PID: 41}
+	waiting := &procState{readyCh: make(chan struct{}), generation: 1, state: "running"}
+	if waiting.recordRefusedOwner(2, refused) || waiting.readinessOwner != nil {
+		t.Fatal("a stale generation's refusal was recorded")
+	}
+	// The incarnation already exited before ready (its server failed its own
+	// bind): the refusal is still what explains it.
+	waiting.state = "failed"
+	waiting.markReady(false)
+	if !waiting.recordRefusedOwner(1, refused) {
+		t.Fatal("the refusal of an incarnation that exited unready was not recorded")
+	}
+	if got := waiting.ipcStateLocked("api", config.Process{}); got.ReadinessOwner != refused || got.Ready {
+		t.Fatalf("failed incarnation: readiness_owner = %+v, want the refused answer", got.ReadinessOwner)
+	}
+
+	owner := &ipc.EndpointOwner{Result: ipc.OwnerForeign, Address: "127.0.0.1:3000", PID: 42, Command: "node"}
+	st := &procState{readyCh: make(chan struct{}), generation: 2, state: "running"}
+	if st.markReadyFor(context.Background(), 1, true, owner) || st.readinessOwner != nil {
+		t.Fatal("a stale generation's probe recorded its owner")
+	}
+	if !st.markReadyFor(context.Background(), 2, true, owner) {
+		t.Fatal("markReadyFor refused the live incarnation")
+	}
+	if st.recordRefusedOwner(2, refused) || st.readinessOwner != owner {
+		t.Fatal("a refusal after readiness replaced the answer that made the incarnation ready")
+	}
+	health := &ipc.EndpointOwner{Result: ipc.OwnerOwned, Address: "127.0.0.1:3000", PID: 7}
+	if st.recordHealthOwner(context.Background(), 2, health) {
+		t.Fatal("an owned health answer was reported as foreign")
+	}
+	got := st.ipcStateLocked("api", config.Process{})
+	if got.ReadinessOwner != owner || got.HealthOwner != health {
+		t.Fatalf("live incarnation: owners = %+v / %+v", got.ReadinessOwner, got.HealthOwner)
+	}
+	st.state = "restarting"
+	if got := st.ipcStateLocked("api", config.Process{}); got.ReadinessOwner != owner || got.HealthOwner != nil {
+		t.Fatalf("restarting process: owners = %+v / %+v, want the readiness owner only", got.ReadinessOwner, got.HealthOwner)
+	}
+}
+
+// TestProcState_ForeignHealthOwnerIsReportedOncePerHolder keeps the warning
+// from repeating every health interval: it is reported when the answer
+// becomes foreign or moves to another foreign holder.
+func TestProcState_ForeignHealthOwnerIsReportedOncePerHolder(t *testing.T) {
+	st := &procState{generation: 1, state: "running"}
+	ctx := context.Background()
+	foreign := func(pid int) *ipc.EndpointOwner { return &ipc.EndpointOwner{Result: ipc.OwnerForeign, PID: pid} }
+	owned := &ipc.EndpointOwner{Result: ipc.OwnerOwned, PID: 7}
+	for i, step := range []struct {
+		owner *ipc.EndpointOwner
+		gen   uint64
+		want  bool
+	}{
+		{owned, 1, false},
+		{foreign(42), 1, true},
+		{foreign(42), 1, false},
+		{foreign(43), 1, true},
+		{owned, 1, false},
+		{foreign(43), 1, true},
+		{foreign(44), 2, false}, // a stale generation's check changes nothing
+	} {
+		if became := st.recordHealthOwner(ctx, step.gen, step.owner); became != step.want {
+			t.Fatalf("step %d (%+v, gen %d): became foreign = %v, want %v", i, step.owner, step.gen, became, step.want)
+		}
+	}
+	if st.healthOwner.PID != 43 {
+		t.Fatalf("health owner = %+v, want the last live answer (PID 43)", st.healthOwner)
+	}
+}
+
 // TestProcState_MarkReadyForRejectsOtherGeneration covers a probe whose context
 // is still live but whose incarnation is no longer current.
 func TestProcState_MarkReadyForRejectsOtherGeneration(t *testing.T) {
 	st := &procState{readyCh: make(chan struct{}), generation: 2}
-	if st.markReadyFor(context.Background(), 1, true) {
+	if st.markReadyFor(context.Background(), 1, true, nil) {
 		t.Fatal("markReadyFor latched a cycle for a previous generation")
 	}
-	if !st.markReadyFor(context.Background(), 2, true) {
+	if !st.markReadyFor(context.Background(), 2, true, nil) {
 		t.Fatal("markReadyFor refused the live incarnation")
 	}
 	st.mu.Lock()
@@ -254,7 +332,7 @@ func TestProcState_FailReadinessForIsGuarded(t *testing.T) {
 	if !failed || lastError != "readiness probe (tcp) timed out" {
 		t.Fatalf("probeFailed=%t lastError=%q, want true and the probe message", failed, lastError)
 	}
-	if st.markReadyFor(live, 3, true) {
+	if st.markReadyFor(live, 3, true, nil) {
 		t.Fatal("a failed readiness cycle was later latched ready")
 	}
 }
@@ -274,7 +352,7 @@ func TestReadinessWiring_StaleIncarnationCannotLatchNextCycle(t *testing.T) {
 		fire  func(r *Runner, p procInfo, st *procState, ctx context.Context, cancel context.CancelFunc)
 	}{
 		{"probe result", &config.ReadyWhen{TCP: "127.0.0.1:1"}, func(r *Runner, p procInfo, st *procState, ctx context.Context, cancel context.CancelFunc) {
-			r.handleProbeResult(p, st, 1, "tcp", true, "", ctx, cancel)
+			r.handleProbeResult(p, st, 1, "tcp", true, "", nil, ctx, cancel)
 		}},
 		{"no-probe onStart", nil, func(r *Runner, p procInfo, st *procState, ctx context.Context, cancel context.CancelFunc) {
 			onStart, _ := r.buildReadinessCallbacks(p, 0, st, 1, nil, 0, ctx, cancel, nil, nil, nil)

@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"sort"
 	"time"
+
+	"github.com/anivaryam/proc-compose/internal/ipc"
 )
 
 const SchemaVersion = 1
@@ -158,6 +160,13 @@ type ReadinessObservation struct {
 	Probe      *string `json:"probe"`
 	Status     string  `json:"status"`
 	ObservedAt *string `json:"observed_at"`
+	// Owner is who answered an http or tcp probe, from the OS socket table:
+	// owned by the process's own tree, foreign (another process, named by
+	// PID), or unattributable. For a passing probe it is the answer that
+	// passed; for one that failed under foreign_listener: reject, the last
+	// answer it refused. It is null for other probes, for a probe nothing
+	// answered, and in receipts written before it existed.
+	Owner *ipc.EndpointOwner `json:"owner"`
 }
 
 type Startup struct {

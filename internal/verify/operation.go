@@ -504,6 +504,7 @@ func (a *attempt) waitReady(ctx context.Context, deadline time.Time) bool {
 	res, r := a.result, a.runner
 	cfg := r.Config
 	observed := make(map[string]time.Time)
+	owners := make(map[string]*ipc.EndpointOwner)
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -531,6 +532,7 @@ func (a *attempt) waitReady(ctx context.Context, deadline time.Time) bool {
 			case st.Ready:
 				if _, seen := observed[name]; !seen {
 					observed[name] = a.opts.now()
+					owners[name] = st.ReadinessOwner
 				}
 			default:
 				allReady = false
@@ -559,11 +561,22 @@ func (a *attempt) waitReady(ctx context.Context, deadline time.Time) bool {
 	for _, st := range last {
 		byName[st.Name] = st
 	}
+	// The loop can end on runDone with a snapshot taken before the runner's
+	// last state change, so the owner an unready process's readiness refused
+	// is read from a snapshot taken now.
+	final := map[string]ipc.ProcState{}
+	for _, st := range r.Snapshot() {
+		final[st.Name] = st
+	}
 	for _, name := range a.selected {
 		proc := cfg.Processes[name]
 		obs := ReadinessObservation{Process: name, Generation: byName[name].Generation, Probe: probeKind(proc), Status: StatusNotRun}
+		// A process that never became ready keeps the last answer its
+		// readiness refused (foreign_listener: reject), if any.
+		obs.Owner = final[name].ReadinessOwner
 		if at, ok := observed[name]; ok {
 			obs.ObservedAt = timestamp(at)
+			obs.Owner = owners[name]
 			obs.Status = StatusPassed
 			if obs.Probe == nil {
 				obs.Status = StatusNotConfig

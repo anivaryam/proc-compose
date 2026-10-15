@@ -40,6 +40,8 @@ response to `DIR/results/<mode>/` and the gate results to `DIR/gates.json`.
 | S2 | the build has a real regression | check fails | check fails, `eligible` |
 | S3a | the check reaches another session's dev server | passes, hiding S2's regression | `environment_ineligible` (instance, db) |
 | S3b | the build step is skipped; a stale build runs | passes, hiding the regression | `environment_ineligible` (`before.build`) |
+| S3c | the config hardcodes a port the dev server already holds | readiness passes against the dev server; the check passes against it too, and only the new api's later crash fails the attempt | `environment_ineligible`; on Linux the api's readiness `owner` is `foreign`, naming the dev server's process |
+| S3d | S3c with `foreign_listener: reject` (env-bound mode only) | — | `startup_failed`; the check never runs, and the api's readiness `owner` names the refused dev server process |
 | S4a | state configured outside the session | `startup_failed` | `startup_failed`; setup and teardown both refuse, and the foreign file is untouched |
 | S4b | two sessions share state; the second resets it during the first's check (both orders) | both pass | the first is `ineligible` on `after.fixture_run` only, with `check: passed`; the second, which then runs alone, passes as `eligible` |
 | S4c | the same order, each session with its own state | both pass | both `eligible`, on different databases |
@@ -58,8 +60,10 @@ marker times. The first session keeps its state at teardown, so the second
 isolates the reset; a teardown that deletes shared state is S4a's fault.
 
 Every run must also report verified termination. The baseline gates require
-S3a, S3b, S5, and S6b to pass and S8 to be `comparable`: if the baseline
-does not show the problem, the pilot proves nothing.
+S3a, S3b, S5, and S6b to pass, S3c's readiness to pass, and S8 to be
+`comparable`: if the baseline does not show the problem, the pilot proves
+nothing. On Linux, a gate also requires every other passing readiness probe
+in env-bound mode to be `owned`, so attribution reports no false `foreign`.
 
 ## Evidence that outlives the runtime directory
 

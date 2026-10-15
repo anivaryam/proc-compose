@@ -177,7 +177,7 @@ func procChanged(a, b config.Process) bool {
 		return true
 	}
 	if !readyWhenEqual(a.ReadyWhen, b.ReadyWhen) || !readyWhenEqual(a.HealthWhen, b.HealthWhen) ||
-		a.HealthInterval != b.HealthInterval || a.HealthAction != b.HealthAction {
+		a.HealthInterval != b.HealthInterval || a.HealthAction != b.HealthAction || a.ForeignListener != b.ForeignListener {
 		return true
 	}
 	if len(a.Env) != len(b.Env) {

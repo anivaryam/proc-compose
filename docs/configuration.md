@@ -23,6 +23,7 @@ processes:
       http: http://localhost:3000/health
     health_interval: 10          # optional — seconds between health checks
     health_action: report        # optional — report or restart
+    foreign_listener: allow      # optional — allow or reject another process's answer
     depends_on:                  # optional — wait for these processes
       - db
 ```
@@ -44,6 +45,7 @@ processes:
 | `health_when` | No | — | Ongoing health check after readiness: `http`, `tcp`, or `cmd` (see [Health Checks](#health-checks)) |
 | `health_interval` | No | `10` | Seconds between health checks; `0` uses the default; requires `health_when` |
 | `health_action` | No | `report` | `report` marks the service unhealthy; `restart` restarts it through `restart`; requires `health_when` |
+| `foreign_listener` | No | `allow` | What an `http` or `tcp` probe does with an answer from a process outside this process's tree: `allow` passes and reports it; `reject` fails the attempt (see [Who answered the probe](#who-answered-the-probe)); requires an `http` or `tcp` `ready_when` or `health_when` |
 | `depends_on` | No | — | List of process names to wait for before starting |
 
 ## Process Modes
@@ -193,7 +195,80 @@ its stderr. If `ready_timeout` passes first, the `readiness.failed` error and
 the process's last error name the last completed attempt's exit status and
 stderr, so they are visible without `--verbose`.
 
-`http` and `tcp` probes poll every 3 seconds until success or process exit. The default readiness deadline is 60 seconds — set `ready_timeout` to override (`-1` disables the limit). Without `ready_when`, a service is considered ready as soon as it starts. Tasks cannot use `ready_when` or `ready_timeout`; they become ready only after they exit successfully.
+`http` and `tcp` probes make their first attempt as soon as the process starts and then retry about once a second until success or process exit. The default readiness deadline is 60 seconds — set `ready_timeout` to override (`-1` disables the limit). Without `ready_when`, a service is considered ready as soon as it starts. Tasks cannot use `ready_when` or `ready_timeout`; they become ready only after they exit successfully.
+
+### Who answered the probe
+
+An `http` or `tcp` probe passes when *any* process answers at its address. A
+server already listening there, such as another worktree's dev server, a stale
+run or a manual `npm run dev`, makes the new process ready on the first
+attempt, before it has bound anything. This happens most with hardcoded ports:
+two copies of a stack that both use `http://localhost:3000/health` probe the
+same server. Named [ports](sessions-and-logs.md) avoid it.
+
+On Linux and Windows, proc-compose records who answered each `http` or `tcp`
+readiness probe and health check that got an answer. Every attempt opens its
+own connection (probes do not reuse connections), and as soon as it is
+connected, before the request is sent, proc-compose finds the server side of
+that connection and the process holding it: on Linux in the kernel's socket
+table (`/proc/net/tcp` and `tcp6`) and `/proc/<pid>/fd`, on Windows in the TCP
+table, which names each socket's owning process. Doing this before the server
+can answer means a server that answers and then hands its port to another
+process is still the one named. A connection the server has not accepted yet
+is attributed to the listener whose queue holds it. proc-compose then
+compares the holder with the incarnation's process tree: the process group on
+Linux, the Job Object on Windows.
+
+| Result | Meaning |
+|---|---|
+| `owned` | A process in the incarnation's own process tree holds the socket. `pid` and `command` name it. |
+| `foreign` | A process outside that tree, running as the same user as proc-compose, holds it. `pid` and `command` (its process name) name it. |
+| `unattributable` | The holder could not be identified, or may not be named. `reason` says why: another user's process, which is never named (for example a root-owned `docker-proxy`, or a service on Windows); a server that is not in this network namespace (a remote host, a container address, a NAT rule), where a local process on the same port is never taken for it; on Windows a process that cannot be opened, such as the System process behind `http.sys`; on macOS always, because sockets are not attributed there yet. |
+
+The result appears as `readiness_owner` and `health_owner` in `status --json`,
+as `owner` on each `verify` readiness observation, and, when it is `foreign`,
+as a `readiness.foreign_listener` or `health.foreign_listener` warning event.
+The health warning is logged when the answer becomes foreign or changes to
+another foreign holder, not on every check. Like `last_error`,
+`readiness_owner` describes the latest incarnation until the next one starts;
+`health_owner` is shown only while the process runs.
+
+By default (`foreign_listener: allow`) attribution only reports. It does not
+change readiness, health, `depends_on`, `--wait-ready` or the `verify` verdict.
+It never signals the processes it names, and it reads only their process
+name, not their command line, environment or working directory.
+
+Set `foreign_listener: reject` to refuse foreign answers:
+
+```yaml
+processes:
+  web:
+    cmd: npm run dev
+    ready_when:
+      http: http://localhost:5173/
+    foreign_listener: reject
+```
+
+With `reject`, a probe attempt answered by a `foreign` process counts as a
+failed attempt. Readiness keeps polling, so `depends_on`, `up --wait-ready` and
+`verify` wait for the process's own server. If it never answers,
+`ready_timeout` fails the process with an error that names the holder, for
+example `readiness probe (http) timed out (last attempt: answered at
+127.0.0.1:5173 by PID 4242 (node), outside web's process tree)`. The first
+refusal is logged as a `readiness.foreign_listener` warning, and the refused
+answer is kept as `readiness_owner`, so it is still there when the process
+fails for another reason, such as its own bind failing. A health check
+answered by a `foreign` process counts as a failed check, with the holder in
+`health_error`. An `unattributable` answer is never refused, so on macOS
+`reject` changes nothing. The same holds for a port published by rootful
+Docker: its `docker-proxy` runs as root, so the answer is `unattributable`.
+`reject` then neither refuses your own container nor catches another
+copy's container on that port.
+
+Do not use `reject` for a service that hands its listening socket to a
+process outside its tree, such as a detached daemon, PM2, WSL's port relay or
+rootless Podman's port forwarder: those answers are `foreign` even though they
+are expected, and `reject` would hold readiness until it times out.
 
 ## Health Checks
 

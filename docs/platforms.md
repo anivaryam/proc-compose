@@ -11,6 +11,7 @@
 | Named pipes IPC | Unix sockets | Unix sockets | Full |
 | Graceful stop (`--timeout`) | Full (SIGTERM) | Full (SIGTERM) | N/A (always `taskkill /F`) |
 | `init` template | POSIX shell | POSIX shell | PowerShell |
+| [Probe owner attribution](configuration.md#who-answered-the-probe) | Full (procfs) | N/A (`unattributable`) | Full (TCP table and Job Object) |
 
 ## Linux
 

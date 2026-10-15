@@ -1239,6 +1239,46 @@ func TestLoad_HealthWhen(t *testing.T) {
 	}
 }
 
+// TestLoad_ForeignListener pins foreign_listener: allow by default, reject
+// accepted on a process with an http or tcp probe for it to apply to, and
+// every misuse refused with a stable code at the field.
+func TestLoad_ForeignListener(t *testing.T) {
+	cfg := loadFromString(t, "processes:\n  api:\n    cmd: serve\n    ready_when:\n      http: http://localhost:3000/\n")
+	if got := cfg.Processes["api"].EffectiveForeignListener(); got != ForeignListenerAllow {
+		t.Fatalf("default foreign_listener = %q, want %q", got, ForeignListenerAllow)
+	}
+	for name, body := range map[string]string{
+		"http readiness": "    ready_when:\n      http: http://localhost:3000/\n",
+		"tcp readiness":  "    ready_when:\n      tcp: localhost:3000\n",
+		"tcp health":     "    ready_when:\n      log: listening\n    health_when:\n      tcp: localhost:3000\n",
+	} {
+		t.Run("accepts reject with "+name, func(t *testing.T) {
+			cfg := loadFromString(t, "processes:\n  api:\n    cmd: serve\n"+body+"    foreign_listener: reject\n")
+			if got := cfg.Processes["api"].EffectiveForeignListener(); got != ForeignListenerReject {
+				t.Fatalf("foreign_listener = %q, want reject", got)
+			}
+		})
+	}
+	for _, tc := range []struct{ name, body, code string }{
+		{"unknown policy", "    ready_when:\n      tcp: localhost:1\n    foreign_listener: warn\n", CodeInvalidValue},
+		{"no probe", "    foreign_listener: reject\n", CodeInvalidValue},
+		{"only cmd and log probes", "    ready_when:\n      cmd: check\n    health_when:\n      cmd: check\n    foreign_listener: reject\n", CodeInvalidValue},
+		{"task", "    mode: task\n    foreign_listener: reject\n", CodeTaskIncompatible},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: serve\n"+tc.body))
+			var verr *ValidationError
+			if !errors.As(err, &verr) || verr.Code != tc.code || FormatPath(verr.Path) != "processes.api.foreign_listener" {
+				t.Fatalf("err = %v (%+v), want %s at processes.api.foreign_listener", err, verr, tc.code)
+			}
+		})
+	}
+	// Enum parity with the schema: every published policy loads.
+	for _, policy := range ForeignListenerPolicies {
+		loadFromString(t, "processes:\n  api:\n    cmd: serve\n    ready_when:\n      tcp: localhost:1\n    foreign_listener: "+policy+"\n")
+	}
+}
+
 func TestLoad_ModeTaskRejectsReadyWhen(t *testing.T) {
 	yaml := `
 processes:
@@ -1450,6 +1490,7 @@ func TestLoad_ModeTeardown(t *testing.T) {
 		{"health_when", "    health_when:\n      tcp: localhost:1\n", CodeTaskIncompatible},
 		{"health_interval", "    health_interval: 3\n", CodeTaskIncompatible},
 		{"health_action", "    health_action: report\n", CodeTaskIncompatible},
+		{"foreign_listener", "    foreign_listener: reject\n", CodeTaskIncompatible},
 		{"ports", "    ports:\n      http: 0\n", CodeTaskIncompatible},
 		{"depends_on", "    depends_on: [api]\n", CodeTaskIncompatible},
 		{"shutdown_timeout", "    shutdown_timeout: 6\n", CodeInvalidValue},
