@@ -45,7 +45,7 @@ processes:
 | `health_when` | No | — | Ongoing health check after readiness: `http`, `tcp`, or `cmd` (see [Health Checks](#health-checks)) |
 | `health_interval` | No | `10` | Seconds between health checks; `0` uses the default; requires `health_when` |
 | `health_action` | No | `report` | `report` marks the service unhealthy; `restart` restarts it through `restart`; requires `health_when` |
-| `foreign_listener` | No | `allow` | What an `http` or `tcp` probe does with an answer from a process outside this process's tree: `allow` passes and reports it; `reject` fails the attempt (see [Who answered the probe](#who-answered-the-probe)); requires an `http` or `tcp` `ready_when` or `health_when` |
+| `foreign_listener` | No | `allow` | What an `http` or `tcp` probe does with an answer from a process outside this process's tree: `allow` passes and reports it, except that `verify` refuses an answer from another live session unless given `--allow-cross-session`; `reject` fails the attempt (see [Who answered the probe](#who-answered-the-probe)); requires an `http` or `tcp` `ready_when` or `health_when` |
 | `depends_on` | No | — | List of process names to wait for before starting |
 
 ## Process Modes
@@ -225,16 +225,42 @@ Linux, the Job Object on Windows.
 | `foreign` | A process outside that tree, running as the same user as proc-compose, holds it. `pid` and `command` (its process name) name it. |
 | `unattributable` | The holder could not be identified, or may not be named. `reason` says why: another user's process, which is never named (for example a root-owned `docker-proxy`, or a service on Windows); a server that is not in this network namespace (a remote host, a container address, a NAT rule), where a local process on the same port is never taken for it; on Windows a process that cannot be opened, such as the System process behind `http.sys`; on macOS always, because sockets are not attributed there yet. |
 
+A `foreign` answer is also placed against the other sessions in the same
+runtime directory (the ones `proc-compose sessions` lists), read when the
+answer is judged, and gets a `scope`:
+
+| `scope` | Meaning |
+|---|---|
+| `cross_session` | It belongs to another live session. `session` names it (`name`, `run_id`, `config_path`, `worktree`) and gives the `evidence`: `holder` when the holder is a member of a process group that session recorded (Linux only; the group is proven by its leader's start time, as crash recovery proves it), with `process` naming the group; `port_lease` when the answered port is one that session was assigned and leases, with `process` and `port` naming the assignment. |
+| `outside_session` | No live session is known to hold it: a program proc-compose did not start, a session in another runtime directory, or a session whose supervisor is no longer running. |
+
+A session counts as live only while its supervisor (the `up` process or
+daemon, or the `verify` process) is still running with the start time its PID
+file recorded, so a finished or crashed session never makes an answer
+`cross_session`, even when processes it started still run, and neither does
+one whose supervisor has exited but has not been reaped yet (a zombie on
+Linux, or on Windows a process some handle still holds open). `scope` is absent
+for `owned` and `unattributable` answers, for a `foreign` answer that the
+same session's own record places (another of its processes, through its
+recorded process group on Linux or a port it leases), and in records written
+by earlier versions. Another process of the same session that its record does
+not place, such as one on a hardcoded port it does not lease on Windows, is
+`outside_session`; neither is ever refused.
+
 The result appears as `readiness_owner` and `health_owner` in `status --json`,
 as `owner` on each `verify` readiness observation, and, when it is `foreign`,
-as a `readiness.foreign_listener` or `health.foreign_listener` warning event.
+as a `readiness.foreign_listener` or `health.foreign_listener` warning event,
+whose message names the other session of a `cross_session` answer. The
+journal's state events carry the same owner, with its `scope` and `session`.
 The health warning is logged when the answer becomes foreign or changes to
 another foreign holder, not on every check. Like `last_error`,
 `readiness_owner` describes the latest incarnation until the next one starts;
 `health_owner` is shown only while the process runs.
 
 By default (`foreign_listener: allow`) attribution only reports. It does not
-change readiness, health, `depends_on`, `--wait-ready` or the `verify` verdict.
+change readiness, health, `depends_on` or `--wait-ready`, nor the `verify`
+verdict except for a `cross_session` answer (see
+[Answers from another session under verify](#answers-from-another-session-under-verify)).
 It never signals the processes it names, and it reads only their process
 name, not their command line, environment or working directory.
 
@@ -269,6 +295,30 @@ Do not use `reject` for a service that hands its listening socket to a
 process outside its tree, such as a detached daemon, PM2, WSL's port relay or
 rootless Podman's port forwarder: those answers are `foreign` even though they
 are expected, and `reject` would hold readiness until it times out.
+
+#### Answers from another session under verify
+
+`verify` refuses a `cross_session` answer by default, the way
+`foreign_listener: reject` refuses a `foreign` one: the probe attempt counts
+as failed, readiness keeps waiting for the process's own server, and at
+`ready_timeout` the error names the other session, for example
+`readiness probe (http) timed out (last attempt: answered at 127.0.0.1:3000
+by PID 4242 (node) on a port leased by session "feature-x" (web.http, in
+/home/me/wt/feature-x), outside api's process tree)`. The first refusal is
+logged as a `readiness.foreign_listener` warning, and the refused answer is
+kept as the readiness observation's `owner`. A `health_when` check answered
+that way counts as a failed check. `outside_session` and `unattributable`
+answers are never refused this way, so a shared database or a detached daemon
+outside every session behaves as before, and so does every answer under
+`up`, `compare` and every other command, which only label them.
+
+To count such answers again, pass `verify --allow-cross-session`; the owner
+is still recorded with its `scope` and `session`.
+
+On Linux both kinds of evidence refuse. Windows records no process groups, so
+only `port_lease` evidence exists there: a holder on a hardcoded port that
+the other session does not lease is `outside_session` and is taken. macOS
+attributes nothing, so nothing is refused.
 
 ## Health Checks
 

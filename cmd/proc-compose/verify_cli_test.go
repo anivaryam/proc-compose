@@ -4,11 +4,18 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"net"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/anivaryam/proc-compose/internal/daemon"
+	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/paths"
+	"github.com/anivaryam/proc-compose/internal/session"
 )
 
 func buildCLI(t *testing.T) string {
@@ -25,9 +32,16 @@ func buildCLI(t *testing.T) string {
 
 func runVerifyCLI(t *testing.T, bin, dir string, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
+	return runVerifyCLIIn(t, bin, dir, t.TempDir(), args...)
+}
+
+// runVerifyCLIIn is runVerifyCLI with runtimeDir as the runtime directory, so
+// the command sees sessions a test recorded there.
+func runVerifyCLIIn(t *testing.T, bin, dir, runtimeDir string, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = dir
-	cmd.Env = append(cmd.Environ(), "XDG_RUNTIME_DIR="+t.TempDir())
+	cmd.Env = append(cmd.Environ(), "XDG_RUNTIME_DIR="+runtimeDir)
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	err := cmd.Run()
@@ -126,6 +140,82 @@ func TestVerifyCLI_ExitCodesAndJSONContract(t *testing.T) {
 	stdout, _, code = runVerifyCLI(t, bin, dir, "compare", "--json", "--baseline", base, "--candidate", cand, "--", "sh", "-c", `printf '%s' "$1" > "$PROC_COMPOSE_ENVIRONMENT_REPORT"`, "sh", repeated)
 	if result := decodeOne(t, stdout); code != 1 || result["status"] != "not_comparable" || !strings.Contains(stdout, `"code":"environment_unverified"`) {
 		t.Fatalf("compare with a repeated status: code %d result %v", code, result)
+	}
+}
+
+// TestVerifyCLI_RefusesCrossSessionAnswersByDefault drives the real verify
+// command: by default, a readiness probe answered on a port another live
+// session leases fails startup and names that session; --allow-cross-session
+// counts the answer again, the owner keeps the label, and human output names
+// the session. macOS attributes nothing, so it passes there either way.
+func TestVerifyCLI_RefusesCrossSessionAnswersByDefault(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture service uses POSIX sleep; Windows covered by internal/verify")
+	}
+	bin := buildCLI(t)
+	runtimeDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	// A listener that never accepts: each probe connection waits in its
+	// queue, so it is attributed to this test process.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+	supervisor := exec.Command("sleep", "60")
+	if err := supervisor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = supervisor.Process.Kill()
+		_ = supervisor.Wait()
+	})
+	devConfig := filepath.Join(t.TempDir(), "proc-compose.yml")
+	hash, err := paths.FromConfig(devConfig, "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, _ := strconv.Atoi(addr[strings.LastIndexByte(addr, ':')+1:])
+	dev := &ipc.Project{Session: "dev", RunID: "run-dev", ConfigPath: devConfig, Ports: map[string]map[string]int{"web": {"http": port}},
+		Owner: &ipc.Owner{PID: supervisor.Process.Pid, Command: "up", Worktree: "/work/dev"}}
+	if err := session.Save(paths.Metadata(hash), dev); err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.WritePID(paths.PID(hash), supervisor.Process.Pid, paths.Socket(hash)); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeCLIFile(t, filepath.Join(dir, "proc-compose.yml"), "processes:\n  api:\n    cmd: exec sleep 30\n    ready_when:\n      tcp: "+addr+"\n    ready_timeout: 1\n")
+	owner := func(result map[string]any) map[string]any {
+		obs := result["startup"].(map[string]any)["readiness_observations"].([]any)
+		owner, _ := obs[0].(map[string]any)["owner"].(map[string]any)
+		return owner
+	}
+	attributed := runtime.GOOS == "linux"
+
+	stdout, stderr, code := runVerifyCLIIn(t, bin, dir, runtimeDir, "verify", "--json", "--", "true")
+	result := decodeOne(t, stdout)
+	o := owner(result)
+	switch {
+	case !attributed:
+		if code != 0 || o["result"] != "unattributable" {
+			t.Fatalf("default on %s: code %d owner %v\nstderr: %s", runtime.GOOS, code, o, stderr)
+		}
+	case code != 1 || result["status"] != "failed" || result["check"].(map[string]any)["status"] != "not_run" ||
+		o["scope"] != "cross_session" || o["session"].(map[string]any)["name"] != "dev":
+		t.Fatalf("default: code %d result %v owner %v\nstderr: %s", code, result["status"], o, stderr)
+	}
+
+	stdout, stderr, code = runVerifyCLIIn(t, bin, dir, runtimeDir, "verify", "--json", "--allow-cross-session", "--", "true")
+	result = decodeOne(t, stdout)
+	if o := owner(result); code != 0 || result["status"] != "passed" || (attributed && o["scope"] != "cross_session") {
+		t.Fatalf("--allow-cross-session: code %d result %v owner %v\nstderr: %s", code, result["status"], o, stderr)
+	}
+
+	stdout, _, code = runVerifyCLIIn(t, bin, dir, runtimeDir, "verify", "--allow-cross-session", "--", "true")
+	if code != 0 || (attributed && (!strings.Contains(stdout, `another live session's answer: PID`) || !strings.Contains(stdout, `on a port leased by session "dev" (web.http, in /work/dev)`))) {
+		t.Fatalf("human --allow-cross-session: code %d\n%s", code, stdout)
 	}
 }
 

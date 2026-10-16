@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Session-aware probe owners. A `foreign` probe owner now also has a `scope`,
+  read from the other sessions in the same runtime directory when the answer
+  is judged: `cross_session` when the answer belongs to another live session,
+  with `session` naming it (`name`, `run_id`, `config_path`, `worktree`,
+  `process`, `port`) and its `evidence` (`holder`: the holder is a member of a
+  process group that session recorded, proven by the group leader's start
+  time, Linux only; `port_lease`: the answered port is one that session was
+  assigned and leases), or `outside_session` when no live session is known to
+  hold it. A session counts as live only while its supervisor runs with the
+  start time its PID file recorded, so a finished or crashed session never
+  does. The fields are added to `readiness_owner` and `health_owner` in
+  `status --json`, to the `owner` of `verify` readiness observations, and to
+  the journal's state events; the `result` values and existing fields are
+  unchanged. Warnings and human `verify` output name the other session.
+  Receipts written by earlier versions have no `scope`, and earlier versions
+  ignore it. macOS attributes no answers, so none are placed there.
+- `verify --allow-cross-session` counts readiness and health answers from
+  another live session again (see Changed).
+
+### Changed
+
+- `verify` refuses a readiness or health answer from another live session
+  (`scope: cross_session`) by default, the way `foreign_listener: reject`
+  refuses a foreign one: readiness keeps waiting for the process's own server
+  and, at `ready_timeout`, fails with an error naming the other session, so
+  the attempt fails at startup; a health check counts as failed. On Linux
+  both `holder` and `port_lease` evidence refuse; on Windows, which records no
+  process groups, only `port_lease` does; macOS never refuses. Answers that
+  are `outside_session` or `unattributable` are taken as before, and `up`,
+  `compare` and the other commands only label such answers. Pass
+  `--allow-cross-session` to restore the previous behavior. The
+  `examples/environment-report` pilot now expects this refusal for S3c, and
+  runs its baseline with `--allow-cross-session` when the baseline binary has
+  it.
+
 ## [1.9.0] - 2026-10-15
 
 ### Added

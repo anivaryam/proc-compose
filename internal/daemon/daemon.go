@@ -53,6 +53,14 @@ type ProcInfo struct {
 	StartTime uint64 // start time in clock ticks since boot
 }
 
+// ExitedState reports whether a ProcStat state letter means the process has
+// terminated: Z is a zombie awaiting its reaper, X and x the dead and
+// in-death-transit states of exit. Such a process keeps its pid and start
+// time until it is reaped.
+func ExitedState(state byte) bool {
+	return state == 'Z' || state == 'X' || state == 'x'
+}
+
 // Reexec re-executes the current binary with args, fully detached from the
 // terminal (new session, stdin closed, stdout+stderr → logPath).
 // Returns as soon as the child is launched; does NOT wait.
@@ -204,6 +212,23 @@ func IsAliveFromPIDFile(pidPath string) (bool, int) {
 		return true, pid // can't read → assume our PID
 	}
 	return cur == startedAt, pid
+}
+
+// StartProven reports whether rec's process is running now as the process
+// that wrote rec: its pid names a process that is still running, not one
+// that has exited and awaits its reaper, and its start time equals the
+// recorded one. Unlike IsAliveFromPIDFile it never falls back to the pid
+// alone, so a record without a start time (an older file, or macOS) or a
+// process whose start time cannot be read is not proven; and it does not
+// count an exited process that keeps its pid and start time (a zombie on
+// Linux, or on Windows a process some handle still holds open). Use it where
+// a stale record must never count as live.
+func StartProven(rec Record) bool {
+	if rec.PID <= 0 || rec.StartedAt == 0 || !IsAlive(rec.PID) {
+		return false
+	}
+	cur, running, err := procRunningStart(rec.PID)
+	return err == nil && running && cur == rec.StartedAt
 }
 
 // Cleanup removes the PID and socket files (best-effort, ignores errors).

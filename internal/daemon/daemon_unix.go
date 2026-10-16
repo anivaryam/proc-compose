@@ -51,6 +51,21 @@ func procStartTime(pid int) (uint64, error) {
 	return info.StartTime, nil
 }
 
+// procRunningStart is procStartTime for StartProven, which must also know
+// whether the process still runs: a zombie keeps its pid and start time, and
+// kill(pid, 0) still succeeds for it. One ProcStat read gives both. Off Linux
+// there is no start time, so nothing is reported running.
+func procRunningStart(pid int) (start uint64, running bool, err error) {
+	if runtime.GOOS != "linux" {
+		return 0, false, nil
+	}
+	info, err := ProcStat(pid)
+	if err != nil {
+		return 0, false, err
+	}
+	return info.StartTime, !ExitedState(info.State), nil
+}
+
 // ProcStat reads a process's state, process group and start time from
 // /proc/<pid>/stat. It is the single parser of that file. Off Linux it
 // returns errors.ErrUnsupported.

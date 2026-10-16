@@ -4,9 +4,12 @@ package daemon
 
 import (
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // TestProcStat_MatchesProcStartTimeAndPgrp is the parity test for the single
@@ -50,5 +53,77 @@ func TestHostIdentity_LinuxNonEmptyStable(t *testing.T) {
 	}
 	if again := HostIdentity(); again != h {
 		t.Fatalf("HostIdentity changed: %+v then %+v", h, again)
+	}
+}
+
+// TestStartProven_ZombieIsNotProven pins that a supervisor that has exited
+// but not been reaped is not live: a zombie keeps its pid and start time, and
+// kill(pid, 0) still succeeds for it. IsAliveFromPIDFile, which `sessions`
+// uses, keeps its own semantics and still reports it.
+func TestStartProven_ZombieIsNotProven(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reaped := false
+	t.Cleanup(func() {
+		if !reaped {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	path := filepath.Join(t.TempDir(), "child.pid")
+	if err := WritePID(path, cmd.Process.Pid, ""); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := ReadRecord(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !StartProven(rec) {
+		t.Fatalf("StartProven(%+v) = false for a running child", rec)
+	}
+	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		info, err := ProcStat(cmd.Process.Pid)
+		if err != nil {
+			t.Fatalf("ProcStat(killed child): %v", err)
+		}
+		if info.State == 'Z' {
+			if info.StartTime != rec.StartedAt {
+				t.Fatalf("zombie start time %d, recorded %d", info.StartTime, rec.StartedAt)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("killed child never became a zombie (state %q)", info.State)
+		}
+	}
+	if StartProven(rec) {
+		t.Fatal("StartProven = true for an exited, unreaped child (zombie)")
+	}
+	if alive, _ := IsAliveFromPIDFile(path); !alive {
+		t.Fatal("IsAliveFromPIDFile changed: it no longer reports the zombie")
+	}
+	_ = cmd.Wait()
+	reaped = true
+	if StartProven(rec) {
+		t.Fatal("StartProven = true for a reaped child")
+	}
+}
+
+// TestExitedState names the terminated procfs states.
+func TestExitedState(t *testing.T) {
+	for _, state := range []byte("ZXx") {
+		if !ExitedState(state) {
+			t.Errorf("ExitedState(%q) = false", state)
+		}
+	}
+	for _, state := range []byte("RSDTtIWP") {
+		if ExitedState(state) {
+			t.Errorf("ExitedState(%q) = true", state)
+		}
 	}
 }

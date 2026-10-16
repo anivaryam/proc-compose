@@ -1290,7 +1290,7 @@ func (r *Runner) handleProbeResult(p procInfo, st *procState, gen uint64, kind s
 			r.broadcastState(p, st)
 			r.processLog(p, "info", "process.ready", "ready ("+kind+" probe)")
 			if owner != nil && owner.Result == ipc.OwnerForeign {
-				r.processLog(p, "warn", "readiness.foreign_listener", foreignListenerMessage(p.name, "readiness probe ("+kind+")", owner, false))
+				r.processLog(p, "warn", "readiness.foreign_listener", foreignListenerMessage(p.name, "readiness probe ("+kind+")", owner, ""))
 			}
 		}
 		return
