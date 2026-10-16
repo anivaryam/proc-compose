@@ -78,30 +78,9 @@ func RecoverGroups(groups []daemon.Group, host daemon.Host, mode RecoveryMode, d
 		}
 	}()
 
-	current := currentHost()
-	switch {
-	case runtime.GOOS == "linux" && (host.BootID == "" || current.BootID == ""):
-		// Without both boot ids a record from a previous boot cannot be told
-		// apart: the namespace check below does not catch a reboot, because
-		// the initial namespaces keep their inode numbers across boots.
+	if outcome, reason := hostVerdict(host); reason != "" {
 		for _, r := range rs {
-			r.finish(OutcomeUnknown, "boot_unknown")
-		}
-		return recoveryResults(rs)
-	case host.BootID != "" && current.BootID != "" && host.BootID != current.BootID:
-		// Nothing from another boot survives it; nothing is enumerated.
-		for _, r := range rs {
-			r.finish(OutcomeEmpty, "rebooted")
-		}
-		return recoveryResults(rs)
-	case host.PIDNS != current.PIDNS || host.TimeNS != current.TimeNS || !procOwn():
-		// Pids from another pid namespace, and start times from another time
-		// namespace, name nothing here. Neither does a /proc mounted for
-		// another pid namespace: every proof reads it, while a pidfd opens
-		// the pid in ours, so a proof would be about one process and the
-		// signal would reach another.
-		for _, r := range rs {
-			r.finish(OutcomeUnknown, "namespace_mismatch")
+			r.finish(outcome, reason)
 		}
 		return recoveryResults(rs)
 	}
@@ -137,6 +116,62 @@ func RecoverGroups(groups []daemon.Group, host daemon.Host, mode RecoveryMode, d
 		r.conclude()
 	}
 	return recoveryResults(rs)
+}
+
+// hostVerdict applies the record-wide identity rules to host, the identity
+// stored with a record of process groups. It returns no reason when the
+// record's pids and start times name processes here; otherwise the outcome
+// every group of the record gets, and why.
+func hostVerdict(host daemon.Host) (outcome, reason string) {
+	current := currentHost()
+	switch {
+	case runtime.GOOS == "linux" && (host.BootID == "" || current.BootID == ""):
+		// Without both boot ids a record from a previous boot cannot be told
+		// apart: the namespace check below does not catch a reboot, because
+		// the initial namespaces keep their inode numbers across boots.
+		return OutcomeUnknown, "boot_unknown"
+	case host.BootID != "" && current.BootID != "" && host.BootID != current.BootID:
+		// Nothing from another boot survives it; nothing is enumerated.
+		return OutcomeEmpty, "rebooted"
+	case host.PIDNS != current.PIDNS || host.TimeNS != current.TimeNS || !procOwn():
+		// Pids from another pid namespace, and start times from another time
+		// namespace, name nothing here. Neither does a /proc mounted for
+		// another pid namespace: every proof reads it, while a pidfd opens
+		// the pid in ours, so a proof would be about one process and the
+		// signal would reach another.
+		return OutcomeUnknown, "namespace_mismatch"
+	}
+	return "", ""
+}
+
+// recordedGroupOf returns the group among groups, recorded with host, that the
+// running process pid is a member of. The group is proven as RecoverAssessOnly
+// proves one, without a pidfd or a signal: the record passes hostVerdict, and
+// the group's leader is alive with the recorded start time and still leads
+// it, so pid's group is the recorded one and not a later group that reused
+// the number. A group whose leader is gone, or that has no recorded start
+// time (macOS), is never claimed, whatever its members.
+func recordedGroupOf(pid int, groups []daemon.Group, host daemon.Host) (daemon.Group, bool) {
+	if pid <= 0 || len(groups) == 0 {
+		return daemon.Group{}, false
+	}
+	if _, reason := hostVerdict(host); reason != "" {
+		return daemon.Group{}, false
+	}
+	info, err := daemon.ProcStat(pid)
+	if err != nil || info.PGID <= 1 {
+		return daemon.Group{}, false
+	}
+	for _, g := range groups {
+		if g.PGID != info.PGID || g.LeaderStart == 0 {
+			continue
+		}
+		r := recovery{RecoveredGroup: RecoveredGroup{GroupResult: GroupResult{Name: g.Name, PGID: g.PGID}, LeaderStart: g.LeaderStart}, leader: -1}
+		if r.leaderIdentity() == "" {
+			return g, true
+		}
+	}
+	return daemon.Group{}, false
 }
 
 // assessCrashedRun decides whether a new run may take over pidPath; see

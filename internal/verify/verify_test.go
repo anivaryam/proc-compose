@@ -329,6 +329,165 @@ func TestRun_ForeignListenerRejectFailsStartupNamingTheHolder(t *testing.T) {
 	}
 }
 
+// otherLiveSession records, in the fixture's runtime directory, a live
+// session named name that leases addr's port as web.http, the way a dev stack
+// started with up does. A helper process stands in for its supervisor.
+func otherLiveSession(t *testing.T, name, addr string) {
+	t.Helper()
+	supervisor := exec.Command(os.Args[0], "-test.run=^$", "60s")
+	supervisor.Env = append(os.Environ(), helperEnv+"=sleep")
+	if err := supervisor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = supervisor.Process.Kill()
+		_ = supervisor.Wait()
+	})
+	configPath := filepath.Join(t.TempDir(), "proc-compose.yml")
+	hash, err := paths.FromConfig(configPath, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, portText, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portText)
+	project := &ipc.Project{Session: name, RunID: "run-" + name, ConfigPath: configPath, Ports: map[string]map[string]int{"web": {"http": port}},
+		Owner: &ipc.Owner{PID: supervisor.Process.Pid, Command: "up", Worktree: "/work/" + name}}
+	if err := session.Save(paths.Metadata(hash), project); err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.WritePID(paths.PID(hash), supervisor.Process.Pid, paths.Socket(hash)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRun_CrossSessionAnswerFailsStartupNamingTheSession is verify's side of
+// the cross-session refusal. With RefuseCrossSession (the verify command's
+// default) a probe another live session's leased port answers does not make
+// the stack ready: startup fails, the check never runs, and the receipt's
+// readiness owner names that session. Without it (--allow-cross-session) the
+// attempt passes as before and the owner still carries the label. On macOS
+// answers are unattributable and never refused.
+func TestRun_CrossSessionAnswerFailsStartupNamingTheSession(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})}
+	go srv.Serve(ln)
+	defer srv.Close()
+	attributed := runtime.GOOS == "linux" || runtime.GOOS == "windows"
+	for name, refuse := range map[string]bool{"refused": true, "allowed": false} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, `processes:
+  api:
+    cmd: {{BIN}} 30s
+    env:
+      `+helperEnv+`: sleep
+    ready_when:
+      http: http://`+ln.Addr().String()+`/
+    ready_timeout: 1
+`)
+			otherLiveSession(t, "dev", ln.Addr().String())
+			opts := f.options(t, "", checkArgv("exit", "0")...)
+			opts.RefuseCrossSession = refuse
+			result := Run(context.Background(), opts)
+			assertComplete(t, result)
+			obs := result.Startup.ReadinessObservations
+			if len(obs) != 1 || obs[0].Owner == nil {
+				t.Fatalf("readiness = %+v, want one attributed observation", obs)
+			}
+			owner := obs[0].Owner
+			switch {
+			case !attributed:
+				if result.Status != StatusPassed || owner.Result != ipc.OwnerUnattributable || owner.Scope != "" {
+					t.Fatalf("result = %s, owner %+v; want passed and unattributable on %s", result.Status, owner, runtime.GOOS)
+				}
+				return
+			case refuse:
+				if result.Status != StatusFailed || result.Startup.Status != StatusFailed || result.Check.Status != StatusNotRun {
+					t.Fatalf("result = %s startup=%s check=%s errors=%v; want a startup failure", result.Status, result.Startup.Status, result.Check.Status, result.Errors)
+				}
+			default:
+				if result.Status != StatusPassed {
+					t.Fatalf("result = %s errors=%v; --allow-cross-session should pass", result.Status, result.Errors)
+				}
+			}
+			if owner.Result != ipc.OwnerForeign || owner.PID != os.Getpid() || owner.Scope != ipc.ScopeCrossSession || owner.Session == nil ||
+				owner.Session.Name != "dev" || owner.Session.Process != "web" || owner.Session.Port != "http" || owner.Session.Evidence != ipc.EvidencePortLease || owner.Session.Worktree != "/work/dev" {
+				t.Fatalf("readiness owner = %+v (session %+v), want foreign, cross_session, naming dev's web.http", owner, owner.Session)
+			}
+			receipt, err := ReadReceipt(*result.ReceiptPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := receipt.Startup.ReadinessObservations[0].Owner
+			if got == nil || got.Scope != owner.Scope || got.Session == nil || *got.Session != *owner.Session {
+				t.Fatalf("receipt readiness owner = %+v, want %+v", got, owner)
+			}
+		})
+	}
+}
+
+// TestReadReceipt_OwnerScopeIsAdditive pins receipt compatibility for the
+// session labels: a receipt written before scope existed still reads, with
+// no scope, and a receipt that has one still decodes into the owner shape
+// earlier versions read, which ignores the new fields.
+func TestReadReceipt_OwnerScopeIsAdditive(t *testing.T) {
+	dir := t.TempDir()
+	older := filepath.Join(dir, "older.json")
+	body := `{"schema_version":1,"kind":"verify.receipt","state":"completed","status":"passed","startup":{"status":"passed","readiness_observations":[` +
+		`{"process":"api","generation":1,"probe":"http","status":"passed","observed_at":null,"owner":{"result":"foreign","address":"127.0.0.1:3000","pid":42,"command":"node"}}]}}`
+	if err := os.WriteFile(older, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := ReadReceipt(older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := receipt.Startup.ReadinessObservations[0].Owner; o == nil || o.Result != ipc.OwnerForeign || o.PID != 42 || o.Scope != "" || o.Session != nil {
+		t.Fatalf("older receipt owner = %+v", o)
+	}
+
+	labelled := &ipc.EndpointOwner{Result: ipc.OwnerForeign, Address: "127.0.0.1:3000", PID: 42, Command: "node", Scope: ipc.ScopeCrossSession,
+		Session: &ipc.OwnerSession{Name: "dev", RunID: "r1", Worktree: "/work/dev", Process: "web", Port: "http", Evidence: ipc.EvidencePortLease}}
+	newer := filepath.Join(dir, "newer.json")
+	result := &Result{SchemaVersion: SchemaVersion, State: StateCompleted, Status: StatusPassed,
+		Startup: Startup{ReadinessObservations: []ReadinessObservation{{Process: "api", Status: StatusPassed, Owner: labelled}}}}
+	if err := WriteReceipt(newer, result); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err = ReadReceipt(newer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o := receipt.Startup.ReadinessObservations[0].Owner; o == nil || o.Scope != labelled.Scope || o.Session == nil || *o.Session != *labelled.Session {
+		t.Fatalf("labelled receipt owner = %+v", o)
+	}
+	data, err := os.ReadFile(newer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var earlier struct {
+		Startup struct {
+			ReadinessObservations []struct {
+				Owner *struct {
+					Result  string `json:"result"`
+					Address string `json:"address"`
+					PID     int    `json:"pid"`
+					Command string `json:"command"`
+					Reason  string `json:"reason"`
+				} `json:"owner"`
+			} `json:"readiness_observations"`
+		} `json:"startup"`
+	}
+	if err := json.Unmarshal(data, &earlier); err != nil {
+		t.Fatal(err)
+	}
+	if o := earlier.Startup.ReadinessObservations[0].Owner; o == nil || o.Result != ipc.OwnerForeign || o.PID != 42 || o.Address != "127.0.0.1:3000" {
+		t.Fatalf("earlier owner shape decoded %+v", o)
+	}
+}
+
 // TestProbeKind_NamesEveryReadinessKind keeps the receipt's probe field in step
 // with the probe kinds config accepts: a cmd probe is a probe, not unprobed.
 func TestProbeKind_NamesEveryReadinessKind(t *testing.T) {

@@ -23,7 +23,9 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/registry"
 )
 
 const attestHelperEnv = "PROC_COMPOSE_ATTEST_HELPER"
@@ -526,6 +528,166 @@ func TestRun_ReadinessOwnerIsRecorded(t *testing.T) {
 	if !strings.Contains(journal.String(), `"code":"readiness.foreign_listener"`) {
 		t.Fatalf("journal has no readiness.foreign_listener event:\n%s", journal.String())
 	}
+}
+
+// holderGroup starts the attest helper listening in its own process group,
+// requests from it, and returns its address, the PID that served (a
+// grandchild of the leader) and the group record a session would hold.
+func holderGroup(t *testing.T) (addr string, server int, group []daemon.Group) {
+	t.Helper()
+	pgid, port := startAttestGroup(t, "127.0.0.1:0", "serve")
+	addr = net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	conn, _ := dialProbe(t, addr)
+	server = requestPID(t, conn)
+	info, err := daemon.ProcStat(pgid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return addr, server, []daemon.Group{{Name: "api", PGID: pgid, LeaderStart: info.StartTime}}
+}
+
+// TestPlaceAnswer_HolderEvidence is the holder half of session placement: a
+// listener in a process group another live session recorded is that
+// session's, whatever its port, and that evidence outranks another session's
+// lease on the port. A crashed session (supervisor gone, group still
+// running) never places it, and neither does this run's own session.
+func TestPlaceAnswer_HolderEvidence(t *testing.T) {
+	addr, server, group := holderGroup(t)
+	_, portText, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portText)
+	for _, tc := range []struct {
+		name     string
+		register func(t *testing.T)
+		scope    string
+		session  string
+		process  string
+		portName string
+	}{
+		{"live session's group", func(t *testing.T) {
+			registerSession(t, "feature-y", otherSupervisor(t), nil, group)
+		}, ipc.ScopeCrossSession, "feature-y", "api", ""},
+		{"its own named port", func(t *testing.T) {
+			registerSession(t, "feature-y", otherSupervisor(t), map[string]map[string]int{"api": {"http": port}}, group)
+		}, ipc.ScopeCrossSession, "feature-y", "api", "http"},
+		{"holder outranks another lease", func(t *testing.T) {
+			registerSession(t, "a-lessee", otherSupervisor(t), leased(addr), nil)
+			registerSession(t, "feature-y", otherSupervisor(t), nil, group)
+		}, ipc.ScopeCrossSession, "feature-y", "api", ""},
+		{"crashed session", func(t *testing.T) {
+			registerSession(t, "crashed", exitedSupervisor(t), nil, group)
+		}, ipc.ScopeOutsideSession, "", "", ""},
+		{"own session", func(t *testing.T) {
+			registerSession(t, "mine", otherSupervisor(t), nil, group)
+		}, "", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+			tc.register(t)
+			sessions, err := registry.Discover()
+			if err != nil {
+				t.Fatal(err)
+			}
+			scope, s := placeAnswer(sessions, "run-mine", server, addr)
+			if scope != tc.scope || (tc.session == "") != (s == nil) {
+				t.Fatalf("placeAnswer = %q %+v, want %q in %q", scope, s, tc.scope, tc.session)
+			}
+			if s != nil && (s.Name != tc.session || s.Process != tc.process || s.Port != tc.portName || s.Evidence != ipc.EvidenceHolder || s.Worktree != "/work/"+tc.session) {
+				t.Fatalf("session = %+v, want %s's %s.%s by holder evidence", s, tc.session, tc.process, tc.portName)
+			}
+		})
+	}
+}
+
+// TestRun_CrossSessionHolderIsRefusedUnderVerify is the holder variant of
+// the verify refusal on Linux: a listener in another live session's recorded
+// group answers on a port that session does not lease (a hardcoded port).
+// Its answer is refused and the error names the session and its process.
+func TestRun_CrossSessionHolderIsRefusedUnderVerify(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	addr, server, group := holderGroup(t)
+	registerSession(t, "feature-y", otherSupervisor(t), nil, group)
+	r := makeRunner(map[string]config.Process{
+		"api": {Cmd: helperCmd("sleep", "30s"), Restart: "never", ReadyTimeout: 2, ReadyWhen: &config.ReadyWhen{TCP: addr}},
+	})
+	r.RefuseCrossSession = true
+	run := runUntil(t, r)
+	err, journal := run.wait(t, 15*time.Second)
+	st := snapshotOf(r, "api")
+	want := fmt.Sprintf(`answered at %s by PID %d`, addr, server)
+	session := `of session "feature-y" (api, in /work/feature-y)`
+	if err == nil || st.Ready || !strings.Contains(st.LastError, want) || !strings.Contains(st.LastError, session) {
+		t.Fatalf("err=%v ready=%v last_error=%q, want a refusal naming %q and %q", err, st.Ready, st.LastError, want, session)
+	}
+	if o := st.ReadinessOwner; o == nil || o.Scope != ipc.ScopeCrossSession || o.Session == nil || o.Session.Evidence != ipc.EvidenceHolder || o.Session.Process != "api" {
+		t.Fatalf("readiness_owner = %+v, want the cross_session holder", o)
+	}
+	if strings.Count(journal, `"code":"readiness.foreign_listener"`) != 1 {
+		t.Fatal("want exactly one refusal warning")
+	}
+}
+
+// TestRun_ZombieSupervisorSessionIsNotRefused is a crashed session whose
+// supervisor has not been reaped yet: a zombie keeps its pid and start time,
+// so only its state shows it is gone. Its recorded group and its leased port
+// both still match the answer, which must nevertheless be outside_session and
+// taken under the verify refusal, as for a reaped crash.
+func TestRun_ZombieSupervisorSessionIsNotRefused(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	addr, server, group := holderGroup(t)
+	supervisor := exec.Command(os.Args[0], "-test.run=^TestRunnerHelperProcess$", "--", helperSentinel, encodeHelperArgs("sleep", "60s"))
+	if err := supervisor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reaped := false
+	t.Cleanup(func() {
+		if !reaped {
+			_ = supervisor.Process.Kill()
+			_ = supervisor.Wait()
+		}
+	})
+	registerSession(t, "crashed", supervisor.Process.Pid, leased(addr), group)
+	sessions, err := registry.Discover()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope, s := placeAnswer(sessions, "run-mine", server, addr); scope != ipc.ScopeCrossSession || s == nil || s.Evidence != ipc.EvidenceHolder {
+		t.Fatalf("while its supervisor runs: %q %+v, want cross_session by holder (the fixture proves nothing otherwise)", scope, s)
+	}
+
+	if err := supervisor.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		info, err := daemon.ProcStat(supervisor.Process.Pid)
+		if err != nil {
+			t.Fatalf("ProcStat(killed supervisor): %v", err)
+		}
+		if info.State == 'Z' {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("killed supervisor never became a zombie (state %q)", info.State)
+		}
+	}
+	if sessions, err = registry.Discover(); err != nil {
+		t.Fatal(err)
+	}
+	if scope, s := placeAnswer(sessions, "run-mine", server, addr); scope != ipc.ScopeOutsideSession || s != nil {
+		t.Fatalf("zombie supervisor: %q %+v, want outside_session", scope, s)
+	}
+	r := makeRunner(map[string]config.Process{
+		"api": {Cmd: helperCmd("sleep", "30s"), Restart: "never", ReadyTimeout: 5, ReadyWhen: &config.ReadyWhen{TCP: addr}},
+	})
+	r.RefuseCrossSession = true
+	runUntil(t, r)
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Ready }, 5*time.Second) {
+		t.Fatalf("a zombie supervisor's session caused a refusal: %+v", snapshotOf(r, "api"))
+	}
+	if o := snapshotOf(r, "api").ReadinessOwner; o == nil || o.Result != ipc.OwnerForeign || o.PID != server || o.Scope != ipc.ScopeOutsideSession || o.Session != nil {
+		t.Fatalf("readiness_owner = %+v, want foreign outside_session held by PID %d", o, server)
+	}
+	_ = supervisor.Wait()
+	reaped = true
 }
 
 func benchmarkAttribute(b *testing.B, foreign bool) {

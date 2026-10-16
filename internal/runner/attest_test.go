@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -18,7 +21,11 @@ import (
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/paths"
+	"github.com/anivaryam/proc-compose/internal/registry"
+	"github.com/anivaryam/proc-compose/internal/session"
 )
 
 func ap(s string) netip.AddrPort { return netip.MustParseAddrPort(s) }
@@ -546,5 +553,342 @@ func TestRun_HandoffAnswerBelongsToItsResponder(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// otherSupervisor starts a helper process that stands in for another
+// session's supervisor and returns its PID. Cleanup ends it.
+func otherSupervisor(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRunnerHelperProcess$", "--", helperSentinel, encodeHelperArgs("sleep", "60s"))
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return cmd.Process.Pid
+}
+
+// exitedSupervisor returns the PID of a helper process that has already
+// exited, the supervisor of a crashed or finished session.
+func exitedSupervisor(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRunnerHelperProcess$", "--", helperSentinel, encodeHelperArgs("exit", "0"))
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	return cmd.Process.Pid
+}
+
+// registerSession records a session named name in the runtime directory as
+// up and verify do: metadata with its assigned ports and its owner's
+// worktree (/work/<name>), and a PID file naming supervisor with its start
+// time and, when groups is not nil, the groups it launched. It returns the
+// session's hash. The caller points XDG_RUNTIME_DIR at a test directory.
+func registerSession(t *testing.T, name string, supervisor int, ports map[string]map[string]int, groups []daemon.Group) string {
+	t.Helper()
+	configPath := filepath.Join(t.TempDir(), "proc-compose.yml")
+	hash, err := paths.FromConfig(configPath, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := &ipc.Project{Session: name, RunID: "run-" + name, ConfigPath: configPath, Ports: ports,
+		Owner: &ipc.Owner{PID: supervisor, Command: "up", Worktree: "/work/" + name}}
+	if err := session.Save(paths.Metadata(hash), project); err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.WritePID(paths.PID(hash), supervisor, paths.Socket(hash)); err != nil {
+		t.Fatal(err)
+	}
+	if groups != nil {
+		if err := daemon.WriteGroups(paths.PID(hash), supervisor, groups); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return hash
+}
+
+// restampSession rewrites a registered session's PID file with startedAt as
+// its supervisor's start time: 0 for a file that predates start times, or a
+// wrong value for a PID the system has since reused.
+func restampSession(t *testing.T, hash string, startedAt func(uint64) uint64) {
+	t.Helper()
+	rec, err := daemon.ReadRecord(paths.PID(hash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.StartedAt = startedAt(rec.StartedAt)
+	data, _ := json.Marshal(rec)
+	if err := daemon.WriteFileAtomic(paths.PID(hash), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// leased is the named-port assignment of one port to web.http.
+func leased(addr string) map[string]map[string]int {
+	_, port, _ := net.SplitHostPort(addr)
+	n, _ := strconv.Atoi(port)
+	return map[string]map[string]int{"web": {"http": n}}
+}
+
+// TestRefusalOf_OnlyForeignAnswersAreRefused pins which answers a policy
+// refuses: foreign_listener: reject refuses every foreign answer, and the
+// cross-session refusal only a foreign answer placed in another live
+// session. Owned and unattributable answers are never refused, whatever
+// they carry.
+func TestRefusalOf_OnlyForeignAnswersAreRefused(t *testing.T) {
+	cross := &ipc.EndpointOwner{Result: ipc.OwnerForeign, PID: 7, Scope: ipc.ScopeCrossSession, Session: &ipc.OwnerSession{Name: "x", Evidence: ipc.EvidencePortLease}}
+	outside := &ipc.EndpointOwner{Result: ipc.OwnerForeign, PID: 7, Scope: ipc.ScopeOutsideSession}
+	unplaced := &ipc.EndpointOwner{Result: ipc.OwnerForeign, PID: 7}
+	owned := &ipc.EndpointOwner{Result: ipc.OwnerOwned, PID: 7, Scope: ipc.ScopeCrossSession}
+	unattributable := &ipc.EndpointOwner{Result: ipc.OwnerUnattributable, Reason: "hidden", Scope: ipc.ScopeCrossSession}
+	for _, tc := range []struct {
+		name               string
+		owner              *ipc.EndpointOwner
+		reject, crossRefus bool
+		want               string
+	}{
+		{"no owner", nil, true, true, ""},
+		{"owned", owned, true, true, ""},
+		{"unattributable", unattributable, true, true, ""},
+		{"outside_session", outside, false, true, ""},
+		{"foreign, registry unread", unplaced, false, true, ""},
+		{"cross_session under verify", cross, false, true, refusedAsCrossSession},
+		{"cross_session under up", cross, false, false, ""},
+		{"cross_session under reject", cross, true, true, refusedByReject},
+		{"outside_session under reject", outside, true, false, refusedByReject},
+	} {
+		if got := refusalOf(tc.owner, tc.reject, tc.crossRefus); got != tc.want {
+			t.Errorf("%s: refusalOf = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestPlaceAnswer_ScopesByLiveSession is the port-lease half of the session
+// placement: an answer on a port another session leases is cross_session
+// only while that session's supervisor is proven live by PID plus start time.
+// A finished or crashed session, a PID file whose PID was reused, and one
+// without a start time never place it; this run's own session leaves it
+// without a scope. Where processes have no start time (macOS) no other
+// session is ever proven live.
+func TestPlaceAnswer_ScopesByLiveSession(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	live := otherSupervisor(t)
+	at := func(port int) string { return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)) }
+	registerSession(t, "live", live, leased(at(4101)), nil)
+	registerSession(t, "finished", exitedSupervisor(t), leased(at(4102)), nil)
+	restampSession(t, registerSession(t, "reused", live, leased(at(4103)), nil), func(s uint64) uint64 { return s + 1 })
+	restampSession(t, registerSession(t, "legacy", live, leased(at(4104)), nil), func(uint64) uint64 { return 0 })
+	registerSession(t, "own", otherSupervisor(t), leased(at(4105)), nil)
+	registerSession(t, "self", os.Getpid(), leased(at(4106)), nil)
+	sessions, err := registry.Discover()
+	if err != nil || len(sessions) != 6 {
+		t.Fatalf("registry = %+v, %v", sessions, err)
+	}
+	proven := false
+	for _, s := range sessions {
+		if s.Name() == "live" {
+			proven = s.Record != nil && s.Record.StartedAt != 0
+		}
+	}
+	if proven != (runtime.GOOS != "darwin") {
+		t.Fatalf("supervisor start time recorded = %v on %s", proven, runtime.GOOS)
+	}
+
+	scope, s := placeAnswer(sessions, "run-mine", os.Getpid(), at(4101))
+	switch {
+	case !proven:
+		if scope != ipc.ScopeOutsideSession || s != nil {
+			t.Fatalf("live session without start times: %q %+v, want outside_session", scope, s)
+		}
+	case scope != ipc.ScopeCrossSession || s == nil || s.Name != "live" || s.RunID != "run-live" || !strings.HasSuffix(s.ConfigPath, "proc-compose.yml") ||
+		s.Worktree != "/work/live" || s.Process != "web" || s.Port != "http" || s.Evidence != ipc.EvidencePortLease:
+		t.Fatalf("live session's leased port: %q %+v, want cross_session naming it", scope, s)
+	}
+	for port, why := range map[int]string{4102: "finished", 4103: "reused pid", 4104: "no start time", 4199: "not leased"} {
+		if scope, s := placeAnswer(sessions, "run-mine", os.Getpid(), at(port)); scope != ipc.ScopeOutsideSession || s != nil {
+			t.Errorf("%s: %q %+v, want outside_session", why, scope, s)
+		}
+	}
+	if scope, s := placeAnswer(sessions, "run-own", os.Getpid(), at(4105)); scope != "" || s != nil {
+		t.Errorf("own session by run ID: %q %+v, want no scope", scope, s)
+	}
+	if scope, s := placeAnswer(sessions, "run-mine", os.Getpid(), at(4106)); scope != "" || s != nil {
+		t.Errorf("own session by PID file: %q %+v, want no scope", scope, s)
+	}
+	if scope, s := placeAnswer(sessions, "run-mine", os.Getpid(), "not an address"); scope != ipc.ScopeOutsideSession || s != nil {
+		t.Errorf("unparsable address: %q %+v, want outside_session", scope, s)
+	}
+}
+
+// TestPlaceForeign_OnlyForeignAnswersArePlaced pins that placement refines
+// foreign answers only: an owned or unattributable answer on another live
+// session's leased port is left exactly as attribution reported it.
+func TestPlaceForeign_OnlyForeignAnswersArePlaced(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	addr := freeAddr(t)
+	registerSession(t, "other", otherSupervisor(t), leased(addr), nil)
+	r := &Runner{}
+	for _, o := range []ipc.EndpointOwner{
+		{Result: ipc.OwnerOwned, Address: addr, PID: os.Getpid()},
+		{Result: ipc.OwnerUnattributable, Address: addr, Reason: "hidden"},
+	} {
+		got := o
+		r.placeForeign(&got)
+		if got != o {
+			t.Errorf("placeForeign changed %+v to %+v", o, got)
+		}
+	}
+	foreign := &ipc.EndpointOwner{Result: ipc.OwnerForeign, Address: addr, PID: os.Getpid()}
+	r.placeForeign(foreign)
+	if foreign.Scope == "" || (foreign.Scope == ipc.ScopeCrossSession) != (runtime.GOOS != "darwin") {
+		t.Fatalf("foreign answer placed as %+v", foreign)
+	}
+}
+
+// TestRun_CrossSessionAnswerIsRefusedUnderVerify is the default verify sets
+// (RefuseCrossSession): an answer on a port another live session leases does
+// not make the process ready. Readiness times out with an error naming that
+// session, the refused answer stays as readiness_owner, and one warning is
+// logged. macOS attributes nothing, so there the answer is unattributable
+// and taken.
+func TestRun_CrossSessionAnswerIsRefusedUnderVerify(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	addr := foreignServer(t)
+	registerSession(t, "feature-x", otherSupervisor(t), leased(addr), nil)
+	for kind, rw := range map[string]*config.ReadyWhen{"tcp": {TCP: addr}, "http": {HTTP: "http://" + addr + "/"}} {
+		t.Run(kind, func(t *testing.T) {
+			r := makeRunner(map[string]config.Process{
+				"api": {Cmd: helperCmd("sleep", "30s"), Restart: "never", ReadyTimeout: 2, ReadyWhen: rw},
+			})
+			r.RefuseCrossSession = true
+			run := runUntil(t, r)
+			if !attributedHere() {
+				if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Ready }, 5*time.Second) {
+					t.Fatalf("an unattributable answer was refused on %s: %+v", runtime.GOOS, snapshotOf(r, "api"))
+				}
+				if o := snapshotOf(r, "api").ReadinessOwner; o == nil || o.Result != ipc.OwnerUnattributable || o.Scope != "" {
+					t.Fatalf("readiness_owner = %+v, want unattributable and unplaced", o)
+				}
+				return
+			}
+			err, journal := run.wait(t, 15*time.Second)
+			st := snapshotOf(r, "api")
+			want := fmt.Sprintf(`answered at %s by PID %d`, addr, os.Getpid())
+			session := `on a port leased by session "feature-x" (web.http, in /work/feature-x)`
+			if st.Ready || !strings.Contains(st.LastError, "timed out") || !strings.Contains(st.LastError, want) || !strings.Contains(st.LastError, session) {
+				t.Fatalf("ready=%v last_error=%q, want a timeout naming %q and %q", st.Ready, st.LastError, want, session)
+			}
+			o := st.ReadinessOwner
+			if o == nil || o.Result != ipc.OwnerForeign || o.Scope != ipc.ScopeCrossSession || o.Session == nil || o.Session.Name != "feature-x" || o.Session.Evidence != ipc.EvidencePortLease {
+				t.Fatalf("readiness_owner after the refusal = %+v (session %+v), want the refused cross_session answer", o, o.Session)
+			}
+			if err == nil || strings.Count(journal, `"code":"readiness.foreign_listener"`) != 1 || !strings.Contains(journal, "verify does not count another live session's answer") {
+				t.Fatalf("Run err = %v; want a failure and exactly one cross-session refusal warning in the journal", err)
+			}
+			if !strings.Contains(journal, `"scope":"cross_session"`) {
+				t.Fatal("the journal's state events do not carry the owner's scope")
+			}
+		})
+	}
+}
+
+// TestRun_CrossSessionAnswerIsOnlyLabelledWithoutRefusal is up's side, and
+// verify's with --allow-cross-session: the same answer makes the process
+// ready, as before, and is labelled with the other session.
+func TestRun_CrossSessionAnswerIsOnlyLabelledWithoutRefusal(t *testing.T) {
+	if !attributedHere() {
+		t.Skip("socket owners are not attributed on " + runtime.GOOS)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	addr := foreignServer(t)
+	registerSession(t, "feature-x", otherSupervisor(t), leased(addr), nil)
+	r := makeRunner(map[string]config.Process{
+		"api": {Cmd: helperCmd("sleep", "30s"), Restart: "never", ReadyTimeout: 5, ReadyWhen: &config.ReadyWhen{TCP: addr}},
+	})
+	run := runUntil(t, r)
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Ready }, 5*time.Second) {
+		t.Fatalf("a cross-session answer was refused without RefuseCrossSession: %+v", snapshotOf(r, "api"))
+	}
+	o := snapshotOf(r, "api").ReadinessOwner
+	if o == nil || o.Result != ipc.OwnerForeign || o.PID != os.Getpid() || o.Scope != ipc.ScopeCrossSession || o.Session == nil || o.Session.Name != "feature-x" {
+		t.Fatalf("readiness_owner = %+v, want foreign and labelled cross_session", o)
+	}
+	if _, journal := run.stop(); !strings.Contains(journal, `on a port leased by session \"feature-x\"`) || strings.Contains(journal, "does not count") {
+		t.Fatalf("journal does not name the session in an allow warning:\n%s", journal)
+	}
+}
+
+// TestRun_CrossSessionRefusalSparesOutsideAndStaleSessions pins what the
+// refusal never touches: an answer no session leases (outside_session), and
+// one on a port leased by a session whose supervisor has exited or whose PID
+// now belongs to another process. Those are taken, as today.
+func TestRun_CrossSessionRefusalSparesOutsideAndStaleSessions(t *testing.T) {
+	if !attributedHere() {
+		t.Skip("socket owners are not attributed on " + runtime.GOOS)
+	}
+	for name, register := range map[string]func(t *testing.T, addr string){
+		"no session": func(*testing.T, string) {},
+		"finished session": func(t *testing.T, addr string) {
+			registerSession(t, "gone", exitedSupervisor(t), leased(addr), nil)
+		},
+		"reused pid": func(t *testing.T, addr string) {
+			hash := registerSession(t, "reused", otherSupervisor(t), leased(addr), nil)
+			restampSession(t, hash, func(s uint64) uint64 { return s + 1 })
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+			addr := foreignServer(t)
+			register(t, addr)
+			r := makeRunner(map[string]config.Process{
+				"api": {Cmd: helperCmd("sleep", "30s"), Restart: "never", ReadyTimeout: 5, ReadyWhen: &config.ReadyWhen{HTTP: "http://" + addr + "/"}},
+			})
+			r.RefuseCrossSession = true
+			runUntil(t, r)
+			if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Ready }, 5*time.Second) {
+				t.Fatalf("answer refused: %+v", snapshotOf(r, "api"))
+			}
+			if o := snapshotOf(r, "api").ReadinessOwner; o == nil || o.Result != ipc.OwnerForeign || o.Scope != ipc.ScopeOutsideSession || o.Session != nil {
+				t.Fatalf("readiness_owner = %+v, want foreign outside_session", o)
+			}
+		})
+	}
+}
+
+// TestRun_CrossSessionHealthAnswerIsRefused covers health_when under the
+// refusal: a check another live session answers counts as failed, so the
+// service becomes unhealthy with that session in health_error.
+func TestRun_CrossSessionHealthAnswerIsRefused(t *testing.T) {
+	if !attributedHere() {
+		t.Skip("socket owners are not attributed on " + runtime.GOOS)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	own, foreign := freeAddr(t), foreignServer(t)
+	registerSession(t, "feature-x", otherSupervisor(t), leased(foreign), nil)
+	r := makeRunner(map[string]config.Process{
+		"api": {
+			Cmd: helperCmd("serve-http", own), Restart: "never", ReadyTimeout: 10,
+			ReadyWhen:      &config.ReadyWhen{HTTP: "http://" + own + "/"},
+			HealthWhen:     &config.ReadyWhen{TCP: foreign},
+			HealthInterval: 1,
+		},
+	})
+	r.RefuseCrossSession = true
+	run := runUntil(t, r)
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Health == healthUnhealthy }, 15*time.Second) {
+		t.Fatalf("health was not refused: %+v", snapshotOf(r, "api"))
+	}
+	st := snapshotOf(r, "api")
+	if want := `tcp: answered at ` + foreign; !strings.Contains(st.HealthError, want) || !strings.Contains(st.HealthError, `session "feature-x"`) {
+		t.Fatalf("health_error = %q, want it to name %s and the session", st.HealthError, foreign)
+	}
+	if o := st.HealthOwner; o == nil || o.Scope != ipc.ScopeCrossSession || o.Session == nil || o.Session.Name != "feature-x" {
+		t.Fatalf("health_owner = %+v, want the cross_session answer", o)
+	}
+	if _, journal := run.stop(); strings.Count(journal, `"code":"health.foreign_listener"`) != 1 || !strings.Contains(journal, "verify does not count another live session's answer") {
+		t.Fatal("want exactly one health.foreign_listener event naming the cross-session refusal")
 	}
 }

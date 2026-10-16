@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/anivaryam/proc-compose/internal/daemon"
 )
 
 type unixProcessGroup struct {
@@ -203,7 +205,8 @@ func (pg *unixProcessGroup) numericID() int {
 
 // isZombieState reports whether a procfs state letter means the process has
 // terminated. It reads daemon.ProcStat states, which only Linux provides. Z is the ordinary zombie state; X and x are the dead and
-// in-death-transit states used during exit.
+// in-death-transit states used during exit. daemon.ExitedState is the one
+// definition, shared with daemon.StartProven.
 func isZombieState(state byte) bool {
-	return state == 'Z' || state == 'X' || state == 'x'
+	return daemon.ExitedState(state)
 }

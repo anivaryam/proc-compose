@@ -49,7 +49,9 @@ that, an optional `health_when` probe (`http`, `tcp`, or `cmd`) keeps checking
 the service and either reports it unhealthy or restarts it. On Linux and
 Windows, each `http` or `tcp` probe also records who answered it, so a server
 from another copy of the stack on the same port is named instead of silently
-counting as ready; `foreign_listener: reject` makes such an answer not count.
+counting as ready, together with the other live session it belongs to, if
+any; `foreign_listener: reject` makes such an answer not count, and `verify`
+refuses one from another live session by default.
 
 ```yaml
 processes:

@@ -61,9 +61,11 @@ resources that must serialize. Named-port leases coordinate proc-compose
 sessions; an unrelated program can still race the application's bind, which
 must succeed and pass its configured readiness check. On Linux and Windows,
 `status --json` shows who answered that check as `readiness_owner`: `foreign`
-with the holder's PID means another program serves the port. Set
+with the holder's PID means another program serves the port, and its `scope`
+says whether that program belongs to another live session. Set
 `foreign_listener: reject` to make readiness wait for the process's own server
-instead (see [Who answered the probe](configuration.md#who-answered-the-probe)).
+instead (see [Who answered the probe](configuration.md#who-answered-the-probe));
+`verify` already does that for an answer from another live session.
 
 ## Logs for coding agents
 

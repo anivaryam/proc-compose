@@ -380,11 +380,11 @@ func (r *Runner) monitorHealth(ctx context.Context, cancel context.CancelFunc, p
 			return
 		}
 		if ok && owner != nil {
-			reject := owner.Result == ipc.OwnerForeign && p.proc.EffectiveForeignListener() == config.ForeignListenerReject
+			refusal := refusalOf(owner, p.proc.EffectiveForeignListener() == config.ForeignListenerReject, r.RefuseCrossSession)
 			if st.recordHealthOwner(ctx, gen, owner) {
-				r.processLog(p, "warn", "health.foreign_listener", foreignListenerMessage(p.name, "health check", owner, reject))
+				r.processLog(p, "warn", "health.foreign_listener", foreignListenerMessage(p.name, "health check", owner, refusal))
 			}
-			if reject {
+			if refusal != "" {
 				kind := "tcp"
 				if hw.HTTP != "" {
 					kind = "http"

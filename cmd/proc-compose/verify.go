@@ -44,6 +44,7 @@ func newVerifyCommand(configFile *string) *cobra.Command {
 		machine        bool
 		streamLogs     bool
 		requireEnv     bool
+		allowCross     bool
 		dir            string
 		startupTimeout string
 		checkTimeout   string
@@ -70,6 +71,12 @@ PROC_COMPOSE_ENVIRONMENT_REPORT. It is recorded under environment in the
 result. Any observation that did not match, or an invalid report, fails the
 attempt; --require-environment also fails it when the report is missing or
 empty. The observations are the check's own; proc-compose does not verify them.
+
+An http or tcp readiness probe or health check answered by another live
+session (its process, or a port it leases) does not count: readiness waits
+for the process's own server, and the error names that session. On macOS
+answers are never attributed, so nothing is refused. --allow-cross-session
+counts such answers again; the owner is still recorded.
 
 The target session must not already be running; verify refuses rather than
 reusing or stopping it. Receipts live under the session runtime directory
@@ -106,6 +113,7 @@ Default budgets (unmeasured policy): startup 120s (1s-10m), check 10m
 				ToolVersion:        version,
 				Log:                stderr,
 				RequireEnvironment: requireEnv,
+				RefuseCrossSession: !allowCross,
 			}
 			if !machine || streamLogs {
 				opts.ProcessOutput = stderr
@@ -141,6 +149,7 @@ Default budgets (unmeasured policy): startup 120s (1s-10m), check 10m
 	command.Flags().BoolVar(&machine, "json", false, "emit exactly one JSON result object on stdout")
 	command.Flags().BoolVar(&streamLogs, "stream-logs", false, "with --json, also stream process output to stderr (default: journal only)")
 	addRequireEnvironmentFlag(command, &requireEnv)
+	command.Flags().BoolVar(&allowCross, "allow-cross-session", false, "count readiness and health answers from another live session instead of refusing them")
 	addBudgetFlags(command, &dir, &startupTimeout, &checkTimeout, &cleanupTimeout)
 	return command
 }
@@ -184,6 +193,9 @@ func printVerifyHuman(w io.Writer, r *verify.Result) {
 		fmt.Fprintf(w, "    %s gen %d: %s (probe %s)\n", obs.Process, obs.Generation, obs.Status, probe)
 		if o := obs.Owner; o != nil && o.Result == ipc.OwnerForeign {
 			fmt.Fprintf(w, "      warning: answered at %s by PID %d (%s), outside %s's process tree\n", o.Address, o.PID, o.Command, obs.Process)
+			if o.Scope == ipc.ScopeCrossSession && o.Session != nil {
+				fmt.Fprintf(w, "      another live session's answer: PID %d %s\n", o.PID, o.Session.Describe())
+			}
 		}
 	}
 	if len(r.Startup.UnprobedProcesses) > 0 {

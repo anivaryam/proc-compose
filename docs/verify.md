@@ -38,15 +38,30 @@ with `required_failed`. A service without a readiness probe is reported as
 `http` or `tcp` readiness observation also records its `owner`: who held the
 socket that answered (`owned`, `foreign` with the holder's `pid` and `command`,
 or `unattributable` with a `reason`; `null` for other probes). A `foreign`
-owner means the check may have run against another server on that address;
-human output prints it as a warning. By default it is evidence, not a verdict.
-A process with `foreign_listener: reject` does not become ready on a foreign
-answer, so the attempt fails at startup and its readiness observation's
-`owner` is the refused holder (see [Who answered the probe](configuration.md#who-answered-the-probe)). Source revision and dirty state are
-recorded as provenance only (`loaded_code_proven: false`). Default budgets are
-startup 120s, check 10m, and an independent 30s cleanup (unmeasured policy
-defaults; override with `--startup-timeout`, `--check-timeout`,
-`--cleanup-timeout`). The cleanup budget starts once, at the first trigger
+owner also has a `scope`: `cross_session` when it belongs to another live
+session, which `session` names (its `name`, `worktree`, `process`, `port` and
+`evidence`), or `outside_session`. A `foreign` owner means the check may have
+run against another server on that address; human output prints it as a
+warning, naming the session of a `cross_session` one.
+
+An answer from another live session is refused by default: the process does
+not become ready on it, so the attempt fails at startup and its readiness
+observation's `owner` is the refused `cross_session` answer; a `health_when`
+check answered that way counts as a failed check. Pass
+`--allow-cross-session` to count such answers again (the owner keeps its
+label). An `outside_session` or `unattributable` owner is evidence, not a
+verdict, unless the process sets `foreign_listener: reject`, which refuses
+every foreign answer the same way (see
+[Who answered the probe](configuration.md#who-answered-the-probe) and
+[Answers from another session under verify](configuration.md#answers-from-another-session-under-verify)).
+Windows refuses only on a port the other session leases, and macOS never
+refuses, because it does not attribute answers. `compare` does not refuse
+such answers; it only records them.
+
+Source revision and dirty state are recorded as provenance only
+(`loaded_code_proven: false`). Default budgets are startup 120s, check 10m,
+and an independent 30s cleanup (unmeasured policy defaults; override with
+`--startup-timeout`, `--check-timeout`, `--cleanup-timeout`). The cleanup budget starts once, at the first trigger
 (check deadline, interruption, or failure), and covers check teardown, stack
 teardown, and sealing together.
 
