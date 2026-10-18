@@ -195,6 +195,41 @@ func TestIsAliveFromPIDFile_StartTimeMismatch(t *testing.T) {
 	}
 }
 
+// TestStartProven_NeverFallsBackToThePID pins the strict liveness check:
+// only a live pid with the recorded start time is proven. A record without a
+// start time, which IsAliveFromPIDFile accepts on the pid alone, is not.
+func TestStartProven_NeverFallsBackToThePID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "self.pid")
+	if err := WritePID(path, os.Getpid(), "/tmp/x.sock"); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := ReadRecord(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.StartedAt == 0 {
+		if StartProven(rec) {
+			t.Fatal("a record without a start time was proven")
+		}
+		t.Skip("no process start time on " + runtime.GOOS)
+	}
+	if !StartProven(rec) {
+		t.Fatalf("StartProven(%+v) = false for this live process", rec)
+	}
+	for name, stale := range map[string]Record{
+		"start time mismatch": {PID: rec.PID, StartedAt: rec.StartedAt + 1},
+		"no start time":       {PID: rec.PID},
+		"no pid":              {StartedAt: rec.StartedAt},
+	} {
+		if StartProven(stale) {
+			t.Errorf("%s: StartProven(%+v) = true", name, stale)
+		}
+	}
+	if alive, _ := IsAliveFromPIDFile(path); !alive {
+		t.Fatal("IsAliveFromPIDFile disagrees for the same live record")
+	}
+}
+
 // TestWriteGroups_PreservesPIDAddrAndStart pins the record contract: writing
 // the process-group record keeps the daemon's own identity intact, so liveness
 // checks still recognise the daemon, and the atomic writer leaves no temporary

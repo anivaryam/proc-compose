@@ -4,8 +4,11 @@ evidence handoff that is read after the runtime directory is gone.
   python3 pilot.py [--bin BIN] [--baseline-bin BIN] [--work DIR]
 
 Every scenario runs in two modes. "baseline" runs `check.py plain` with
---baseline-bin (today's workflow). "env-bound" runs `check.py env-bound` with
---require-environment. All sessions use a runtime directory the pilot creates
+--baseline-bin (today's workflow, without the protections under test: a
+binary that refuses another live session's readiness answers runs it with
+--allow-cross-session; an older one has no such refusal). "env-bound" runs
+`check.py env-bound` with --require-environment, using --bin with its
+defaults. All sessions use a runtime directory the pilot creates
 (XDG_RUNTIME_DIR) and removes at the end. Results, workspaces, and the evidence
 bundle stay in --work. Exits 1 if any gate fails.
 """
@@ -40,6 +43,15 @@ class Pilot:
         self.order = {}
         self.gates = []
         self.holders = {}
+        self.flags = {}
+
+    def allows_cross_session(self, binary):
+        """Whether binary's verify has --allow-cross-session, which only a
+        binary that refuses another live session's answers has."""
+        if binary not in self.flags:
+            help_text = subprocess.run([binary, "verify", "--help"], env=self.env, capture_output=True, text=True).stdout
+            self.flags[binary] = "--allow-cross-session" in help_text
+        return self.flags[binary]
 
     # Workspaces: one worktree per fault, copied from this directory.
     def workspace(self, name, src=None, build=None, edit_config=None):
@@ -92,6 +104,10 @@ class Pilot:
         flags = ["--require-environment"] if required else []
         check = check or ("env-bound" if mode == "env-bound" else "plain")
         binary = self.baseline_bin if mode == "baseline" else self.bin
+        if mode == "baseline" and self.allows_cross_session(binary):
+            # The baseline is the workflow before verify refused another
+            # live session's answers, so S3c can still show the problem.
+            flags.append("--allow-cross-session")
         proc = self.cli(ws, f"{mode}-{session}", "verify", "--json", "--cleanup-timeout", "30s", *flags,
                         "--", "python3", "check.py", check, env=env, binary=binary)
         return self.record(mode, scenario, proc)
@@ -346,12 +362,32 @@ class Pilot:
             for obs in (res.get("startup") or {}).get("readiness_observations", []):
                 if obs["status"] == "passed" and obs.get("probe") in ("http", "tcp"):
                     owners[(scenario, obs["process"])] = obs.get("owner")
-        s3c = owners.pop(("S3c-hardcoded-port-held", "api"), None)
-        self.gate("baseline: S3c's readiness passes against the dev server",
-                  any(o["process"] == "api" and o["status"] == "passed" for o in r("S3c-hardcoded-port-held", "baseline")["startup"]["readiness_observations"]))
+        owners.pop(("S3c-hardcoded-port-held", "api"), None)
+        # Baseline: without the refusal, S3c's readiness passes against the
+        # dev server. A binary that has the refusal ran it with
+        # --allow-cross-session, and must still label the answer as the dev
+        # session's.
+        base = next((o for o in r("S3c-hardcoded-port-held", "baseline")["startup"]["readiness_observations"] if o["process"] == "api"), {})
+        base_owner = base.get("owner") or {}
+        labelled = not self.allows_cross_session(self.baseline_bin) or (
+            base_owner.get("scope") == "cross_session" and (base_owner.get("session") or {}).get("name") == "baseline-dev")
+        self.gate("baseline: S3c's readiness passes against the dev server" +
+                  (" (counted with --allow-cross-session, and labelled cross_session)" if self.allows_cross_session(self.baseline_bin) else ""),
+                  base.get("status") == "passed" and labelled, base)
+        # Env-bound, with --bin's defaults: verify refuses the dev server's
+        # answer as another live session's (holder evidence on Linux, where
+        # the dev api's process group is recorded), so the check never runs
+        # against it.
+        s3c = r("S3c-hardcoded-port-held")
+        refused = next((o.get("owner") for o in s3c["startup"]["readiness_observations"] if o["process"] == "api"), None) or {}
+        session = refused.get("session") or {}
         leader, group = self.holders.get("env-bound", (None, None))
-        self.gate("S3c: readiness answered by the dev server is foreign, naming a process of the dev api",
-                  s3c is not None and s3c["result"] == "foreign" and leader is not None and group == leader, (s3c, leader, group))
+        evidence_ok = session.get("evidence") == "holder" if sys.platform == "linux" else session.get("evidence") in ("holder", "port_lease")
+        self.gate("S3c: verify refuses the dev server's answer as another live session's; startup fails, the check never runs, and the receipt's owner is foreign, cross_session, naming the dev session and a process of the dev api",
+                  "startup_failed" in {e["code"] for e in s3c.get("errors", [])} and s3c["check"]["status"] == "not_run"
+                  and refused.get("result") == "foreign" and refused.get("scope") == "cross_session"
+                  and session.get("name") == "env-bound-dev" and evidence_ok and leader is not None and group == leader,
+                  (s3c.get("errors"), s3c["check"]["status"], refused, leader, group))
         s3d = r("S3d-hardcoded-port-rejected")
         refused = next((o.get("owner") for o in s3d["startup"]["readiness_observations"] if o["process"] == "api"), None)
         self.gate("S3d: foreign_listener: reject refuses the dev server; startup fails, the check never runs, and the receipt names a process of the dev api",
@@ -376,8 +412,8 @@ class Pilot:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--bin", default="proc-compose", help="proc-compose with environment reports")
-    parser.add_argument("--baseline-bin", help="proc-compose for baseline mode (default: --bin)")
+    parser.add_argument("--bin", default="proc-compose", help="proc-compose with environment reports and cross-session refusal")
+    parser.add_argument("--baseline-bin", help="proc-compose for baseline mode (default: --bin); an older binary works too")
     parser.add_argument("--work", help="directory for workspaces, results, and evidence (default: a new temporary directory)")
     pilot = Pilot(parser.parse_args())
     try:

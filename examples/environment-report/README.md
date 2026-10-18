@@ -30,9 +30,14 @@ python3 examples/environment-report/pilot.py --bin proc-compose [--baseline-bin 
 
 Every scenario runs in `baseline` mode (`check.py plain`, optionally with an
 older binary) and in `env-bound` mode (`check.py env-bound` with
-`--require-environment`). The pilot uses its own runtime directory
-(`XDG_RUNTIME_DIR`), and exits 1 if any gate fails. It writes every JSON
-response to `DIR/results/<mode>/` and the gate results to `DIR/gates.json`.
+`--require-environment`). Baseline mode is the workflow without the
+protections under test: with a binary that refuses another live session's
+readiness answers, it passes `--allow-cross-session`; an older binary has no
+such refusal and gets no flag. Env-bound mode uses `--bin` with its defaults,
+so `--bin` must be a binary with that refusal. The pilot uses its own runtime
+directory (`XDG_RUNTIME_DIR`), and exits 1 if any gate fails. It writes every
+JSON response to `DIR/results/<mode>/` and the gate results to
+`DIR/gates.json`.
 
 | Scenario | Fault | Baseline | Env-bound gate |
 |---|---|---|---|
@@ -40,8 +45,8 @@ response to `DIR/results/<mode>/` and the gate results to `DIR/gates.json`.
 | S2 | the build has a real regression | check fails | check fails, `eligible` |
 | S3a | the check reaches another session's dev server | passes, hiding S2's regression | `environment_ineligible` (instance, db) |
 | S3b | the build step is skipped; a stale build runs | passes, hiding the regression | `environment_ineligible` (`before.build`) |
-| S3c | the config hardcodes a port the dev server already holds | readiness passes against the dev server; the check passes against it too, and only the new api's later crash fails the attempt | `environment_ineligible`; on Linux the api's readiness `owner` is `foreign`, naming the dev server's process |
-| S3d | S3c with `foreign_listener: reject` (env-bound mode only) | — | `startup_failed`; the check never runs, and the api's readiness `owner` names the refused dev server process |
+| S3c | the config hardcodes a port the dev server already holds | readiness passes against the dev server (an older binary, or `--allow-cross-session`, which still labels the answer `cross_session`); the check passes against it too, and only the new api's own bind failure, when it is noticed while the check runs, fails the attempt | `startup_failed`; the check never runs: `verify` refuses the dev server's answer as another live session's, and the api's readiness `owner` is `foreign` with `scope: cross_session`, naming the dev session (evidence `holder` on Linux) and its process |
+| S3d | S3c with `foreign_listener: reject` (env-bound mode only) | — | `startup_failed`; the check never runs, and the api's readiness `owner` names the refused dev server process (`reject` refuses every foreign answer, not only another session's) |
 | S4a | state configured outside the session | `startup_failed` | `startup_failed`; setup and teardown both refuse, and the foreign file is untouched |
 | S4b | two sessions share state; the second resets it during the first's check (both orders) | both pass | the first is `ineligible` on `after.fixture_run` only, with `check: passed`; the second, which then runs alone, passes as `eligible` |
 | S4c | the same order, each session with its own state | both pass | both `eligible`, on different databases |
@@ -60,10 +65,13 @@ marker times. The first session keeps its state at teardown, so the second
 isolates the reset; a teardown that deletes shared state is S4a's fault.
 
 Every run must also report verified termination. The baseline gates require
-S3a, S3b, S5, and S6b to pass, S3c's readiness to pass, and S8 to be
-`comparable`: if the baseline does not show the problem, the pilot proves
-nothing. On Linux, a gate also requires every other passing readiness probe
-in env-bound mode to be `owned`, so attribution reports no false `foreign`.
+S3a, S3b, S5, and S6b to pass, S3c's readiness to pass against the dev server
+(with a current binary, counted through `--allow-cross-session` and labelled
+`cross_session`), and S8 to be `comparable`: if the baseline does not show
+the problem, the pilot proves nothing. In env-bound mode, S3c must then be
+refused as described above. On Linux, a gate also requires every other
+passing readiness probe in env-bound mode to be `owned`, so attribution
+reports no false `foreign`.
 
 ## Evidence that outlives the runtime directory
 

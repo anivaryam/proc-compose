@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/registry"
 )
 
 // probeConn is the connection a passing http or tcp probe attempt used: the
@@ -197,19 +200,24 @@ func classifyHolders(inodes []uint64, holders map[uint64][]socketHolder, unseen 
 	return ipc.EndpointOwner{Result: ipc.OwnerUnattributable, Reason: unseen}
 }
 
-// describeOwner is the operator-facing summary of a foreign owner.
+// describeOwner is the operator-facing summary of a foreign owner, naming
+// the other session of a cross_session one.
 func describeOwner(o *ipc.EndpointOwner) string {
 	who := fmt.Sprintf("PID %d", o.PID)
 	if o.Command != "" {
 		who += " (" + o.Command + ")"
 	}
+	if o.Scope == ipc.ScopeCrossSession && o.Session != nil {
+		who += " " + o.Session.Describe()
+	}
 	return who
 }
 
 // attribute identifies who answered conn for p's current incarnation, whose
-// process group exec registered under p's name before any probe started. A
-// result computed against a group a restart has since replaced is dropped
-// by the generation guards that record it.
+// process group exec registered under p's name before any probe started, and
+// places a foreign answer against the live-session registry. A result
+// computed against a group a restart has since replaced is dropped by the
+// generation guards that record it.
 func (r *Runner) attribute(p procInfo, conn probeConn) *ipc.EndpointOwner {
 	r.groupsMu.Lock()
 	pg := r.groups[p.name]
@@ -217,22 +225,128 @@ func (r *Runner) attribute(p procInfo, conn probeConn) *ipc.EndpointOwner {
 	if pg == nil {
 		return &ipc.EndpointOwner{Result: ipc.OwnerUnattributable, Reason: "the process has no group"}
 	}
-	return attributeProbe(conn, pg)
+	owner := attributeProbe(conn, pg)
+	r.placeForeign(owner)
+	return owner
+}
+
+// placeForeign sets the scope of a foreign owner from the live-session
+// registry, read now, so every session's liveness is re-validated when the
+// answer is judged. Anything else is left as it is. A foreign owner is left
+// without a scope only if listing the registry fails outright; a runtime
+// directory that cannot be read lists no sessions, so its foreign answers
+// are outside_session.
+func (r *Runner) placeForeign(owner *ipc.EndpointOwner) {
+	if owner == nil || owner.Result != ipc.OwnerForeign {
+		return
+	}
+	sessions, err := registry.Discover()
+	if err != nil {
+		return
+	}
+	runID := ""
+	if r.Project != nil {
+		runID = r.Project.RunID
+	}
+	owner.Scope, owner.Session = placeAnswer(sessions, runID, owner.PID, owner.Address)
+}
+
+// placeAnswer finds the session an answer at address, held by holder, belongs
+// to. This run's own session is recognised by its run ID or by a PID file
+// naming this process; any other session counts only while its supervisor is
+// proven live by PID plus start time (daemon.StartProven), so a stale or
+// crashed session never does. A holder in a process group a session
+// recorded, with the leader's identity proven (recordedGroupOf), is that
+// session's whatever the port. Otherwise an answered port that a session was
+// assigned, and so leases, is that session's. A match with this run's own
+// session is no other session's and gets no scope; a match with another
+// session is cross_session; no match is outside_session.
+func placeAnswer(sessions []registry.Session, runID string, holder int, address string) (string, *ipc.OwnerSession) {
+	port := 0
+	if ap, err := netip.ParseAddrPort(address); err == nil {
+		port = int(ap.Port())
+	}
+	var lease *ipc.OwnerSession
+	leaseOwn := false
+	for _, s := range sessions {
+		own := (runID != "" && s.Project.RunID == runID) || (s.Record != nil && s.Record.PID == os.Getpid())
+		if !own && (s.Record == nil || !daemon.StartProven(*s.Record)) {
+			continue
+		}
+		process, portName, leased := s.PortAssignment(port)
+		if s.Record != nil && s.Record.Groups != nil {
+			if g, ok := recordedGroupOf(holder, *s.Record.Groups, s.Record.Host); ok {
+				if own {
+					return "", nil
+				}
+				if process != g.Name {
+					portName = ""
+				}
+				return ipc.ScopeCrossSession, ownerSession(s, g.Name, portName, ipc.EvidenceHolder)
+			}
+		}
+		if leased && lease == nil {
+			lease, leaseOwn = ownerSession(s, process, portName, ipc.EvidencePortLease), own
+		}
+	}
+	switch {
+	case lease == nil:
+		return ipc.ScopeOutsideSession, nil
+	case leaseOwn:
+		return "", nil
+	}
+	return ipc.ScopeCrossSession, lease
+}
+
+// ownerSession describes s as the session an answer belongs to.
+func ownerSession(s registry.Session, process, port, evidence string) *ipc.OwnerSession {
+	o := &ipc.OwnerSession{Name: s.Name(), RunID: s.Project.RunID, ConfigPath: s.Project.ConfigPath, Process: process, Port: port, Evidence: evidence}
+	if s.Project.Owner != nil {
+		o.Worktree = s.Project.Owner.Worktree
+	}
+	return o
+}
+
+// Policies that refuse a foreign answer, named in its warning.
+const (
+	refusedByReject       = "foreign_listener: reject"
+	refusedAsCrossSession = "cross_session"
+)
+
+// refusalOf says which policy refuses owner, or "" when the answer counts.
+// foreign_listener: reject refuses every foreign answer; refuseCrossSession
+// (verify's default) refuses one that belongs to another live session. An
+// owned, unattributable or outside_session answer is never refused by the
+// latter.
+func refusalOf(owner *ipc.EndpointOwner, reject, refuseCrossSession bool) string {
+	switch {
+	case owner == nil || owner.Result != ipc.OwnerForeign:
+		return ""
+	case reject:
+		return refusedByReject
+	case refuseCrossSession && owner.Scope == ipc.ScopeCrossSession:
+		return refusedAsCrossSession
+	}
+	return ""
 }
 
 // foreignListenerMessage is the warning for a probe a foreign process
-// answered. rejected says that foreign_listener: reject refused the answer.
-func foreignListenerMessage(name, probe string, o *ipc.EndpointOwner, rejected bool) string {
+// answered. refusal is the policy that refused the answer, if any.
+func foreignListenerMessage(name, probe string, o *ipc.EndpointOwner, refusal string) string {
 	msg := fmt.Sprintf("%s was answered at %s by %s, which is not part of %s's process tree; another server holds this address",
 		probe, o.Address, describeOwner(o), name)
-	if rejected {
+	switch refusal {
+	case refusedByReject:
 		return msg + "; foreign_listener: reject does not count that answer"
+	case refusedAsCrossSession:
+		return msg + "; verify does not count another live session's answer (verify --allow-cross-session counts it)"
 	}
 	return msg + ", so the probe does not show that " + name + " is serving"
 }
 
-// foreignListenerError is the failed-attempt detail for an answer
-// foreign_listener: reject refused.
+// foreignListenerError is the failed-attempt detail for a refused foreign
+// answer: one foreign_listener: reject refused, or another live session's
+// answer that Runner.RefuseCrossSession refused, which describeOwner names.
 func foreignListenerError(name string, o *ipc.EndpointOwner) error {
 	return fmt.Errorf("answered at %s by %s, outside %s's process tree", o.Address, describeOwner(o), name)
 }
@@ -240,24 +354,27 @@ func foreignListenerError(name string, o *ipc.EndpointOwner) error {
 // ownerCheck attributes every attempt of one readiness probe run, for
 // incarnation gen of st, when its connection is dialed, and judges the
 // answered ones. Under foreign_listener: reject it refuses an answer
-// attributed to a foreign process: the refusal is recorded as the
+// attributed to a foreign process, and with Runner.RefuseCrossSession one
+// that belongs to another live session: the refusal is recorded as the
 // incarnation's readiness owner, and the first one is logged and broadcast.
 // An unattributable answer is always taken. owner is who answered the
 // attempt that was taken. A probe run calls it from one goroutine only.
 type ownerCheck struct {
-	r      *Runner
-	p      procInfo
-	st     *procState
-	gen    uint64
-	probe  string
-	reject bool
-	warned bool
-	owner  *ipc.EndpointOwner
+	r                  *Runner
+	p                  procInfo
+	st                 *procState
+	gen                uint64
+	probe              string
+	reject             bool
+	refuseCrossSession bool
+	warned             bool
+	owner              *ipc.EndpointOwner
 }
 
 func (r *Runner) newOwnerCheck(p procInfo, st *procState, gen uint64, kind string) *ownerCheck {
 	return &ownerCheck{r: r, p: p, st: st, gen: gen, probe: "readiness probe (" + kind + ")",
-		reject: p.proc.EffectiveForeignListener() == config.ForeignListenerReject}
+		reject:             p.proc.EffectiveForeignListener() == config.ForeignListenerReject,
+		refuseCrossSession: r.RefuseCrossSession}
 }
 
 func (c *ownerCheck) attribute(conn probeConn) *ipc.EndpointOwner { return c.r.attribute(c.p, conn) }
@@ -266,14 +383,15 @@ func (c *ownerCheck) accept(owner *ipc.EndpointOwner) error {
 	if owner == nil {
 		owner = &ipc.EndpointOwner{Result: ipc.OwnerUnattributable, Reason: "the probe connection was not recorded"}
 	}
-	if !c.reject || owner.Result != ipc.OwnerForeign {
+	refusal := refusalOf(owner, c.reject, c.refuseCrossSession)
+	if refusal == "" {
 		c.owner = owner
 		return nil
 	}
 	if c.st.recordRefusedOwner(c.gen, owner) && !c.warned {
 		c.warned = true
 		c.r.broadcastState(c.p, c.st)
-		c.r.processLog(c.p, "warn", "readiness.foreign_listener", foreignListenerMessage(c.p.name, c.probe, owner, true))
+		c.r.processLog(c.p, "warn", "readiness.foreign_listener", foreignListenerMessage(c.p.name, c.probe, owner, refusal))
 	}
 	return foreignListenerError(c.p.name, owner)
 }

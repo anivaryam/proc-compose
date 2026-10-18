@@ -53,6 +53,11 @@ type Runner struct {
 	AttemptID     string
 	ResolveConfig func(*config.Config) (*config.Config, error)
 	RecordPath    string // daemon PID file that records launched process groups (Unix); empty disables recording
+	// RefuseCrossSession refuses an http or tcp readiness or health answer
+	// that belongs to another live session (scope cross_session), as
+	// foreign_listener: reject refuses a foreign one. verify sets it unless
+	// --allow-cross-session is given; up never does.
+	RefuseCrossSession bool
 	// TeardownDeadline, when set, returns a time the teardown phase must end
 	// by, earlier than its fixed budget would; verify passes its cleanup
 	// deadline minus the seal reserve.

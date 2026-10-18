@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -76,6 +77,28 @@ const (
 	OwnerUnattributable = "unattributable"
 )
 
+// Scopes of a foreign answer, placed against the live-session registry.
+const (
+	// ScopeCrossSession means the answer belongs to another live
+	// proc-compose session in this runtime directory; Session names it.
+	ScopeCrossSession = "cross_session"
+	// ScopeOutsideSession means no live session is known to hold the
+	// answer: a program proc-compose did not start, a session in another
+	// runtime directory, or a session that is no longer live.
+	ScopeOutsideSession = "outside_session"
+)
+
+// Evidence that a cross_session answer belongs to the other session.
+const (
+	// EvidenceHolder means the holder is a member of a process group the
+	// other session recorded, proven by the group leader's start time.
+	EvidenceHolder = "holder"
+	// EvidencePortLease means the answered port is one the other session
+	// was assigned and leases for its lifetime; the holder itself was not
+	// proven to be one of its processes.
+	EvidencePortLease = "port_lease"
+)
+
 // EndpointOwner records which process held the server side of the connection
 // a passing http or tcp probe used, as the OS socket table reports it.
 type EndpointOwner struct {
@@ -84,6 +107,56 @@ type EndpointOwner struct {
 	PID     int    `json:"pid,omitempty"`     // the holder, when identified
 	Command string `json:"command,omitempty"` // the holder's process name
 	Reason  string `json:"reason,omitempty"`  // why the holder is unattributable
+	// Scope refines a foreign result: cross_session or outside_session. It
+	// is empty for owned and unattributable answers, for a foreign answer
+	// that this session's own record places (another of its processes, by
+	// its recorded process group on Linux, or a port it leases), if listing
+	// the registry fails, and in records written before it existed. Another
+	// process of this session that its record does not place (on Windows a
+	// hardcoded port it does not lease; on Linux a process outside its
+	// recorded groups) is outside_session.
+	Scope string `json:"scope,omitempty"`
+	// Session names the other session of a cross_session answer.
+	Session *OwnerSession `json:"session,omitempty"`
+}
+
+// OwnerSession names the live session a cross_session answer belongs to and
+// the evidence for it.
+type OwnerSession struct {
+	Name       string `json:"name"` // the session name, "default" for the unnamed one
+	RunID      string `json:"run_id,omitempty"`
+	ConfigPath string `json:"config_path,omitempty"`
+	Worktree   string `json:"worktree,omitempty"` // where its owner started it, when known
+	// Process is the holder's recorded group for holder evidence, otherwise
+	// the process the answered port is assigned to; Port is that named port.
+	Process  string `json:"process,omitempty"`
+	Port     string `json:"port,omitempty"`
+	Evidence string `json:"evidence"` // holder | port_lease
+}
+
+// Describe says, for operators, how an answer relates to the session: of
+// session "x" (api, in /w/x) for a holder in its process group, or on a port
+// leased by session "x" (api.http, in /w/x).
+func (s *OwnerSession) Describe() string {
+	what := s.Process
+	if s.Port != "" {
+		what += "." + s.Port
+	}
+	var detail []string
+	if what != "" {
+		detail = append(detail, what)
+	}
+	if s.Worktree != "" {
+		detail = append(detail, "in "+s.Worktree)
+	}
+	desc := fmt.Sprintf("session %q", s.Name)
+	if len(detail) > 0 {
+		desc += " (" + strings.Join(detail, ", ") + ")"
+	}
+	if s.Evidence == EvidenceHolder {
+		return "of " + desc
+	}
+	return "on a port leased by " + desc
 }
 
 // LogEntry is a single log line emitted by a managed process.

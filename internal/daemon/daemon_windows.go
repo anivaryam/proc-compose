@@ -50,6 +50,33 @@ func procStartTime(pid int) (uint64, error) {
 		return 0, err
 	}
 	defer syscall.CloseHandle(h)
+	return creationTime(h)
+}
+
+// procRunningStart is procStartTime for StartProven, which must also know
+// whether the process still runs: an exited process stays openable, with the
+// same creation time, while any handle to it is open. Only a wait that times
+// out at once proves it still runs; the exit code cannot, because a process
+// may exit with STILL_ACTIVE's value.
+func procRunningStart(pid int) (start uint64, running bool, err error) {
+	const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+	h, err := syscall.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|syscall.SYNCHRONIZE, false, uint32(pid))
+	if err != nil {
+		return 0, false, err
+	}
+	defer syscall.CloseHandle(h)
+	if start, err = creationTime(h); err != nil {
+		return 0, false, err
+	}
+	event, err := syscall.WaitForSingleObject(h, 0)
+	if err != nil {
+		return 0, false, err
+	}
+	return start, event == syscall.WAIT_TIMEOUT, nil
+}
+
+// creationTime is the creation time of the process h, from GetProcessTimes.
+func creationTime(h syscall.Handle) (uint64, error) {
 	var creation, exit, kernel, user syscall.Filetime
 	if err := syscall.GetProcessTimes(h, &creation, &exit, &kernel, &user); err != nil {
 		return 0, err

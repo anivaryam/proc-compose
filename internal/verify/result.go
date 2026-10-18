@@ -162,10 +162,14 @@ type ReadinessObservation struct {
 	ObservedAt *string `json:"observed_at"`
 	// Owner is who answered an http or tcp probe, from the OS socket table:
 	// owned by the process's own tree, foreign (another process, named by
-	// PID), or unattributable. For a passing probe it is the answer that
-	// passed; for one that failed under foreign_listener: reject, the last
-	// answer it refused. It is null for other probes, for a probe nothing
-	// answered, and in receipts written before it existed.
+	// PID), or unattributable. A foreign owner's scope says whether it
+	// belongs to another live session (cross_session, naming it) or not
+	// (outside_session). For a passing probe it is the answer that passed;
+	// for one that failed under foreign_listener: reject, or because the
+	// attempt refused another live session's answer, the last answer it
+	// refused. It is null for other probes, for a probe nothing answered,
+	// and in receipts written before it existed; receipts written before
+	// scope existed have none.
 	Owner *ipc.EndpointOwner `json:"owner"`
 }
 

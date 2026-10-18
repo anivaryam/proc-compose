@@ -305,6 +305,12 @@ func RecoverGroups(groups []daemon.Group, _ daemon.Host, _ RecoveryMode, _ time.
 	return out
 }
 
+// recordedGroupOf claims no group on Windows, which records none: a holder is
+// never proven to be in another session's tree here.
+func recordedGroupOf(int, []daemon.Group, daemon.Host) (daemon.Group, bool) {
+	return daemon.Group{}, false
+}
+
 // assessCrashedRun keeps the pre-record behaviour on Windows: a live daemon
 // refuses the start, and any other PID file is stale, because its managed
 // trees ended with the daemon's kill-on-close Job Objects.

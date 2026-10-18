@@ -12,6 +12,7 @@
 | Graceful stop (`--timeout`) | Full (SIGTERM) | Full (SIGTERM) | N/A (always `taskkill /F`) |
 | `init` template | POSIX shell | POSIX shell | PowerShell |
 | [Probe owner attribution](configuration.md#who-answered-the-probe) | Full (procfs) | N/A (`unattributable`) | Full (TCP table and Job Object) |
+| [Refusing another session's answer](configuration.md#answers-from-another-session-under-verify) (`verify`) | Full (holder in a recorded process group, or a leased port) | N/A (never refuses) | Leased port only (no process groups are recorded) |
 
 ## Linux
 

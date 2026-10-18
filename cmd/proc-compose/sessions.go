@@ -4,15 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
-	"github.com/anivaryam/proc-compose/internal/paths"
-	"github.com/anivaryam/proc-compose/internal/session"
+	"github.com/anivaryam/proc-compose/internal/registry"
 	"github.com/spf13/cobra"
 )
 
@@ -47,28 +44,22 @@ func sessionFlags(project *ipc.Project) string {
 	return flags
 }
 
+// discoverSessions builds the handoff view of every session the registry
+// lists, in its order.
 func discoverSessions() ([]sessionView, error) {
-	metas, err := filepath.Glob(paths.Metadata("*"))
+	sessions, err := registry.Discover()
 	if err != nil {
 		return nil, err
 	}
 	views := []sessionView{}
-	for _, meta := range metas {
-		base := filepath.Base(meta)
-		hash := strings.TrimSuffix(strings.TrimPrefix(base, "pc-"), ".meta.json")
-		project, err := session.Read(meta)
-		if err != nil {
-			continue
-		}
-		name := project.Session
-		if name == "" {
-			name = "default"
-		}
-		view := sessionView{Session: name, ConfigPath: project.ConfigPath, RunID: project.RunID, Owner: project.Owner, URLs: project.URLs}
+	for _, s := range sessions {
+		project := s.Project
+		view := sessionView{Session: s.Name(), ConfigPath: project.ConfigPath, RunID: project.RunID, Owner: project.Owner, URLs: project.URLs}
 		if view.URLs == nil {
 			view.URLs = map[string]map[string]string{}
 		}
-		if alive, pid := daemon.IsAliveFromPIDFile(paths.PID(hash)); alive {
+		if s.Live {
+			pid := s.PID
 			view.Live, view.PID = true, &pid
 			// A live `up` session is intentionally retained until stopped;
 			// a live verify session is released when its attempt finishes.
@@ -78,17 +69,11 @@ func discoverSessions() ([]sessionView, error) {
 		}
 		view.Inspect = "proc-compose " + sessionFlags(project) + " status --json"
 		// Discovery never probes the lease: a gone owner stays indeterminate.
-		if rows, err := listAttempts(hash, false); err == nil && len(rows) > 0 {
+		if rows, err := listAttempts(s.Hash, false); err == nil && len(rows) > 0 {
 			view.LatestAttempt = &rows[0]
 		}
 		views = append(views, view)
 	}
-	sort.Slice(views, func(i, j int) bool {
-		if views[i].ConfigPath != views[j].ConfigPath {
-			return views[i].ConfigPath < views[j].ConfigPath
-		}
-		return views[i].Session < views[j].Session
-	})
 	return views, nil
 }
 

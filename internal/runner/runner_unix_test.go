@@ -1908,6 +1908,60 @@ func TestRecoverGroups_AssessOnlyReportsLiveWithoutSignal(t *testing.T) {
 	assertStillRunning(t, g.PGID, "assessed leader")
 }
 
+// TestRecordedGroupOf_ProvesMembershipLikeAssessOnly pins the holder half of
+// session placement: a running process belongs to a recorded group only when
+// the record passes the host rules and the group's leader is proven by its
+// start time, as RecoverAssessOnly proves it. It opens no pidfd and sends
+// nothing.
+func TestRecordedGroupOf_ProvesMembershipLikeAssessOnly(t *testing.T) {
+	requireLinuxRecovery(t)
+	memberFile := filepath.Join(t.TempDir(), "member.pid")
+	_, g := startRecoveryGroup(t, "api", "sh", "-c", `sleep 60 & echo $! > "$1"; wait`, "sh", memberFile)
+	member, ok := waitForPIDFile(t, memberFile, 10*time.Second)
+	if !ok {
+		t.Fatal("member never recorded its PID")
+	}
+	trackProcessForCleanup(t, member, "member")
+	restore := pidfdOpen
+	pidfdOpen = func(int) (int, error) { t.Error("recordedGroupOf opened a pidfd"); return -1, syscall.ENOSYS }
+	t.Cleanup(func() { pidfdOpen = restore })
+	sent := recordSignals(t)
+	other := daemon.Group{Name: "web", PGID: 99999, LeaderStart: 1}
+	host := daemon.HostIdentity()
+
+	for _, pid := range []int{g.PGID, member} {
+		if got, ok := recordedGroupOf(pid, []daemon.Group{other, g}, host); !ok || got != g {
+			t.Fatalf("recordedGroupOf(%d) = %+v, %v; want %+v", pid, got, ok, g)
+		}
+	}
+	reused := g
+	reused.LeaderStart++
+	noStart := g
+	noStart.LeaderStart = 0
+	rebooted := host
+	rebooted.BootID = "00000000-0000-0000-0000-000000000000"
+	for name, tc := range map[string]struct {
+		pid    int
+		groups []daemon.Group
+		host   daemon.Host
+	}{
+		"leader start reused":  {member, []daemon.Group{reused}, host},
+		"no leader start":      {member, []daemon.Group{noStart}, host},
+		"another boot's group": {member, []daemon.Group{g}, rebooted},
+		"not a member":         {os.Getpid(), []daemon.Group{g}, host},
+		"no groups":            {member, nil, host},
+		"no process":           {0, []daemon.Group{g}, host},
+	} {
+		if got, ok := recordedGroupOf(tc.pid, tc.groups, tc.host); ok {
+			t.Errorf("%s: recordedGroupOf = %+v, want no group", name, got)
+		}
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("recordedGroupOf sent %v", *sent)
+	}
+	assertStillRunning(t, member, "member")
+}
+
 // TestRun_ReadyTimeoutGracefulExitCountsAsFailure is the regression for the
 // probe-cancel verdict. A readiness timeout cancels the incarnation; a service
 // that handles SIGTERM by exiting 0 used to land in the clean-exit branch, so it

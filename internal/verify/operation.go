@@ -63,6 +63,10 @@ type Options struct {
 	// RequireEnvironment fails the attempt unless the check reports an
 	// eligible environment through PROC_COMPOSE_ENVIRONMENT_REPORT.
 	RequireEnvironment bool
+	// RefuseCrossSession refuses readiness and health answers that belong
+	// to another live session (runner.Runner.RefuseCrossSession). The
+	// verify command sets it unless --allow-cross-session is given.
+	RefuseCrossSession bool
 	Now                func() time.Time
 
 	// writeReceipt is a test seam; nil uses WriteReceipt.
@@ -427,9 +431,10 @@ func (a *attempt) startAndCheck(ctx context.Context) {
 		// check teardown that already spent the budget leaves only sealing.
 		CleanupHandoffDeadline: func() time.Time { return a.beginCleanup().Add(-opts.sealReserve()) },
 		// Teardown spends the same cleanup budget and leaves the seal reserve.
-		TeardownDeadline: func() time.Time { return a.beginCleanup().Add(-opts.sealReserve()) },
-		AttemptID:        *res.AttemptID,
-		RecordPath:       pidPath,
+		TeardownDeadline:   func() time.Time { return a.beginCleanup().Add(-opts.sealReserve()) },
+		AttemptID:          *res.AttemptID,
+		RecordPath:         pidPath,
+		RefuseCrossSession: opts.RefuseCrossSession,
 	}
 	if server != nil {
 		r.IPC = server
@@ -572,7 +577,8 @@ func (a *attempt) waitReady(ctx context.Context, deadline time.Time) bool {
 		proc := cfg.Processes[name]
 		obs := ReadinessObservation{Process: name, Generation: byName[name].Generation, Probe: probeKind(proc), Status: StatusNotRun}
 		// A process that never became ready keeps the last answer its
-		// readiness refused (foreign_listener: reject), if any.
+		// readiness refused (foreign_listener: reject, or another live
+		// session's answer under RefuseCrossSession), if any.
 		obs.Owner = final[name].ReadinessOwner
 		if at, ok := observed[name]; ok {
 			obs.ObservedAt = timestamp(at)
