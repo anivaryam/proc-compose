@@ -25,8 +25,8 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why --attempt latest --j
   a session that is already running); 130 interrupted. On exit 2 with
   `session_occupied`, choose another `--session`. Never stop a session you did
   not start.
-- stdout is exactly one JSON object, even on failure; stderr holds only short
-  diagnostics. Read `status` (`passed`/`failed`/`interrupted`), then
+- After successful flag parsing, `--json` normal/semantic results are one bounded
+  object. Read `status` (`passed`/`failed`/`interrupted`), then
   `startup.status`, `check.status`/`check.exit_code`, `cleanup.status`, and
   `errors` (`{code,count}`: `startup_timeout`, `startup_failed`,
   `check_exit_nonzero`, `check_timeout`, `required_process_failed`,
@@ -44,10 +44,10 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why --attempt latest --j
   stack on a hardcoded port, so the check may have hit it. `owner.scope` says
   whose: `cross_session` is another live proc-compose session, named in
   `owner.session` (`name`, `worktree`, `process`, `port`, `evidence`);
-  `outside_session` is not a live session's. verify refuses a
-  `cross_session` answer by default, so startup fails (`startup_failed`, or
-  `startup_timeout` if `--startup-timeout` ends first) with that owner on the
-  readiness observation; an `outside_session` answer can still give
+  `outside_session` is not a live session's. verify refuses attributed
+  `cross_session` answers by default (Windows: leased ports only; macOS: never),
+  failing startup (`startup_failed`/`startup_timeout`) with that owner recorded;
+  an `outside_session` answer can still give
   `status: passed`. Treat either like an ineligible environment: use named
   ports, stop your own stale session, or set `foreign_listener: reject` on the
   process so readiness waits for its own server. `--allow-cross-session` counts another session's answer; use it only
@@ -70,8 +70,8 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why --attempt latest --j
   the environment before reading the check result. `compare` calls such
   attempts `not_comparable`.
 - Application output stays in the journal, not on stderr; `--stream-logs`
-  overrides that. Flag-parse errors before `verify --json` is recognised are
-  plain text.
+  overrides that. Flag-parse errors can return exit 2 with plaintext stderr
+  and empty stdout even after `--json`; inspect exit/stderr before decoding.
 
 ## Diagnose a failed attempt
 

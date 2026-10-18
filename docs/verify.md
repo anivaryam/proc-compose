@@ -26,9 +26,12 @@ every declared named port.
 | 2 | Usage, invalid config, or occupied session (including a crashed run whose process groups may still be running; run `stop` first) — nothing was started |
 | 130 | Interrupted (cleanup still ran) |
 
-With `--json`, stdout is exactly one JSON object (`kind: verify.response`, at
-most 64 KiB; or `verify.compact_error` if the full result cannot fit). Process
-output is kept in the journal only (read it with `why --attempt`); add
+After successful flag parsing, `--json` returns one JSON result object
+(`kind: verify.response`, at most 64 KiB; or `verify.compact_error` if the full
+result cannot fit). Flag-parsing errors are an exception: for example,
+`verify --json --bogus -- true` exits 2 with plaintext stderr and empty stdout.
+Check the exit status and stderr; do not assume every failure has JSON to decode.
+Process output is kept in the journal only (read it with `why --attempt`); add
 `--stream-logs` to also stream it to stderr, as human mode does. Each phase (`startup`, `check`, `cleanup`) keeps its own
 status, so a passing check cannot hide a crashed service or an unverified
 cleanup. A required service that stops running, restarts, or becomes
@@ -210,3 +213,6 @@ proc-compose -f "$PWD/proc-compose.yml" --session "task-$TASK_ID" verify --json 
 # on failure: proc-compose -f "$PWD/proc-compose.yml" --session "task-$TASK_ID" why --attempt latest --json
 ```
 
+For repeated checks against a deliberately retained stack, see the
+[agent and browser-test workflow](sessions-and-logs.md#agent-and-browser-test-workflow).
+`verify` always needs a fresh session; it does not attach to a retained one.

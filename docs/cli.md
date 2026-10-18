@@ -77,19 +77,29 @@ Flags (logs): see `proc-compose logs --help` and [Sessions and logs](sessions-an
 |----------|---------|--------|
 | `NO_COLOR` | runner, monitor | Any non-empty value disables ANSI colour output |
 | `PORT` | merge-port config | Used as `merge.port` when not set explicitly (cloud platforms) |
-| `XDG_RUNTIME_DIR` | daemon | Base directory for socket / PID / log files; falls back to `$TMPDIR` |
+| `XDG_RUNTIME_DIR` | daemon | Preferred runtime directory; otherwise uses the per-user cache's `proc-compose` directory, then the OS temporary directory if the cache is unavailable |
 | `PROC_COMPOSE_INSTALL_DIR` | `install.sh` | Override install target (default `~/.local/bin`) |
 | `PROC_COMPOSE_VERSION` | `install.sh` | Pin a specific release tag (e.g. `v1.2.3`) |
 
 ## Daemon file paths
 
-Each daemon is scoped per absolute config path (hashed into a stable id):
+Each daemon is scoped by its absolute config path and optional `--session` name
+(hashed into a stable id). The runtime directory is `$XDG_RUNTIME_DIR` when set;
+otherwise proc-compose creates `proc-compose` under the OS per-user cache
+directory with mode `0700`. If that directory cannot be obtained or created,
+it falls back to the OS temporary directory, which may be shared and provides
+no privacy guarantee.
+
+On Unix, the paths are:
 
 ```
-$XDG_RUNTIME_DIR/pc-<hash>.sock   # IPC socket (status/monitor/restart/reload/stop talk to this)
-$XDG_RUNTIME_DIR/pc-<hash>.pid    # daemon PID file
-$XDG_RUNTIME_DIR/pc-<hash>.log    # default log file when --log-file is not set
+<runtime-dir>/pc-<hash>.sock          # IPC socket (status/monitor/restart/reload/stop talk to this)
+<runtime-dir>/pc-<hash>.pid           # daemon PID file
+<runtime-dir>/pc-<hash>.log           # default human log when --log-file is not set
+<runtime-dir>/pc-<hash>.events.jsonl  # independent structured event journal
 ```
+
+Windows uses a named pipe (`\\.\pipe\pc-<hash>`) for IPC instead of a Unix socket.
 
 The PID file is JSON and is replaced atomically, so a reader never sees a
 partial file. On Linux and macOS it also records every process group the
@@ -104,7 +114,11 @@ is then turned off for the rest of that run with a warning, processes keep
 launching unrecorded, and the other daemon's record is left untouched. Windows records no groups; Job Objects
 end managed processes together with the daemon.
 
-`logs` reads the default `.log` path. If you ran `up --silent --log-file PATH`, the daemon writes to `PATH` instead and `logs` will report "no log file found" — read `PATH` directly.
+`logs` queries the structured event journal, not the human `.log` file.
+`up --silent --log-file PATH` redirects human output to `PATH` without disabling
+`logs`, its JSON pages, or cursor resumption. If a session was started by an
+older binary without a structured journal, `logs` reports that limitation and
+the legacy text-log path instead. See [Sessions and logs](sessions-and-logs.md#logs-for-coding-agents).
 
 ## Common tasks
 

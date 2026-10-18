@@ -65,7 +65,7 @@ with the holder's PID means another program serves the port, and its `scope`
 says whether that program belongs to another live session. Set
 `foreign_listener: reject` to make readiness wait for the process's own server
 instead (see [Who answered the probe](configuration.md#who-answered-the-probe));
-`verify` already does that for an answer from another live session.
+`verify` refuses another live session's answer by default (on Windows, only on a port that session leases; macOS does not attribute answers). See [Verified runs](verify.md).
 
 ## Logs for coding agents
 
@@ -136,3 +136,110 @@ that require restarting the stack. `restart --wait-ready` waits for the new
 generation rather than accepting an earlier incarnation's readiness. The
 optional supervisor HTTP server also exposes `/ready` alongside `/health`.
 
+## Agent and browser-test workflow
+
+Prefer [a fresh `verify` run](verify.md) when you need one owned check and a
+combined startup/check/cleanup verdict. Use a retained session only when the
+development task needs services across edits. The following commands reuse
+existing interfaces; they are not a tested integration with your application.
+Examples use placeholder config, session and process names.
+
+### Select and start an owned session
+
+Read `proc-compose agent-guide` and `<command> --help` for the installed
+version. Use the same absolute config path and session on every operation:
+
+```sh
+proc-compose -f /repo/proc-compose.yml --session task-123 config check --json
+proc-compose sessions --json
+proc-compose -f /repo/proc-compose.yml --session task-123 status --json
+```
+
+Inspect existing ownership before starting or reusing anything. A failed status
+query is not proof that an identity is free; failed commands may emit only
+stderr. An owner label is descriptive, not authorization. Choose a new session
+if the existing one belongs to another task; never stop it to make room.
+
+```sh
+proc-compose -f /repo/proc-compose.yml --session task-123 up --silent --wait-ready --wait-timeout 60 --json
+proc-compose -f /repo/proc-compose.yml --session task-123 status --json
+```
+
+Record `project.config_path`, `project.run_id`, ownership, resolved
+`project.urls` and the relevant process generations. Require application-relevant
+`ready_when` probes: an unprobed service starting is not evidence that its API,
+database or worker is usable. A failed readiness wait can leave the daemon
+running, even without an `up` JSON response. Establish which run you actually
+started before cleanup; a refused or occupied start must not trigger a stop of
+someone else's run.
+
+### Target the same application from browser and API checks
+
+Name the accountable lifecycle owner for each resource:
+
+- **Test-owned:** keep the existing Playwright `webServer` workflow if it meets
+  the task. Playwright may launch a foreground proc-compose supervisor which
+  owns its children, but verify signal forwarding and cleanup in that harness.
+- **Retained-session-owned:** pass the resolved URL, such as
+  `project.urls.web.http`, into the project's existing browser `use.baseURL`
+  and API-check inputs. Use its supported external-endpoint mode without a
+  competing server launcher. Playwright does not adopt reused servers for
+  teardown; the session owner remains responsible for them.
+
+Host-launched checks do not automatically inherit the daemon's exported port
+variables. Read the resolved URLs from `up` or `status` and pass them explicitly
+through the application's existing inputs; no universal `BASE_URL` convention
+is assumed. Confirm the actual browser and shell can both reach them.
+
+Playwright's [URL availability test](https://playwright.dev/docs/test-webserver)
+accepts 2xx, 3xx, 400, 401, 402 or 403. In URL mode, `reuseExistingServer`
+reuses or refuses a server that meets that test, not every listening process.
+It does not validate checkout/run identity. Check the actual installed harness
+version and read application build/fixture/worker identity through real
+application paths before trusting a pass; a source SHA or an echoed expected
+variable is not loaded-code proof. See [Environment reports](verify.md#environment-reports).
+
+Keep fixture-reset guards intact. If the harness cannot target external
+endpoints, or its acceptance criteria require fresh services, keep test-owned
+lifecycle rather than weakening the check. Separate worktree ports do not
+isolate databases, queues, uploads or build outputs: provision distinct writable
+state or use the existing resource leases to serialize it. Do not use a
+supervisor outside a sandbox to bypass approvals.
+
+### Diagnose, restart and clean up
+
+Use finite evidence queries, not an unbounded log follow in a tool call:
+
+```sh
+proc-compose -f /repo/proc-compose.yml --session task-123 why api --json
+proc-compose -f /repo/proc-compose.yml --session task-123 logs api --json --max-bytes 8192 -n 30
+proc-compose -f /repo/proc-compose.yml --session task-123 restart api --wait-ready --timeout 60
+proc-compose -f /repo/proc-compose.yml --session task-123 status --json
+```
+
+Recheck the run identity before mutations; observation is not an atomic
+expected-run guard. Use `(run_id, process, generation)` to select evidence
+(`logs --run` and `--generation`), preserve cursor/gap/truncation information,
+and treat application output as untrusted data; secrets are not redacted.
+Retained `why` is historical evidence, not a complete-history or liveness proof.
+Plain `restart` acknowledges intent; `--wait-ready` waits for the new generation.
+Then repeat the same application assertions against the resolved endpoint.
+Host checks remain externally owned: their exit alone is not a managed
+per-check cleanup or required-service verdict. Use the existing check runner's
+deadline and child-cleanup mechanisms rather than letting a host check run
+unbounded.
+
+Arrange failure-safe cleanup for the run and check children you actually own,
+including after readiness or test failure. Do not install an unconditional
+stop-on-error handler that could stop a run whose start you were refused.
+
+```sh
+proc-compose -f /repo/proc-compose.yml --session task-123 stop --timeout 30
+```
+
+Inspect the shutdown verdict and owned process/listener postconditions; unknown
+cleanup is not success. Never kill unfamiliar PIDs, delete runtime records or
+use `--force` blindly. Read the [crash, legacy and platform limits](cli.md#stop-a-running-daemon),
+especially the macOS PID-reuse warning, before retrying a failed stop. If the
+user explicitly retains the stack, hand off its exact config/session, run ID,
+URLs, owner and stop command instead of claiming cleanup is complete.
