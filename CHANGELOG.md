@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-10-18
+
 ### Added
 
 - Session-aware probe owners. A `foreign` probe owner now also has a `scope`,
@@ -455,7 +457,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policies, readiness probes, dependencies, background daemon, monitor TUI,
   and merge-port integration.
 
-[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.9.0...HEAD
+[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/anivaryam/proc-compose/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/anivaryam/proc-compose/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/anivaryam/proc-compose/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/anivaryam/proc-compose/compare/v1.6.0...v1.7.0
