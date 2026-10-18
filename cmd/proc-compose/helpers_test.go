@@ -2603,7 +2603,9 @@ func daemonStandin(t *testing.T) *exec.Cmd {
 //
 // The process is registered for cleanup immediately after creation, before any
 // assertion, so no path leaks it.
-func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn)) *fakeDaemon {
+// An optional config path registers the fixture at the CLI's canonical endpoint:
+// Windows discovers that pipe directly, not the address recorded in the PID file.
+func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn), configPath ...string) *fakeDaemon {
 	t.Helper()
 
 	proc := daemonStandin(t)
@@ -2626,7 +2628,21 @@ func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn)) *
 		}
 	})
 
-	fd.socketPath = testEndpointForTest(t)
+	if len(configPath) > 0 {
+		hash, err := paths.FromConfig(configPath[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		fd.socketPath = paths.Socket(hash)
+		if err := daemon.WritePID(paths.PID(hash), fd.pid, fd.socketPath); err != nil {
+			t.Fatal(err)
+		}
+		if _, resolved := liveDaemonPaths(hash); resolved != fd.socketPath {
+			t.Fatalf("CLI resolves %q, but fixture listens at %q", resolved, fd.socketPath)
+		}
+	} else {
+		fd.socketPath = testEndpointForTest(t)
+	}
 
 	if script == nil {
 		// No peer: leave the path unused so connecting fails, modelling an
@@ -3495,14 +3511,7 @@ func TestMutationCLI_JSONAndHuman(t *testing.T) {
 				dir, runtimeDir := t.TempDir(), testTempDir(t)
 				t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 				configPath := filepath.Join(dir, "not-created.yml")
-				peer := startFakeDaemon(t, serveAck(tc.ack, tc.detail, nil, tc.generation))
-				hash, err := paths.FromConfig(configPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := daemon.WritePID(paths.PID(hash), peer.pid, peer.socketPath); err != nil {
-					t.Fatal(err)
-				}
+				startFakeDaemon(t, serveAck(tc.ack, tc.detail, nil, tc.generation), configPath)
 				args := append([]string{"--file", configPath}, tc.args...)
 				if machine {
 					args = append(args, "--json")
@@ -3606,14 +3615,7 @@ func TestMutationCLI_RestartReadiness(t *testing.T) {
 				dir, runtimeDir := t.TempDir(), testTempDir(t)
 				t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 				configPath := filepath.Join(dir, "not-created.yml")
-				peer := startFakeDaemon(t, nil)
-				hash, err := paths.FromConfig(configPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := daemon.WritePID(paths.PID(hash), peer.pid, peer.socketPath); err != nil {
-					t.Fatal(err)
-				}
+				peer := startFakeDaemon(t, nil, configPath)
 				server := ipc.NewServer(peer.socketPath)
 				server.SetState(ipc.ProcState{Name: "api", Mode: "service", State: tc.state, Ready: tc.ready, Generation: tc.generation})
 				if err := server.Listen(); err != nil {
