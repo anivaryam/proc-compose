@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Corrected runtime-directory fallback and custom log-file documentation;
+  clarified JSON parser exceptions and agent/browser session ownership,
+  readiness, diagnostics and cleanup guidance. No runtime behavior changed.
+
 ## [1.10.0] - 2026-10-18
 
 ### Added
