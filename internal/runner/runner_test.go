@@ -3967,10 +3967,13 @@ func TestRun_NaturalExitWithLiveDescendantIsTerminated(t *testing.T) {
 func TestRun_CleanServiceExitIsNotReportedAsSurvivor(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "svc.pid")
-	script := writeScript(t, dir, "quick.sh", quickExitScript)
 
 	r := makeRunner(map[string]config.Process{
-		"svc": {Cmd: script + " " + pidFile, Restart: "never"},
+		"svc": {
+			Cmd:     serviceHelperCmd("record-and-exit", pidFile),
+			Restart: "never",
+			Env:     map[string]string{"GORACE": "atexit_sleep_ms=0"},
+		},
 	})
 
 	start := time.Now()
@@ -3989,17 +3992,14 @@ func TestRun_CleanServiceExitIsNotReportedAsSurvivor(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Fatalf("clean exit took %s; the group was probably judged before the leader was reaped", elapsed)
 	}
-	pid, _ := waitForPIDFile(t, pidFile, 2*time.Second)
+	pid, ok := waitForPIDFile(t, pidFile, 2*time.Second)
+	if !ok {
+		t.Fatal("service never recorded its PID")
+	}
 	if pid > 0 && pidIsRunning(pid) {
 		t.Fatalf("service (PID %d) outlived its own exit", pid)
 	}
 }
-
-// quickExitScript records its PID and exits immediately, leaving nothing behind.
-const quickExitScript = `#!/bin/sh
-echo $$ > "$1"
-exit 0
-`
 
 // helperArgv is helperCmd as a direct argv, for checks that bypass the shell.
 func helperArgv(args ...string) []string {
