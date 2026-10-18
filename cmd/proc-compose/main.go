@@ -654,6 +654,8 @@ See: https://github.com/anivaryam/proc-compose/blob/main/docs/cli.md#auto-restar
 	// ── restart ──────────────────────────────────────────────────────────────
 	var restartWait bool
 	var restartTimeout int
+	var restartJSON bool
+	restartResult := mutationResponse{Operation: "restart"}
 	restartCmd := &cobra.Command{
 		Use:     "restart <process>",
 		Aliases: []string{"r"},
@@ -662,12 +664,18 @@ See: https://github.com/anivaryam/proc-compose/blob/main/docs/cli.md#auto-restar
 others. The daemon (not the local config) is the source of truth for
 process names — an unknown name returns "unknown process" from the
 daemon. Exits non-zero if the daemon rejects the request or is busy
-applying another command.`,
+applying another command. With --json, results expose status, an optional
+message and generation, plus ready when --wait-ready reaches the operation.
+Flag-parsing errors remain plain text and exit 1.`,
 		Example:       "  proc-compose restart backend    # restart single process\n  proc-compose restart -f myapp.yml backend",
 		Args:          cobra.ExactArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			restartResult.Process = args[0]
+			if restartWait {
+				restartResult.Ready = new(bool)
+			}
 			// Don't validate the process name against the local config —
 			// the daemon may be running a different (older) config and is
 			// the source of truth. The daemon's ack carries an
@@ -693,6 +701,7 @@ applying another command.`,
 					return fmt.Errorf("no response from daemon: %w", err)
 				}
 				if ev.Type == ipc.TypeAck {
+					restartResult.acknowledge(ev)
 					switch ev.Ack {
 					case "ok":
 						if restartWait {
@@ -702,10 +711,15 @@ applying another command.`,
 							if err := waitForProcessesReady(socketPath, map[string]struct{}{args[0]: {}}, time.Duration(restartTimeout)*time.Second, map[string]uint64{args[0]: ev.AckGeneration}); err != nil {
 								return err
 							}
-							fmt.Printf("restarted %q and verified generation %d is ready\n", args[0], ev.AckGeneration)
+							*restartResult.Ready = true
+							if !restartJSON {
+								fmt.Printf("restarted %q and verified generation %d is ready\n", args[0], ev.AckGeneration)
+							}
 							return nil
 						}
-						fmt.Printf("restart requested for %q\n", args[0])
+						if !restartJSON {
+							fmt.Printf("restart requested for %q\n", args[0])
+						}
 						return nil
 					case "busy":
 						return fmt.Errorf("daemon busy — try again")
@@ -722,8 +736,11 @@ applying another command.`,
 	}
 	restartCmd.Flags().BoolVar(&restartWait, "wait-ready", false, "wait for the replacement incarnation's readiness")
 	restartCmd.Flags().IntVar(&restartTimeout, "timeout", 60, "seconds to wait for replacement readiness")
+	addMutationJSON(restartCmd, &restartJSON, &restartResult)
 
 	// ── reload ───────────────────────────────────────────────────────────────
+	var reloadJSON bool
+	reloadResult := mutationResponse{Operation: "reload"}
 	reloadCmd := &cobra.Command{
 		Use:     "reload",
 		Aliases: []string{"rl"},
@@ -734,7 +751,10 @@ dir, etc.) changed. Unchanged processes keep running.
 Hot-add / hot-remove are not supported: if processes were added or
 removed the daemon returns "partial" naming the skipped entries —
 restart the daemon to pick those up. Exits 0 on "ok" and "partial",
-non-zero on rejection or daemon-busy.`,
+non-zero on rejection or daemon-busy. With --json, status distinguishes
+"ok", "partial", "busy" and "error" without parsing human text. A successful
+reload does not establish replacement readiness. Flag-parsing errors remain
+plain text and exit 1.`,
 		Example:       "  proc-compose reload            # reload and restart changed processes\n  proc-compose reload -f myapp.yml",
 		SilenceUsage:  true,
 		SilenceErrors: false,
@@ -759,16 +779,21 @@ non-zero on rejection or daemon-busy.`,
 					return fmt.Errorf("no response from daemon: %w", err)
 				}
 				if ev.Type == ipc.TypeAck {
+					reloadResult.acknowledge(ev)
 					switch ev.Ack {
 					case "ok":
-						if ev.AckDetail != "" {
-							fmt.Printf("reload: %s\n", ev.AckDetail)
-						} else {
-							fmt.Println("reload requested")
+						if !reloadJSON {
+							if ev.AckDetail != "" {
+								fmt.Printf("reload: %s\n", ev.AckDetail)
+							} else {
+								fmt.Println("reload requested")
+							}
 						}
 						return nil
 					case "partial":
-						fmt.Fprintf(os.Stderr, "reload partial: %s\n", ev.AckDetail)
+						if !reloadJSON {
+							fmt.Fprintf(os.Stderr, "reload partial: %s\n", ev.AckDetail)
+						}
 						return nil
 					case "busy":
 						return fmt.Errorf("daemon busy — try again")
@@ -783,6 +808,7 @@ non-zero on rejection or daemon-busy.`,
 			}
 		},
 	}
+	addMutationJSON(reloadCmd, &reloadJSON, &reloadResult)
 
 	// ── status ───────────────────────────────────────────────────────────────
 	var statusJSON bool

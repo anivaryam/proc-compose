@@ -2603,7 +2603,9 @@ func daemonStandin(t *testing.T) *exec.Cmd {
 //
 // The process is registered for cleanup immediately after creation, before any
 // assertion, so no path leaks it.
-func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn)) *fakeDaemon {
+// An optional config path registers the fixture at the CLI's canonical endpoint:
+// Windows discovers that pipe directly, not the address recorded in the PID file.
+func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn), configPath ...string) *fakeDaemon {
 	t.Helper()
 
 	proc := daemonStandin(t)
@@ -2626,7 +2628,21 @@ func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn)) *
 		}
 	})
 
-	fd.socketPath = testEndpointForTest(t)
+	if len(configPath) > 0 {
+		hash, err := paths.FromConfig(configPath[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		fd.socketPath = paths.Socket(hash)
+		if err := daemon.WritePID(paths.PID(hash), fd.pid, fd.socketPath); err != nil {
+			t.Fatal(err)
+		}
+		if _, resolved := liveDaemonPaths(hash); resolved != fd.socketPath {
+			t.Fatalf("CLI resolves %q, but fixture listens at %q", resolved, fd.socketPath)
+		}
+	} else {
+		fd.socketPath = testEndpointForTest(t)
+	}
 
 	if script == nil {
 		// No peer: leave the path unused so connecting fails, modelling an
@@ -2654,7 +2670,7 @@ func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn)) *
 // the connection open — which is what a daemon does while it tears itself down.
 // onAck lets a test make its stand-in actually exit, so the exit checks
 // downstream are exercised rather than short-circuited by a still-running peer.
-func serveAck(ack, detail string, onAck func()) func(*fakeDaemon, net.Conn) {
+func serveAck(ack, detail string, onAck func(), generation ...uint64) func(*fakeDaemon, net.Conn) {
 	return func(_ *fakeDaemon, conn net.Conn) {
 		defer conn.Close()
 		sc := bufio.NewScanner(conn)
@@ -2664,7 +2680,11 @@ func serveAck(ack, detail string, onAck func()) func(*fakeDaemon, net.Conn) {
 			if err := json.Unmarshal(sc.Bytes(), &ev); err != nil || ev.Type != ipc.TypeCommand {
 				continue
 			}
-			_ = json.NewEncoder(conn).Encode(ipc.Event{Type: ipc.TypeAck, Ack: ack, AckDetail: detail})
+			event := ipc.Event{Type: ipc.TypeAck, Ack: ack, AckDetail: detail}
+			if len(generation) > 0 {
+				event.AckGeneration = generation[0]
+			}
+			_ = json.NewEncoder(conn).Encode(event)
 			if onAck != nil {
 				onAck()
 			}
@@ -3131,7 +3151,7 @@ func noticeCommand(t *testing.T, name string, args ...string) *cobra.Command {
 		cmd.Flags().String("name", "", "")
 		cmd.Flags().String("log-format", "text", "")
 	}
-	if name == "status" || name == "doctor" || name == "bootstrap" {
+	if name == "status" || name == "doctor" || name == "bootstrap" || name == "restart" || name == "reload" {
 		cmd.Flags().Bool("json", false, "")
 	}
 	if err := cmd.ParseFlags(args); err != nil {
@@ -3143,7 +3163,7 @@ func noticeCommand(t *testing.T, name string, args ...string) *cobra.Command {
 // TestUpdateNoticeEligible_HumanFacingCommands is the positive case: a person
 // watching a terminal gets the hint.
 func TestUpdateNoticeEligible_HumanFacingCommands(t *testing.T) {
-	for _, name := range []string{"up", "list", "status", "logs", "stop", "validate", "doctor", "bootstrap", "monitor"} {
+	for _, name := range []string{"up", "list", "status", "logs", "stop", "restart", "reload", "validate", "doctor", "bootstrap", "monitor"} {
 		if !updateNoticeEligible(noticeCommand(t, name), true) {
 			t.Errorf("%q was denied the update notice; it is a human-facing command", name)
 		}
@@ -3167,6 +3187,8 @@ func TestUpdateNoticeEligible_ExcludedCommands(t *testing.T) {
 		{"status", []string{"--json"}, "machine-readable output"},
 		{"doctor", []string{"--json"}, "machine-readable output"},
 		{"bootstrap", []string{"--json"}, "machine-readable output"},
+		{"restart", []string{"--json"}, "machine-readable mutation output"},
+		{"reload", []string{"--json"}, "machine-readable mutation output"},
 		{"up", []string{"--silent"}, "daemonize hands off to a detached child"},
 		{"up", []string{"-s"}, "daemonize hands off to a detached child"},
 		{"up", []string{"--survive", "--name", "app"}, "a systemd unit is written to a file"},
@@ -3460,4 +3482,221 @@ func captureStderr(t *testing.T, fn func()) string {
 	var buf bytes.Buffer
 	buf.ReadFrom(pr)
 	return buf.String()
+}
+
+func TestMutationCLI_JSONAndHuman(t *testing.T) {
+	bin := buildCLI(t)
+	for _, tc := range []struct {
+		name, ack, detail, status string
+		args                      []string
+		generation                uint64
+		code                      int
+		stdout, stderr            string
+	}{
+		{name: "restart_requested", ack: "ok", status: "ok", args: []string{"restart", "api"}, generation: 7, stdout: "restart requested for \"api\"\n"},
+		{name: "restart_json_false", ack: "ok", status: "ok", args: []string{"restart", "api", "--json=false"}, generation: 7, stdout: "restart requested for \"api\"\n"},
+		{name: "restart_busy", ack: "busy", status: "busy", args: []string{"restart", "api"}, code: 1, stderr: "Error: daemon busy — try again\n"},
+		{name: "restart_rejected", ack: "error", detail: "unknown process api", status: "error", args: []string{"restart", "api"}, code: 1, stderr: "Error: daemon rejected restart: unknown process api\n"},
+		{name: "restart_unknown_ack", ack: "unexpected", status: "error", args: []string{"restart", "api"}, code: 1, stderr: "Error: daemon rejected restart: unexpected\n"},
+		{name: "restart_old_daemon", ack: "ok", status: "error", args: []string{"restart", "api", "--wait-ready"}, code: 1, stderr: "Error: daemon does not expose process generations; restart it with the current proc-compose\n"},
+		{name: "reload_ok", ack: "ok", detail: "no changes detected", status: "ok", args: []string{"reload"}, stdout: "reload: no changes detected\n"},
+		{name: "reload_empty_ack", ack: "ok", status: "ok", args: []string{"reload"}, stdout: "reload requested\n"},
+		{name: "reload_partial", ack: "partial", detail: "ignored added: worker", status: "partial", args: []string{"reload"}, stderr: "reload partial: ignored added: worker\n"},
+		{name: "reload_escaped_detail", ack: "partial", detail: "ignored added: \"worker\"\nsecond line", status: "partial", args: []string{"reload"}, stderr: "reload partial: ignored added: \"worker\"\nsecond line\n"},
+		{name: "reload_busy", ack: "busy", status: "busy", args: []string{"reload"}, code: 1, stderr: "Error: daemon busy — try again\n"},
+		{name: "reload_rejected", ack: "error", detail: "invalid config", status: "error", args: []string{"reload"}, code: 1, stderr: "Error: daemon rejected reload: invalid config\n"},
+	} {
+		for _, machine := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/json=%t", tc.name, machine), func(t *testing.T) {
+				dir, runtimeDir := t.TempDir(), testTempDir(t)
+				t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+				configPath := filepath.Join(dir, "not-created.yml")
+				startFakeDaemon(t, serveAck(tc.ack, tc.detail, nil, tc.generation), configPath)
+				args := append([]string{"--file", configPath}, tc.args...)
+				if machine {
+					args = append(args, "--json")
+				}
+				stdout, stderr, code := runVerifyCLIIn(t, bin, dir, runtimeDir, args...)
+				if code != tc.code {
+					t.Fatalf("exit=%d, want %d; stdout=%q stderr=%q", code, tc.code, stdout, stderr)
+				}
+				if !machine {
+					if stdout != tc.stdout || stderr != tc.stderr {
+						t.Fatalf("human output changed: stdout=%q stderr=%q", stdout, stderr)
+					}
+					return
+				}
+				if stderr != "" || !json.Valid([]byte(stdout)) {
+					t.Fatalf("not one clean JSON object: stdout=%q stderr=%q", stdout, stderr)
+				}
+				result := decodeOne(t, stdout)
+				want := map[string]any{"operation": tc.args[0], "status": tc.status}
+				if tc.args[0] == "restart" {
+					want["process"] = "api"
+				}
+				if tc.generation != 0 {
+					want["generation"] = float64(tc.generation)
+				}
+				message := tc.detail
+				if tc.code != 0 {
+					message = strings.TrimSuffix(strings.TrimPrefix(tc.stderr, "Error: "), "\n")
+				}
+				if message != "" {
+					want["message"] = message
+				}
+				if tc.name == "restart_old_daemon" {
+					want["ready"] = false
+				}
+				if !reflect.DeepEqual(result, want) {
+					t.Fatalf("JSON=%v, want %v", result, want)
+				}
+			})
+		}
+	}
+}
+
+func TestMutationCLI_JSONValidation(t *testing.T) {
+	bin := buildCLI(t)
+	for _, tc := range []struct {
+		name, message string
+		args          []string
+		plain         bool
+	}{
+		{name: "restart_missing_process", args: []string{"restart", "--json"}, message: "accepts 1 arg(s), received 0"},
+		{name: "restart_extra_process", args: []string{"restart", "api", "worker", "--json"}, message: "accepts 1 arg(s), received 2"},
+		{name: "restart_invalid_session", args: []string{"--session", "bad/name", "restart", "api", "--json"}, message: "invalid --session"},
+		{name: "reload_invalid_session", args: []string{"--session", "bad/name", "reload", "--json"}, message: "invalid --session"},
+		{name: "restart_no_daemon", args: []string{"restart", "api", "--json"}, message: "no proc-compose daemon running"},
+		{name: "reload_no_daemon", args: []string{"reload", "--json"}, message: "no proc-compose daemon running"},
+		{name: "restart_bad_flag", args: []string{"restart", "api", "--json", "--bogus"}, message: "unknown flag: --bogus", plain: true},
+		{name: "reload_bad_flag", args: []string{"reload", "--json", "--bogus"}, message: "unknown flag: --bogus", plain: true},
+		{name: "restart_bad_bool", args: []string{"restart", "api", "--json=bad"}, message: "invalid syntax", plain: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, runtimeDir := t.TempDir(), testTempDir(t)
+			args := append([]string{"--file", filepath.Join(dir, "not-created.yml")}, tc.args...)
+			stdout, stderr, code := runVerifyCLIIn(t, bin, dir, runtimeDir, args...)
+			if code != 1 {
+				t.Fatalf("exit=%d, want 1; stdout=%q stderr=%q", code, stdout, stderr)
+			}
+			if tc.plain {
+				if stdout != "" || !strings.Contains(stderr, tc.message) {
+					t.Fatalf("parser behavior changed: stdout=%q stderr=%q", stdout, stderr)
+				}
+				return
+			}
+			if stderr != "" || !json.Valid([]byte(stdout)) {
+				t.Fatalf("not one clean JSON error: stdout=%q stderr=%q", stdout, stderr)
+			}
+			result := decodeOne(t, stdout)
+			message, _ := result["message"].(string)
+			if result["status"] != "error" || !strings.Contains(message, tc.message) {
+				t.Fatalf("wrong error response: %v", result)
+			}
+		})
+	}
+}
+
+func TestMutationCLI_RestartReadiness(t *testing.T) {
+	bin := buildCLI(t)
+	for _, tc := range []struct {
+		name, state, message string
+		generation           uint64
+		ready                bool
+		code                 int
+	}{
+		{name: "replacement_ready", state: "running", generation: 7, ready: true},
+		{name: "old_generation_ready", state: "running", generation: 6, ready: true, code: 1, message: "timed out"},
+		{name: "replacement_not_ready", state: "running", generation: 7, code: 1, message: "timed out"},
+		{name: "replacement_failed", state: "failed", generation: 7, code: 1, message: "failed"},
+	} {
+		for _, machine := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/json=%t", tc.name, machine), func(t *testing.T) {
+				dir, runtimeDir := t.TempDir(), testTempDir(t)
+				t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+				configPath := filepath.Join(dir, "not-created.yml")
+				peer := startFakeDaemon(t, nil, configPath)
+				server := ipc.NewServer(peer.socketPath)
+				server.SetState(ipc.ProcState{Name: "api", Mode: "service", State: tc.state, Ready: tc.ready, Generation: tc.generation})
+				if err := server.Listen(); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(server.Shutdown)
+				stop, done := make(chan struct{}), make(chan struct{})
+				received := make(chan ipc.Command, 1)
+				go func() {
+					defer close(done)
+					select {
+					case command := <-server.Commands():
+						received <- command
+						command.Reply <- ipc.CommandResult{Status: "ok", Generation: 7}
+					case <-stop:
+					}
+				}()
+				t.Cleanup(func() { close(stop); <-done })
+				args := []string{"--file", configPath, "restart", "api", "--wait-ready", "--timeout", "1"}
+				if machine {
+					args = append(args, "--json")
+				}
+				stdout, stderr, code := runVerifyCLIIn(t, bin, dir, runtimeDir, args...)
+				if code != tc.code {
+					t.Fatalf("exit=%d, want %d; stdout=%q stderr=%q", code, tc.code, stdout, stderr)
+				}
+				select {
+				case command := <-received:
+					if command.Action != "restart" || command.Process != "api" {
+						t.Fatalf("mutation changed: %+v", command)
+					}
+				default:
+					t.Fatal("CLI did not send the restart command")
+				}
+				if !machine {
+					if tc.code == 0 {
+						if stdout != "restarted \"api\" and verified generation 7 is ready\n" || stderr != "" {
+							t.Fatalf("human readiness output changed: stdout=%q stderr=%q", stdout, stderr)
+						}
+					} else if stdout != "" || !strings.Contains(stderr, tc.message) {
+						t.Fatalf("human failure changed: stdout=%q stderr=%q", stdout, stderr)
+					}
+					return
+				}
+				if stderr != "" || !json.Valid([]byte(stdout)) {
+					t.Fatalf("not one clean JSON result: stdout=%q stderr=%q", stdout, stderr)
+				}
+				result := decodeOne(t, stdout)
+				status := "ok"
+				if tc.code != 0 {
+					status = "error"
+					message, _ := result["message"].(string)
+					if !strings.Contains(message, tc.message) {
+						t.Fatalf("missing readiness error: %v", result)
+					}
+				}
+				if result["operation"] != "restart" || result["process"] != "api" || result["status"] != status || result["generation"] != float64(7) || result["ready"] != (tc.code == 0) {
+					t.Fatalf("wrong readiness result: %v", result)
+				}
+			})
+		}
+	}
+}
+
+func TestMutationJSON_OutputFailure(t *testing.T) {
+	response := mutationResponse{Operation: "reload", CommandResult: ipc.CommandResult{Status: "ok"}}
+	command := &cobra.Command{Use: "reload", RunE: func(*cobra.Command, []string) error { return nil }}
+	var machine bool
+	addMutationJSON(command, &machine, &response)
+	reader, writer := io.Pipe()
+	reader.Close()
+	defer writer.Close()
+	var stderr bytes.Buffer
+	command.SetOut(writer)
+	command.SetErr(&stderr)
+	command.SetArgs([]string{"--json"})
+	err := command.Execute()
+	if code, ok := err.(exitCodeError); !ok || code.code != 1 {
+		t.Fatalf("output failure returned %v, want exit 1", err)
+	}
+	if !strings.Contains(stderr.String(), "cannot write reload result") {
+		t.Fatalf("missing output diagnostic: %q", stderr.String())
+	}
 }

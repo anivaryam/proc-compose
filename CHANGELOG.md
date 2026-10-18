@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in `--json` results for `restart` and `reload`, reusing daemon
+  acknowledgments while preserving human output and exit codes. Results
+  distinguish partial reloads, busy/rejected requests and replacement
+  readiness failures without adding daemon operations.
+
 ### Fixed
 
 - Corrected runtime-directory fallback and custom log-file documentation;
