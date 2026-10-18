@@ -14,8 +14,8 @@ proc-compose up --silent                                Run daemon in background
 proc-compose monitor                                    Open live TUI for daemon
 proc-compose status [--json]                            Show daemon process states
 proc-compose logs [process] [--json] [--follow]         Query or follow bounded, structured process events
-proc-compose restart <process>                          Restart one running process
-proc-compose reload                                     Reload config and restart changed processes
+proc-compose restart <process> [--json]                 Restart one running process
+proc-compose reload [--json]                            Reload config and restart changed processes
 proc-compose stop [--timeout N] [--force]               Stop daemon and verify its processes ended
 proc-compose list                                       List config processes
 proc-compose verify [processes...] -- PROGRAM [ARG...]  Owned stack + check + verified cleanup + receipt
@@ -229,6 +229,45 @@ changed (command, env, dir, etc.). Unchanged processes keep running.
 If you added or removed processes, `reload` reports `partial` and lists
 which names were skipped — hot-add and hot-remove aren't supported, so
 restart the daemon to pick those up.
+
+### JSON restart and reload
+
+```sh
+proc-compose restart backend --json
+proc-compose restart backend --wait-ready --timeout 60 --json
+proc-compose reload --json
+```
+
+After flag parsing, these commands emit one JSON object on stdout, including
+operational failures and invalid arguments or sessions. Human output and exit
+codes are unchanged when `--json` is omitted or false. JSON mode suppresses
+human success/partial messages and release notices.
+
+| Field | Meaning |
+|---|---|
+| `operation` | `restart` or `reload` |
+| `status` | Overall CLI outcome: `ok`, `partial`, `busy` or `error` |
+| `message` | Optional daemon detail or CLI failure explanation |
+| `process` | Target of a restart after argument validation |
+| `generation` | Acknowledged replacement generation, when provided by the daemon |
+| `ready` | Present only when a restart with `--wait-ready` reaches the operation; `true` means its acknowledged replacement passed readiness, `false` means readiness was not verified |
+
+Plain restart reports request acceptance, not readiness; it omits `ready`.
+If the request succeeds but its readiness wait fails, `status` is `error`,
+`ready` is false and the acknowledged `generation` is retained when available.
+An older daemon without generation support fails the wait rather than claiming
+readiness. Reload does not wait for replacement readiness and omits `ready`.
+
+Exit `0` still includes both full and **partial** reloads: inspect `status`,
+not just the exit code. Busy, rejection, missing daemon, failed readiness and
+semantic usage errors exit `1`. Flag-parsing errors (such as an unknown flag,
+even after `--json`) remain exit `1` with plaintext stderr and empty stdout;
+`--help` remains normal help text. A stdout write failure also exits nonzero
+and cannot guarantee a complete JSON object.
+
+This is a CLI view of existing acknowledgments, not a new daemon operation,
+an expected-run guard or a retained-check/cleanup receipt. Confirm session
+ownership before mutations as usual.
 
 ### Stop a running daemon
 

@@ -104,11 +104,18 @@ proc-compose -f /repo/proc-compose.yml --session task-1 stop --timeout 30
   escalation; never kill unfamiliar PIDs or delete runtime files.
 - `restart api --wait-ready --timeout 60` waits for the new generation; plain
   `restart` only acknowledges the request. Tasks cannot be restarted.
+- Add `--json` to `restart` or `reload` for one result object after flag parsing,
+  including operational/semantic errors. Inspect `status` (`ok`, `partial`,
+  `busy`, `error`) and optional `message`. Reload `partial` still exits 0 and
+  does not prove readiness. Restart reports the acknowledged `generation` when
+  available; with `--wait-ready`, `ready: true` proves that replacement passed
+  readiness, while `ready: false` is not a pass. Plain restart omits `ready`.
+  Flag-parsing errors remain exit 1 with text stderr and empty stdout.
 - `sessions --json` lists every session: owner (command, PID,
   `PROC_COMPOSE_OWNER` label, worktree), URLs, latest attempt, and a stop
   command. It only reads.
-- Apart from `verify --json` and `compare --json`, failed commands may print
-  only stderr text.
+- Other commands and flag-parsing failures may print only stderr text; do not
+  assume every failure has JSON to decode.
 
 ## Logs and failure packets
 
