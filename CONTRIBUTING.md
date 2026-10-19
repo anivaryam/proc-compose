@@ -41,6 +41,8 @@ management, signals, IPC, or paths, consider each platform; see
 - Add or update tests for any behavior change.
 - Update the relevant page under `docs/` and add an entry under
   `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md).
+- When you add, rename, or remove a command or config field, update the agent
+  skill in `skills/proc-compose`. The `TestSkill_` tests fail until you do.
 - Use [Conventional Commits](https://www.conventionalcommits.org/) for commit
   messages, for example `fix: report escaped descendants on stop`.
 
