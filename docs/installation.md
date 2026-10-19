@@ -63,6 +63,35 @@ proc-compose unlocks additional capabilities when these binaries are available o
 
 If `merge:` is configured but merge-port is not on PATH, `up`, `validate`, and `up --dry-run` fail with an actionable error. `doctor` reports a finding. Without `merge:`, merge-port is not required.
 
+## Agent skill for Claude Code and OpenCode
+
+The repository ships an agent skill, [`skills/proc-compose`](../skills/proc-compose/SKILL.md),
+that teaches coding agents every proc-compose feature: setup, running, testing,
+logs, sessions, and deployment. It uses the shared `SKILL.md` format, and
+OpenCode also reads Claude Code's skill directories, so one copy serves both.
+
+```sh
+# From a clone: link it, so git pull keeps it current
+mkdir -p ~/.claude/skills
+ln -s "$PWD/skills/proc-compose" ~/.claude/skills/proc-compose
+
+# Without a clone: copy it
+git clone --depth 1 https://github.com/anivaryam/proc-compose.git /tmp/proc-compose-src
+mkdir -p ~/.claude/skills
+cp -r /tmp/proc-compose-src/skills/proc-compose ~/.claude/skills/
+```
+
+| Location | Claude Code | OpenCode |
+|---|---|---|
+| `~/.claude/skills/proc-compose/` | Every project | Every project |
+| `<project>/.claude/skills/proc-compose/` | That project | That project |
+| `~/.config/opencode/skills/proc-compose/` | No | Every project |
+
+On Windows, copy the directory to `%USERPROFILE%\.claude\skills\proc-compose`.
+A copy does not update itself; copy it again after upgrading proc-compose. The
+skill tells agents to run `proc-compose agent-guide` first and to trust the
+installed binary's help where the two differ.
+
 ## Update notifications
 
 Interactive runs tell you when a newer stable release is available. The notice is

@@ -121,6 +121,7 @@ See [FEATURES.md](FEATURES.md) for a short tour of each with examples.
 | [Deployment](docs/deployment.md) | Containers and platforms such as Railway, Render, and Fly.io |
 | [Platform support](docs/platforms.md) | Linux, macOS, and Windows differences; how it works |
 | [Agent guide](internal/agentguide/GUIDE.md) | Operating guide for coding agents (also `proc-compose agent-guide`) |
+| [Agent skill](skills/proc-compose/SKILL.md) | Claude Code and OpenCode skill covering every feature; [install it](docs/installation.md#agent-skill-for-claude-code-and-opencode) |
 
 ## Contributing
 
