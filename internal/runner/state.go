@@ -375,16 +375,6 @@ func (st *procState) resetReady() {
 	st.readyDisposition = readyUnset
 }
 
-// publishAgain settles the current cycle with readyAgain without installing a
-// following cycle: the cycle ended without a verdict and no further cycle will
-// come. A waiter that re-reads the current cycle sees the same cycle and ends
-// its wait instead of waiting for a verdict that cannot arrive.
-func (st *procState) publishAgain() {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.settleLocked(readyAgain)
-}
-
 // settleLocked publishes outcome on the current cycle, unless it already
 // settled: a published outcome is never overwritten. Callers must hold st.mu.
 func (st *procState) settleLocked(outcome readyOutcome) {

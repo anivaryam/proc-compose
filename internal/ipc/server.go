@@ -15,11 +15,18 @@ import (
 const maxHistory = 500
 
 // maxCommandFrameBytes is the largest inbound command frame the server
-// accepts. A longer frame is dropped: the scanner fails with
-// bufio.ErrTooLong and the connection is torn down. It is deliberately far
-// below MaxEventBytes, which bounds the events the daemon sends out, not the
+// accepts, its newline included. A longer frame is discarded up to its
+// newline and answered with an error acknowledgment; the connection stays
+// open and the frames after it are still read. It is deliberately far below
+// MaxEventBytes, which bounds the events the daemon sends out, not the
 // commands it accepts.
 const maxCommandFrameBytes = 1 << 16
+
+// runnerReplyTimeout bounds how long the server waits for the runner's
+// verdict on a command before acknowledging it with a timeout error — 30s is
+// well over the typical reload time, and comfortably over a shutdown
+// (per-process shutdown_timeout plus the final sweep).
+const runnerReplyTimeout = 30 * time.Second
 
 // stderrSink is where this package's warnings go. It is guarded by
 // stderrMu so that a test can capture the warnings without swapping
@@ -50,6 +57,10 @@ type Server struct {
 	project   *Project
 
 	cmdCh chan Command // received commands forwarded to runner
+
+	// replyTimeout is runnerReplyTimeout, except in tests that need the
+	// timeout path without waiting for it.
+	replyTimeout time.Duration
 }
 
 type serverClient struct {
@@ -63,11 +74,12 @@ type serverClient struct {
 // NewServer creates a Server for the given socket path.
 func NewServer(socketPath string) *Server {
 	return &Server{
-		socketPath: socketPath,
-		clients:    make(map[*serverClient]struct{}),
-		history:    newLogRing(maxHistory),
-		states:     make(map[string]*ProcState),
-		cmdCh:      make(chan Command, 16),
+		socketPath:   socketPath,
+		clients:      make(map[*serverClient]struct{}),
+		history:      newLogRing(maxHistory),
+		states:       make(map[string]*ProcState),
+		cmdCh:        make(chan Command, 16),
+		replyTimeout: runnerReplyTimeout,
 	}
 }
 
@@ -216,45 +228,103 @@ func (s *Server) handle(conn net.Conn) {
 		warnf("WARN: failed to marshal snapshot: %v\n", err)
 	} else {
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		conn.Write(append(data, '\n'))
+		n, werr := conn.Write(append(data, '\n'))
 		conn.SetWriteDeadline(time.Time{})
+		switch {
+		case werr == nil:
+		case n > 0:
+			// Part of the snapshot is on the wire: the client would read
+			// everything after it as the tail of that broken line. Drop the
+			// connection rather than serve a stream it cannot parse.
+			warnf("WARN: failed to write snapshot to client after %d of %d bytes, dropping the connection: %v\n", n, len(data)+1, werr)
+			s.drop(c)
+			conn.Close() // the write loop that would close it never started
+			return
+		default:
+			// Nothing was written, so the stream is still well framed and the
+			// client is served without its snapshot. A client that writes its
+			// command before reading gets here on a pipe that does not buffer
+			// (a Windows named pipe): the write waits out its deadline, and
+			// the command still deserves its acknowledgment.
+			warnf("WARN: failed to write snapshot to client, serving it without one: %v\n", werr)
+		}
 	}
 
 	// Start write loop.
 	go c.writeLoop()
 
 	// Read commands from the client (monitors send nothing; CLI commands do).
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, maxCommandFrameBytes), maxCommandFrameBytes)
-	for scanner.Scan() {
-		var ev Event
-		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
-			continue
-		}
-		if ev.Type == TypeCommand && ev.Cmd != nil {
-			s.handleCommand(conn, ev.Cmd)
-		}
-	}
-	// A frame over the cap is dropped and the connection is torn down, so the
-	// daemon has to say so: without this the oversized frame is
-	// indistinguishable from a client that simply disconnected.
-	if err := scanner.Err(); err != nil && errors.Is(err, bufio.ErrTooLong) {
-		warnf("WARN: command frame too long from peer %s: %v (inbound frame limit is %d bytes)\n", peerAddr(conn), err, maxCommandFrameBytes)
-	}
+	s.readCommands(conn)
 
-	// Clean up.
+	s.drop(c)
+}
+
+// drop unregisters c and closes its send channel.
+func (s *Server) drop(c *serverClient) {
 	s.mu.Lock()
 	delete(s.clients, c)
 	s.mu.Unlock()
 	c.shutdown()
 }
 
+// readCommands reads newline-delimited command frames from conn until the
+// stream ends.
+//
+// A frame over maxCommandFrameBytes is discarded up to its newline and
+// answered with an error acknowledgment, and the frames after it are still
+// read: one oversized frame must not take the commands queued behind it down
+// with it. bufio.Scanner cannot do this — once a line outgrows its buffer it
+// latches bufio.ErrTooLong and stops for good — so this reads with
+// bufio.Reader, whose ReadSlice reports a full buffer and can carry on.
+func (s *Server) readCommands(conn net.Conn) {
+	r := bufio.NewReaderSize(conn, maxCommandFrameBytes)
+	for {
+		frame, err := r.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			err = discardLine(r)
+			s.rejectOversizedFrame(conn)
+		} else if len(frame) > 0 {
+			var ev Event
+			if json.Unmarshal(frame, &ev) == nil && ev.Type == TypeCommand && ev.Cmd != nil {
+				s.handleCommand(conn, ev.Cmd)
+			}
+		}
+		if err != nil {
+			return // the client disconnected, or the connection failed
+		}
+	}
+}
+
+// discardLine consumes r up to and including the next newline. It returns
+// nil once the line has ended, or the read error that ended the stream first.
+func discardLine(r *bufio.Reader) error {
+	for {
+		if _, err := r.ReadSlice('\n'); !errors.Is(err, bufio.ErrBufferFull) {
+			return err
+		}
+	}
+}
+
+// rejectOversizedFrame answers a discarded oversized frame with an error
+// acknowledgment the client can show, and reports it on the daemon side too.
+func (s *Server) rejectOversizedFrame(conn net.Conn) {
+	warnf("WARN: command frame too long: discarded a frame over the %d byte inbound limit and answered it with an error acknowledgment\n", maxCommandFrameBytes)
+	_ = writeAck(conn, Event{
+		Type:      TypeAck,
+		Ack:       "error",
+		AckDetail: fmt.Sprintf("command frame too long: the daemon accepts command frames of at most %d bytes; the frame was discarded", maxCommandFrameBytes),
+	})
+}
+
 // handleCommand forwards one command to the runner and writes its
-// acknowledgment. cmd.flushed is closed once the write attempt for that ack
-// has completed, whatever its result, so a handler that must not be orphaned
-// by a server shutdown (the "shutdown" command, whose verdict is the only
-// report of what could not be terminated) can wait for its own answer to be
-// delivered — or for the delivery to have failed.
+// acknowledgment.
+//
+// cmd.flushed reports what became of that acknowledgment, so a handler that
+// must not be orphaned by a server shutdown (the "shutdown" command, whose
+// verdict is the only report of what could not be terminated) can wait for
+// its own answer and learn whether it was delivered. It is released as soon
+// as the write attempt completes, whatever its result: a peer that has gone
+// away must not wedge the daemon.
 func (s *Server) handleCommand(conn net.Conn, in *Command) {
 	// Attach a buffered reply channel so the runner can hand back a real
 	// verdict (ok / partial / error) instead of the client having to assume
@@ -263,52 +333,57 @@ func (s *Server) handleCommand(conn net.Conn, in *Command) {
 	// ack.
 	cmd := *in
 	cmd.Reply = make(chan CommandResult, 1)
-	cmd.flushed = make(chan struct{})
-	defer close(cmd.flushed)
+	cmd.flushed = &ackDelivery{done: make(chan struct{})}
+	// undelivered stays nil only when the ack carrying the runner's verdict
+	// is written in full.
+	var undelivered error
+	defer func() { cmd.flushed.finish(undelivered) }()
 
 	ack := Event{Type: TypeAck, Ack: "ok"}
 	select {
 	case s.cmdCh <- cmd:
 		// Wait for the runner's verdict. Bound the wait so a runaway runner
-		// can't pin a connection forever — 30s is well over the typical
-		// reload time, and comfortably over a shutdown (per-process
-		// shutdown_timeout plus the final sweep).
+		// can't pin a connection forever.
+		timer := time.NewTimer(s.replyTimeout)
+		defer timer.Stop()
 		select {
 		case res := <-cmd.Reply:
 			ack.Ack = res.Status
 			ack.AckDetail = res.Message
 			ack.AckGeneration = res.Generation
-		case <-time.After(30 * time.Second):
+		case <-timer.C:
 			ack.Ack = "error"
 			ack.AckDetail = "timed out waiting for runner reply"
+			// A verdict the runner hands back after this is never written.
+			undelivered = fmt.Errorf("the client was answered with a timeout after %s, before the runner's verdict arrived", s.replyTimeout)
 		}
 	default:
 		// Channel full — surface the drop so callers can retry.
 		ack.Ack = "busy"
 	}
 
+	if err := writeAck(conn, ack); err != nil && undelivered == nil {
+		undelivered = err
+	}
+}
+
+// writeAck writes one acknowledgment to conn under a write deadline. A
+// failure is reported on stderr, because the client cannot be told, and
+// returned.
+func writeAck(conn net.Conn, ack Event) error {
 	data, err := json.Marshal(ack)
 	if err != nil {
 		warnf("WARN: failed to marshal ack: %v\n", err)
-		return
+		return fmt.Errorf("marshal acknowledgment: %w", err)
 	}
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = conn.Write(append(data, '\n'))
 	conn.SetWriteDeadline(time.Time{})
 	if err != nil {
-		// The verdict could not be delivered. The barrier is still released:
-		// a peer that has gone away must not wedge the daemon. The failure is
-		// reported here because the client cannot be told.
 		warnf("WARN: failed to write ack to client: %v\n", err)
+		return fmt.Errorf("write acknowledgment: %w", err)
 	}
-}
-
-// peerAddr names the other end of conn for a diagnostic.
-func peerAddr(conn net.Conn) string {
-	if addr := conn.RemoteAddr(); addr != nil {
-		return addr.String()
-	}
-	return "unknown"
+	return nil
 }
 
 func (c *serverClient) writeLoop() {

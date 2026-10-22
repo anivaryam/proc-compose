@@ -1,6 +1,9 @@
 package runner
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // exitObservation is what an exit observer concluded about the command leader.
 //
@@ -72,9 +75,29 @@ type exitObserver interface {
 // containment survives the leader's exit, while elsewhere a nil observer means
 // the exit can only be detected by reaping, which ends signalling authority.
 //
-// An error means the leader's waitable state could not be established at all,
-// which revokes signalling authority and must not lead to a group signal.
+// An error fails the launch. Whether the group may still be signalled first is
+// leaderStillReserved's answer: a failed wait on the leader revokes signalling
+// authority and must not lead to a group signal.
 func observeLeaderExit(pid int) (exitObserver, error) { return observeLeaderExitPlatform(pid) }
+
+// errObservationUnsupported reports that this platform has no way to observe
+// the command leader's exit without reaping it. Only the platforms outside the
+// support contract return it; see exitwatch_other.go.
+var errObservationUnsupported = errors.New("exit observation without reaping is not supported on this platform")
+
+// leaderStillReserved reports whether the leader is still provably unreaped
+// after its exit could not be observed, so that its process-group ID is still
+// ours to signal.
+//
+// That holds only when the platform merely lacks a reap-free observation. Such
+// a failure says nothing about the leader, and nothing has collected it: the
+// runner performs the only reap, and that reap has not happened yet. Any other
+// failure is a failed wait on the leader itself — ECHILD means it is no longer
+// a waitable child, so something else collected it — so its identifier may
+// already have been released.
+func leaderStillReserved(obsErr error) bool {
+	return errors.Is(obsErr, errObservationUnsupported)
+}
 
 // groupPGID returns the group's numeric identifier, or 0 when it cannot be
 // resolved. On Unix it is what an operator can act on when a shutdown reports a

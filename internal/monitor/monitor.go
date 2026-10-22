@@ -811,7 +811,8 @@ func (m *monitor) write(b []byte) {
 	if target == nil {
 		target = os.Stdout
 	}
-	target.Write(out.Bytes())
+	// A frame that cannot be written is dropped; the next repaint replaces it.
+	_, _ = target.Write(out.Bytes())
 }
 
 func (m *monitor) renderMessage(msg string) {

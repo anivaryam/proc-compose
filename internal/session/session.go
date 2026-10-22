@@ -14,12 +14,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/paths"
+	"github.com/anivaryam/proc-compose/internal/sharedfile"
 )
 
 type Plan struct {
@@ -30,6 +32,16 @@ type Plan struct {
 	preferred map[string]map[string]int
 	resources []string
 	names     []string
+	mergePort int // the merge proxy port the plan leases; 0 when it leases none
+
+	// portsMu guards held and uses: the runner releases ports from its launch
+	// goroutines while a reload may resolve.
+	portsMu sync.Mutex
+	// held keeps each allocated port bound, by port number, until the first
+	// process that uses it is about to start (ReleasePorts) or the plan closes.
+	held map[int]net.Listener
+	// uses lists, per process, the allocated ports it declares or references.
+	uses map[string][]int
 }
 
 func Acquire(cfg *config.Config, configPath, hash, name string, filter []string) (_ *Plan, err error) {
@@ -44,6 +56,7 @@ func Acquire(cfg *config.Config, configPath, hash, name string, filter []string)
 	p := &Plan{
 		Project:   &ipc.Project{Session: name, RunID: ipc.NewRunID(), ConfigPath: configPath, Directory: paths.SessionDir(hash), Ports: make(map[string]map[string]int), URLs: make(map[string]map[string]string), JournalPath: paths.Journal(hash)},
 		variables: make(map[string]string), preferred: make(map[string]map[string]int), resources: slices.Clone(cfg.Resources),
+		held: make(map[int]net.Listener), uses: make(map[string][]int),
 		// Teardown processes run for the whole stack, whatever the filter.
 		names: append(config.SelectedNames(cfg, filter), config.TeardownNames(cfg)...),
 	}
@@ -74,6 +87,7 @@ func Acquire(cfg *config.Config, configPath, hash, name string, filter []string)
 		if expandErr != nil {
 			return nil, expandErr
 		}
+		resolved = resourceIdentity(resolved)
 		if leased[resolved] {
 			// Two labels expanded to the same resource: the plan already
 			// holds that lease, so it is not taken twice (the first
@@ -98,6 +112,7 @@ func Acquire(cfg *config.Config, configPath, hash, name string, filter []string)
 		if err = p.lease(fmt.Sprintf("tcp:127.0.0.1:%d", cfg.Merge.Port)); err != nil {
 			return nil, err
 		}
+		p.mergePort = cfg.Merge.Port
 	}
 	for _, process := range p.names {
 		declared := cfg.Processes[process].Ports
@@ -135,8 +150,16 @@ func (p *Plan) Resolve(cfg *config.Config) (*config.Config, error) {
 	if !sameResources(p.resources, cfg.Resources) {
 		return nil, fmt.Errorf("resources changed; restart the session")
 	}
+	// The leased merge port is baked into the proxy's command, so a reload
+	// that moves it would restart the proxy on a port the session does not
+	// lease. A reload that drops the merge section leaves the running proxy
+	// alone (hot-remove is not supported) and is not a change of lease.
+	if p.mergePort != 0 && cfg.Merge != nil && cfg.Merge.Port != p.mergePort {
+		return nil, fmt.Errorf("merge port changed; restart the session")
+	}
 	result := *cfg
 	result.Processes = maps.Clone(cfg.Processes)
+	uses := make(map[string][]int, len(p.names))
 	for _, name := range p.names {
 		proc, exists := cfg.Processes[name]
 		if !exists {
@@ -145,8 +168,15 @@ func (p *Plan) Resolve(cfg *config.Config) (*config.Config, error) {
 		if !maps.Equal(proc.Ports, p.preferred[name]) {
 			return nil, fmt.Errorf("named ports for %q changed; restart the session", name)
 		}
+		// A process uses the ports it declares and every port its expanded
+		// fields reference: any of them may be the one that binds the port.
+		used := slices.Collect(maps.Values(p.Project.Ports[name]))
+		expand := func(value string) (string, error) {
+			used = append(used, p.referencedPorts(value)...)
+			return p.expand(value)
+		}
 		var err error
-		proc.Cmd, err = p.expand(proc.Cmd)
+		proc.Cmd, err = expand(proc.Cmd)
 		if err != nil {
 			return nil, fmt.Errorf("process %q cmd: %w", name, err)
 		}
@@ -155,7 +185,7 @@ func (p *Plan) Resolve(cfg *config.Config) (*config.Config, error) {
 			proc.Env = make(map[string]string)
 		}
 		for key, value := range proc.Env {
-			proc.Env[key], err = p.expand(value)
+			proc.Env[key], err = expand(value)
 			if err != nil {
 				return nil, fmt.Errorf("process %q env key %q: %w", name, key, err)
 			}
@@ -168,7 +198,7 @@ func (p *Plan) Resolve(cfg *config.Config) (*config.Config, error) {
 		proc.Env["PROC_COMPOSE_SESSION"] = p.variables["session.name"]
 		proc.Env["PROC_COMPOSE_SESSION_DIR"] = p.Project.Directory
 		proc.Env["PROC_COMPOSE_RUN_ID"] = p.Project.RunID
-		proc.Dir, err = p.expand(proc.Dir)
+		proc.Dir, err = expand(proc.Dir)
 		if err != nil {
 			return nil, fmt.Errorf("process %q dir: %w", name, err)
 		}
@@ -178,15 +208,40 @@ func (p *Plan) Resolve(cfg *config.Config) (*config.Config, error) {
 		if proc.Dir != "" && !filepath.IsAbs(proc.Dir) {
 			proc.Dir = filepath.Join(filepath.Dir(p.Project.ConfigPath), proc.Dir)
 		}
-		if proc.ReadyWhen, err = p.expandProbe(proc.ReadyWhen); err != nil {
+		if proc.ReadyWhen, err = expandProbe(proc.ReadyWhen, expand); err != nil {
 			return nil, fmt.Errorf("process %q probe: %w", name, err)
 		}
-		if proc.HealthWhen, err = p.expandProbe(proc.HealthWhen); err != nil {
+		if proc.HealthWhen, err = expandProbe(proc.HealthWhen, expand); err != nil {
 			return nil, fmt.Errorf("process %q health_when: %w", name, err)
 		}
 		result.Processes[name] = proc
+		uses[name] = used
 	}
+	// Uses only grow: the runner can still refuse a reload this resolved, and
+	// releasing a port early only shortens its hold.
+	p.portsMu.Lock()
+	for name, used := range uses {
+		merged := append(p.uses[name], used...)
+		slices.Sort(merged)
+		p.uses[name] = slices.Compact(merged)
+	}
+	p.portsMu.Unlock()
 	return &result, nil
+}
+
+// referencedPorts returns the allocated ports value names through a
+// ${ports.*} or ${urls.*} reference.
+func (p *Plan) referencedPorts(value string) []int {
+	var ports []int
+	for process, named := range p.Project.Ports {
+		for portName, port := range named {
+			ref := process + "." + portName + "}"
+			if strings.Contains(value, "${ports."+ref) || strings.Contains(value, "${urls."+ref) {
+				ports = append(ports, port)
+			}
+		}
+	}
+	return ports
 }
 
 // sameResources reports whether two resource label lists name the same set of
@@ -202,16 +257,29 @@ func sameResources(a, b []string) bool {
 	return slices.Equal(sorted(a), sorted(b))
 }
 
-// expandProbe returns a copy of probe with its endpoint references resolved,
-// or nil for no probe. A log probe is a regex and is left as written.
-func (p *Plan) expandProbe(probe *config.ReadyWhen) (*config.ReadyWhen, error) {
+// resourceIdentity returns the lease identity of an expanded resource label. A
+// label that is an absolute file path once expanded is cleaned, so the
+// spellings of one path are one resource: `${config.dir}/db` and the literal
+// path, a doubled or trailing separator, and on Windows `/` against `\`. Any
+// other label — `db`, `tcp:127.0.0.1:5432`, a URL, a relative path, or a path
+// behind a prefix such as `next-build:` — is compared as written.
+func resourceIdentity(label string) string {
+	if filepath.IsAbs(label) {
+		return filepath.Clean(label)
+	}
+	return label
+}
+
+// expandProbe returns a copy of probe with its endpoint references resolved by
+// expand, or nil for no probe. A log probe is a regex and is left as written.
+func expandProbe(probe *config.ReadyWhen, expand func(string) (string, error)) (*config.ReadyWhen, error) {
 	if probe == nil {
 		return nil, nil
 	}
 	expanded := *probe
 	var err error
 	for _, field := range []*string{&expanded.HTTP, &expanded.TCP, &expanded.Cmd} {
-		if *field, err = p.expand(*field); err != nil {
+		if *field, err = expand(*field); err != nil {
 			return nil, err
 		}
 	}
@@ -325,16 +393,46 @@ func (p *Plan) allocate(preferred int) (int, error) {
 			continue
 		}
 		port := listener.Addr().(*net.TCPAddr).Port
-		err = p.lease(fmt.Sprintf("tcp:127.0.0.1:%d", port))
-		listener.Close()
-		if err == nil {
-			return port, nil
+		if err = p.lease(fmt.Sprintf("tcp:127.0.0.1:%d", port)); err != nil {
+			listener.Close()
+			continue
 		}
+		// The listener stays open: the lease only excludes other sessions,
+		// while the bound port excludes every program until the process
+		// that uses it is about to start.
+		p.portsMu.Lock()
+		p.held[port] = listener
+		p.portsMu.Unlock()
+		return port, nil
 	}
 	return 0, fmt.Errorf("no available named port starting at %d", preferred)
 }
 
+// ReleasePorts closes the listeners that hold the allocated ports process name
+// declares or references, so that it can bind them. The runner calls it right
+// before each launch (runner.Runner.BeforeStart), which narrows the window in
+// which another program can take a leased port to the launch itself. The
+// leases stay held. A port already released, a later launch and a name that
+// uses no held port are no-ops.
+func (p *Plan) ReleasePorts(name string) {
+	p.portsMu.Lock()
+	defer p.portsMu.Unlock()
+	for _, port := range p.uses[name] {
+		if listener, ok := p.held[port]; ok {
+			_ = listener.Close()
+			delete(p.held, port)
+		}
+	}
+}
+
+// Close releases the ports still held, then the leases.
 func (p *Plan) Close() {
+	p.portsMu.Lock()
+	for port, listener := range p.held {
+		_ = listener.Close()
+		delete(p.held, port)
+	}
+	p.portsMu.Unlock()
 	for i := len(p.leases) - 1; i >= 0; i-- {
 		_ = p.leases[i].Close()
 	}
@@ -351,8 +449,10 @@ func Save(path string, project *ipc.Project) error {
 	return daemon.WriteFileAtomic(path, data, 0600)
 }
 
+// Read reads the session metadata. It reads through sharedfile, so on Windows
+// a Save that replaces the file while it is read still succeeds.
 func Read(path string) (*ipc.Project, error) {
-	data, err := os.ReadFile(path)
+	data, err := sharedfile.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}

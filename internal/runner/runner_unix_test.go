@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -413,10 +414,11 @@ func TestState_AbsenceIsDecidedByMembershipNotTheProbe(t *testing.T) {
 // TestSetupFailure_WithdrawsBeforeAnySignal pins the ordering the invariant
 // depends on.
 //
-// When exit observation cannot be established, the leader's identifier can no
-// longer be proven to be ours. Sending a group signal at that point is exactly
-// what the whole design exists to prevent, so authority has to be withdrawn
-// first — before any signal, including a cleanup one.
+// When the wait on the leader fails, the leader's waitable state cannot be
+// established and its identifier can no longer be proven to be ours. Sending a
+// group signal at that point is exactly what the whole design exists to
+// prevent, so authority has to be withdrawn first — before any signal,
+// including a cleanup one.
 //
 // This is exercised through the group rather than by forcing observeLeaderExit
 // to fail, because the ordering lives in the group: once Withdraw returns,
@@ -441,6 +443,162 @@ func TestSetupFailure_WithdrawsBeforeAnySignal(t *testing.T) {
 	}
 	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("Kill() after Withdraw = %v, want os.ErrProcessDone", err)
+	}
+}
+
+// ── observation failure: the managed tree ───────────────────────────────────
+//
+// A launch whose exit cannot be observed fails. These tests drive that path
+// through the observeExit seam and pin what the failure leaves behind, and
+// whether the restart policy may launch another copy beside it.
+
+// failedObservation is an observeExit seam that reports the same error for
+// every launch.
+type failedObservation struct {
+	mu          sync.Mutex
+	launches    int
+	descendants []int
+}
+
+// failObservation installs a failedObservation on r. With a pidFile, each
+// launch's failure is reported only once its descendant has recorded its PID,
+// so the command's group has a member besides its leader; every descendant
+// seen is killed by its exact PID at cleanup.
+func failObservation(t *testing.T, r *Runner, pidFile string, err error) *failedObservation {
+	t.Helper()
+	f := &failedObservation{}
+	t.Cleanup(func() {
+		for _, pid := range f.seen() {
+			if proc, findErr := os.FindProcess(pid); findErr == nil {
+				_ = proc.Kill()
+			}
+		}
+	})
+	r.observeExit = func(int) (exitObserver, error) {
+		descendant, ok := 0, false
+		if pidFile != "" {
+			descendant, ok = waitForPIDFile(t, pidFile, 20*time.Second)
+			_ = os.Remove(pidFile)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.launches++
+		if ok {
+			f.descendants = append(f.descendants, descendant)
+		}
+		return nil, err
+	}
+	return f
+}
+
+func (f *failedObservation) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.launches
+}
+
+func (f *failedObservation) seen() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.descendants)
+}
+
+// TestObservationFailure_UnsupportedPlatformKillsTheGroup is the #48
+// regression for a platform that cannot observe an exit without reaping it.
+// The launch fails there, and it used to kill only the command itself, so its
+// descendants were orphaned. That failure says nothing about the leader, which
+// nothing has reaped yet, so its group ID is still the command's own and the
+// whole group is killed before authority is withdrawn.
+func TestObservationFailure_UnsupportedPlatformKillsTheGroup(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "descendant.pid")
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	stay := writeScript(t, dir, "stay.sh", stayScript)
+	r := makeRunner(map[string]config.Process{
+		// exec makes the script the leader, so its descendant is the only
+		// other member of the group.
+		"svc": {Cmd: "exec " + stay + " " + stubborn + " " + pidFile, Restart: "never"},
+	})
+	r.Output = io.Discard
+	seam := failObservation(t, r, pidFile, errObservationUnsupported)
+
+	err := r.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "processes failed: svc") {
+		t.Fatalf("Run = %v, want the launch to fail", err)
+	}
+	if got := snapshotOf(r, "svc"); got.State != "failed" || !strings.Contains(got.LastError, "observe leader exit") {
+		t.Fatalf("svc = %+v, want failed with the observation failure", got)
+	}
+	descendants := seam.seen()
+	if len(descendants) != 1 {
+		t.Fatalf("descendants = %v, want the one the launch started", descendants)
+	}
+	assertTerminated(t, descendants[0], "SIGTERM-ignoring descendant of a launch whose exit could not be observed", 10*time.Second)
+}
+
+// TestObservationFailure_UnprovenLeaderIsNeitherSignalledNorRestarted pins
+// the other failure: a failed wait on the leader itself, such as ECHILD when
+// something else collected it. Its identifier may already belong to an
+// unrelated group, so no group signal is sent, and the descendant is left
+// running and reported rather than risk signalling that group. The restart
+// policy used to launch a new copy beside it — one orphaned tree per restart
+// — and does not apply now.
+func TestObservationFailure_UnprovenLeaderIsNeitherSignalledNorRestarted(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "descendant.pid")
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	stay := writeScript(t, dir, "stay.sh", stayScript)
+	r := makeRunner(map[string]config.Process{
+		// exec makes the script the leader, so once it is killed its
+		// descendant is the only member left. MaxRestarts bounds the run if a
+		// restart does happen.
+		"svc": {Cmd: "exec " + stay + " " + stubborn + " " + pidFile, Restart: "always", MaxRestarts: 1},
+	})
+	r.Output = io.Discard
+	seam := failObservation(t, r, pidFile, syscall.ECHILD)
+
+	err := r.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "so svc is not restarted") {
+		t.Fatalf("Run = %v, want the failure reported with the reason it is not restarted", err)
+	}
+	if n := seam.count(); n != 1 {
+		t.Fatalf("%d launches, want 1: a restart would run beside the tree that is still alive", n)
+	}
+	if got := snapshotOf(r, "svc"); got.State != "failed" || got.Restarts != 0 {
+		t.Fatalf("svc = %+v, want failed without a restart", got)
+	}
+	descendants := seam.seen()
+	if len(descendants) != 1 {
+		t.Fatalf("descendants = %v, want the one the launch started", descendants)
+	}
+	if !pidIsRunning(descendants[0]) {
+		t.Fatalf("descendant %d was terminated, want it left alone: its group could not be proven to be the command's", descendants[0])
+	}
+	if !slices.ContainsFunc(r.Unresolved(), func(u UnresolvedProcess) bool { return u.Name == "svc" }) {
+		t.Fatalf("unresolved = %+v, want svc reported", r.Unresolved())
+	}
+}
+
+// TestObservationFailure_ProvenEmptyGroupKeepsTheRestartPolicy pins that the
+// rule is no wider than that: when nothing is left in the group once the
+// leader is collected, a restart cannot duplicate anything, so the restart
+// policy applies as it does to any failed launch.
+func TestObservationFailure_ProvenEmptyGroupKeepsTheRestartPolicy(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"svc": {Cmd: serviceHelperCmd("sleep", "60s"), Restart: "on-failure", MaxRestarts: 1},
+	})
+	r.Output = io.Discard
+	seam := failObservation(t, r, "", syscall.ECHILD)
+
+	err := r.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "processes failed: svc") {
+		t.Fatalf("Run = %v, want the launches to fail", err)
+	}
+	if n := seam.count(); n != 2 {
+		t.Fatalf("%d launches, want 2: the restart policy applies once the group is proven empty", n)
+	}
+	if got := r.Unresolved(); len(got) != 0 {
+		t.Fatalf("unresolved = %+v, want none for a group proven empty", got)
 	}
 }
 
@@ -2334,6 +2492,80 @@ func TestSetup_SetsSetpgidWithoutCallerStruct(t *testing.T) {
 	}
 	if !cmd.SysProcAttr.Setpgid {
 		t.Fatal("Setup did not set Setpgid")
+	}
+}
+
+// TestSetup_CommandLeadsItsOwnGroupWhateverTheCallerSet pins the fields Setup
+// does not leave to the caller. Track records the command's PID as its group
+// ID, so the command must lead a new group whose ID is its own PID:
+//
+//   - a caller's Pgid used to survive and put the command into an existing
+//     group, so every signal went to a group the command was not in and its
+//     ESRCH read as "nothing left to signal";
+//   - a caller's Setsid used to be combined with Setpgid, and setpgid(2) on the
+//     new session leader fails, so the command could not start at all.
+//
+// Each case starts a real command and checks the kernel's answer, and the
+// group is then killed through Setup's own group.
+func TestSetup_CommandLeadsItsOwnGroupWhateverTheCallerSet(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		attr   func() *syscall.SysProcAttr
+		setsid bool
+	}{
+		{"caller pgid", func() *syscall.SysProcAttr {
+			return &syscall.SysProcAttr{Setpgid: true, Pgid: syscall.Getpgrp()}
+		}, false},
+		{"caller setsid", func() *syscall.SysProcAttr {
+			return &syscall.SysProcAttr{Setsid: true}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			argv := helperArgv("sleep", "60s")
+			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+			cmd.SysProcAttr = tc.attr()
+			pg := newProcessGroup()
+			pg.Setup(cmd)
+			if cmd.SysProcAttr.Pgid != 0 {
+				t.Fatalf("Pgid = %d after Setup, want 0", cmd.SysProcAttr.Pgid)
+			}
+			if cmd.SysProcAttr.Setsid != tc.setsid {
+				t.Fatalf("Setsid = %v after Setup, want the caller's %v", cmd.SysProcAttr.Setsid, tc.setsid)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("start with the caller's attributes after Setup: %v", err)
+			}
+			pid := cmd.Process.Pid
+			t.Cleanup(func() {
+				_ = cmd.Process.Kill() // the owned handle, whatever group it is in
+				_, _ = cmd.Process.Wait()
+			})
+			if err := pg.Track(cmd); err != nil {
+				t.Fatalf("track: %v", err)
+			}
+
+			pgid, err := syscall.Getpgid(pid)
+			if err != nil {
+				t.Fatalf("getpgid(%d): %v", pid, err)
+			}
+			if pgid != pid {
+				t.Fatalf("the command's group = %d, want a new group led by the command (%d)", pgid, pid)
+			}
+			if tc.setsid {
+				if sid, err := unix.Getsid(pid); err != nil || sid != pid {
+					t.Fatalf("the command's session = %d (%v), want the caller's setsid to lead a new session (%d)", sid, err, pid)
+				}
+			}
+
+			if err := pg.Kill(); err != nil {
+				t.Fatalf("Kill() = %v, want the group signal to reach the command", err)
+			}
+			if err := cmd.Wait(); err == nil {
+				t.Fatal("Wait() = nil after the group kill, want the command killed")
+			}
+		})
 	}
 }
 

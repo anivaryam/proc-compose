@@ -125,6 +125,34 @@ func TestAcquire_ExpandedResourceCollisionIsLeasedOnce(t *testing.T) {
 	}
 }
 
+// TestAcquire_PathResourceLabelsAreCleaned pins the resource identity rule: a
+// label that is an absolute path once expanded is cleaned, so its spellings
+// are one lease, while every other label is kept exactly as written.
+func TestAcquire_PathResourceLabelsAreCleaned(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proc-compose.yml")
+	db := filepath.Join(dir, "db")
+	others := []string{"db", "./db", "tcp:127.0.0.1:5432", "redis://localhost:6379/0", "next-build:" + dir + "//web"}
+	cfg := &config.Config{
+		// On Windows ${config.dir}/db mixes `\` and `/`.
+		Resources: append([]string{"${config.dir}/db", dir + "//db/"}, others...),
+		Processes: map[string]config.Process{"api": {Cmd: "serve"}},
+	}
+	plan, err := Acquire(cfg, path, "clean-paths", "clean", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer plan.Close()
+	want := slices.Sorted(slices.Values(append([]string{db}, others...)))
+	if got := slices.Sorted(slices.Values(plan.Project.Resources)); !slices.Equal(got, want) {
+		t.Fatalf("Project.Resources = %q, want %q", got, want)
+	}
+	if want := 1 + len(want); len(plan.leases) != want {
+		t.Fatalf("leases = %d, want %d (the instance lease and one per resource)", len(plan.leases), want)
+	}
+}
+
 // TestAcquire_MergePortIsLeased pins that the merge proxy's fixed port is
 // leased: a second session with the same merge port is refused with the
 // lease error, instead of both sessions acquiring it.
@@ -212,7 +240,10 @@ func TestAcquire_MergePortIsLeasedButNotAllocated(t *testing.T) {
 	port := freePortPair(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "proc-compose.yml")
-	body := fmt.Sprintf("merge:\n  client: 3000\n  server: 3001\n  port: %d\nprocesses:\n  api:\n    cmd: serve\n    ports:\n      http: %d\n", port, port)
+	// The process is not name-matched as a merge upstream ("worker", not
+	// "api"), so its named port is only a managed port that prefers the merge
+	// port, not a PORT the merge wiring checks against merge.server.
+	body := fmt.Sprintf("merge:\n  client: 3000\n  server: 3001\n  port: %d\nprocesses:\n  worker:\n    cmd: serve\n    ports:\n      http: %d\n", port, port)
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +269,7 @@ func TestAcquire_MergePortIsLeasedButNotAllocated(t *testing.T) {
 	if _, recorded := plan.Project.Ports["merge-port"]; recorded {
 		t.Fatalf("Project.Ports = %v, want no merge-port entry", plan.Project.Ports)
 	}
-	if got := plan.Project.Ports["api"]["http"]; got != port+1 {
+	if got := plan.Project.Ports["worker"]["http"]; got != port+1 {
 		t.Fatalf("managed port = %d, want %d (moved, not refused)", got, port+1)
 	}
 }
@@ -404,6 +435,53 @@ func TestResolve_AcceptsReorderedResources(t *testing.T) {
 	}
 }
 
+// TestResolve_RefusesAMergePortChange pins that a reload cannot move the merge
+// port the session leases: the proxy would restart on a port no lease covers.
+// The same port resolves, and so does a reload that drops the merge section,
+// which changes no lease. A session that does not run the proxy leases no
+// merge port, so a change there is not refused.
+func TestResolve_RefusesAMergePortChange(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	port := freePortPair(t)
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	withMerge := func(port int) *config.Config {
+		return &config.Config{
+			Merge: &config.Merge{Client: 3000, Server: 3001, Port: port},
+			Processes: map[string]config.Process{
+				"api":                       {Cmd: "serve"},
+				config.MergePortProcessName: {Cmd: "merge-port --client 3000 --server 3001 --port " + strconv.Itoa(port)},
+			},
+		}
+	}
+	plan, err := Acquire(withMerge(port), path, "merge-reload", "merge-reload", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer plan.Close()
+	if _, err := plan.Resolve(withMerge(port)); err != nil {
+		t.Fatalf("an unchanged merge port was refused: %v", err)
+	}
+	_, err = plan.Resolve(withMerge(port + 1))
+	if err == nil {
+		t.Fatal("a reload moved the leased merge port")
+	}
+	if err.Error() != "merge port changed; restart the session" {
+		t.Fatalf("error = %v, want the merge port refusal", err)
+	}
+	if _, err := plan.Resolve(&config.Config{Processes: map[string]config.Process{"api": {Cmd: "serve"}}}); err != nil {
+		t.Fatalf("a reload that drops the merge section was refused: %v", err)
+	}
+
+	filtered, err := Acquire(withMerge(port), path, "merge-reload-filtered", "filtered", []string{"api"})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer filtered.Close()
+	if _, err := filtered.Resolve(withMerge(port + 1)); err != nil {
+		t.Fatalf("a session without the proxy refused a merge port change: %v", err)
+	}
+}
+
 func TestSessionLeaseHelper(t *testing.T) {
 	if len(os.Args) < 3 || os.Args[len(os.Args)-2] != "--session-lease-helper" {
 		return
@@ -471,6 +549,128 @@ func TestAcquire_ProcessExitReleasesResourceLease(t *testing.T) {
 		t.Fatalf("process exit left an orphaned lease: %v", err)
 	}
 	plan.Close()
+}
+
+// bindable reports whether another program could bind port on the loopback
+// address the plan allocates on.
+func bindable(port int) bool {
+	listener, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+	if err != nil {
+		return false
+	}
+	listener.Close()
+	return true
+}
+
+// TestAcquire_HoldsAllocatedPortsUntilTheProcessStarts pins that an allocated
+// port stays bound from Acquire until a process that uses it is about to
+// start, so no other program can take it in between. ReleasePorts frees the
+// ports the process declares and the ones its fields reference, and leaves the
+// rest held until Close.
+func TestAcquire_HoldsAllocatedPortsUntilTheProcessStarts(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	cfg := &config.Config{Processes: map[string]config.Process{
+		"api":    {Cmd: "serve", Ports: map[string]int{"http": 0}},
+		"web":    {Cmd: "web", Ports: map[string]int{"http": 0}, Env: map[string]string{"API_URL": "${urls.api.http}"}},
+		"db":     {Cmd: "db", Ports: map[string]int{"pg": 0}},
+		"worker": {Cmd: "work"},
+	}}
+	plan, err := Acquire(cfg, filepath.Join(t.TempDir(), "proc-compose.yml"), "held-ports", "held", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer plan.Close()
+	api, web, db := plan.Project.Ports["api"]["http"], plan.Project.Ports["web"]["http"], plan.Project.Ports["db"]["pg"]
+	held := func(when string, ports ...int) {
+		t.Helper()
+		for _, port := range ports {
+			if bindable(port) {
+				t.Fatalf("%s: port %d leased by the plan was bindable by another program", when, port)
+			}
+		}
+	}
+	free := func(when string, ports ...int) {
+		t.Helper()
+		for _, port := range ports {
+			if !bindable(port) {
+				t.Fatalf("%s: port %d is still held", when, port)
+			}
+		}
+	}
+	held("after Acquire", api, web, db)
+	plan.ReleasePorts("worker")
+	plan.ReleasePorts("not-a-process")
+	held("after releasing processes that use no port", api, web, db)
+	plan.ReleasePorts("web")
+	free("after web's release", web, api)
+	held("after web's release", db)
+	plan.ReleasePorts("web")
+	plan.Close()
+	free("after Close", db)
+}
+
+func TestSessionPortHelper(t *testing.T) {
+	if len(os.Args) < 3 || os.Args[len(os.Args)-2] != "--session-port-helper" {
+		return
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:"+os.Args[len(os.Args)-1])
+	if err != nil {
+		_, _ = os.Stdout.Write([]byte("E"))
+		os.Exit(2)
+	}
+	_, _ = os.Stdout.Write([]byte("R"))
+	var release [1]byte
+	_, _ = os.Stdin.Read(release[:])
+	listener.Close()
+	os.Exit(0)
+}
+
+// TestReleasePorts_ProcessBindsItsPort pins that a process started after
+// ReleasePorts binds its port, and that a process started while another port
+// was held does not keep that port: once released it binds while the earlier
+// process still runs. The held listener must not leak into a child (handle
+// inheritance on Windows, a missing close-on-exec on Unix).
+func TestReleasePorts_ProcessBindsItsPort(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	cfg := &config.Config{Processes: map[string]config.Process{
+		"api": {Cmd: "serve", Ports: map[string]int{"http": 0}},
+		"web": {Cmd: "web", Ports: map[string]int{"http": 0}},
+	}}
+	plan, err := Acquire(cfg, filepath.Join(t.TempDir(), "proc-compose.yml"), "bind-after-release", "bind", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer plan.Close()
+	api, web := plan.Project.Ports["api"]["http"], plan.Project.Ports["web"]["http"]
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	plan.ReleasePorts("web")
+	child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSessionPortHelper$", "--", "--session-port-helper", strconv.Itoa(web))
+	input, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		input.Close()
+		_ = child.Wait()
+	}()
+	var bound [1]byte
+	if _, err := io.ReadFull(output, bound[:]); err != nil || bound[0] != 'R' {
+		t.Fatalf("the process could not bind its port %d after ReleasePorts (reply %q, err %v)", web, bound[0], err)
+	}
+
+	plan.ReleasePorts("api")
+	if !bindable(api) {
+		t.Fatalf("port %d stayed bound after its release while a process started during its hold runs", api)
+	}
 }
 
 func TestAcquire_IndependentEndpointsAndReferences(t *testing.T) {

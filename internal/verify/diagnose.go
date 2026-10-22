@@ -103,7 +103,9 @@ func Diagnose(receipt *Result, state string, processes []string) Diagnosis {
 	if state != StateCompleted {
 		d.Limitations = append(d.Limitations, "attempt_not_terminal")
 	}
-	if receipt.Journal() == "" || receipt.RunID == nil {
+	// An empty run id is no run id: logs.Query reads an empty RunID as no
+	// filter, so a run-scoped scan with it would return the whole journal.
+	if receipt.Journal() == "" || receipt.RunID == nil || *receipt.RunID == "" {
 		d.HistoryMissing = true
 		d.Limitations = append(d.Limitations, "journal_unavailable")
 		return d

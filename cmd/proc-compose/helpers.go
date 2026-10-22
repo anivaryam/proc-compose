@@ -1264,6 +1264,13 @@ func topLevelName(cmd *cobra.Command) string {
 	return cmd.Name()
 }
 
+// jsonRequested reports whether cmd has a --json flag and it is set: this
+// CLI's marker for "this output is for a machine".
+func jsonRequested(cmd *cobra.Command) bool {
+	machine, err := cmd.Flags().GetBool("json")
+	return err == nil && machine
+}
+
 // updateNoticeEligible reports whether this invocation may print an update
 // notice.
 //
@@ -1279,11 +1286,8 @@ func updateNoticeEligible(cmd *cobra.Command, interactive bool) bool {
 	if updateNoticeSkip[name] {
 		return false
 	}
-	// --json is this CLI's marker for "this output is for a machine".
-	if f := cmd.Flags().Lookup("json"); f != nil {
-		if machine, err := cmd.Flags().GetBool("json"); err == nil && machine {
-			return false
-		}
+	if jsonRequested(cmd) {
+		return false
 	}
 	// "up --survive" prints a systemd unit that callers write to a file, and
 	// "up --silent" hands off to a daemon that re-runs this same binary
@@ -1340,10 +1344,12 @@ var (
 
 // updateRefreshBudget bounds the wait for the background release lookup at the
 // end of a command. It is the lookup's own HTTP timeout, so a cold round trip
-// to the release API is inside the budget: the cache is written even when the
-// first request of a session has to establish the connection. A slower or
-// unreachable release API still leaves the cache unwritten — the wait is
-// silent and best-effort, exactly as it is today.
+// to the release API is inside the budget: the result is recorded even when
+// the first request of a session has to establish the connection. A slower or
+// unreachable release API is given up at the budget, silently. The attempt was
+// recorded when the lookup was scheduled, so the next invocations neither
+// repeat the lookup nor wait for it until update.CacheTTL has passed: the
+// budget is paid at most once per check interval.
 const updateRefreshBudget = update.HTTPTimeout
 
 // checkerForUpdate returns the Checker this process uses for the release

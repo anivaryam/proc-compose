@@ -372,6 +372,7 @@ auto-injection — see:
 				Journal:       journal,
 				Project:       plan.Project,
 				ResolveConfig: plan.Resolve,
+				BeforeStart:   plan.ReleasePorts,
 				RecordPath:    pidPath,
 			}
 			if daemonChild {
@@ -1008,10 +1009,10 @@ See: https://github.com/anivaryam/proc-compose/blob/main/docs/cli.md#diagnose-or
 	// over the screen. Cobra returns for --help and --version before any run
 	// hook, so those never reach it.
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
-		// Commands that promise a structured result report this refusal
-		// themselves; they silence cobra's printing to keep stdout clean.
+		// verify and compare report this refusal in their own result kinds;
+		// every other command reports it here, the same way on each.
 		if err := validateSessionFlag(); err != nil && cmd.Annotations[structuredUsageAnnotation] == "" {
-			return err
+			return refuseSession(cmd, err)
 		}
 		printUpdateNotice(cmd, version, stderrIsTerminal())
 		return nil

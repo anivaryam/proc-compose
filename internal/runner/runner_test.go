@@ -11,6 +11,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -292,14 +293,12 @@ const helperSentinel = "__PROC_COMPOSE_TEST_HELPER__"
 
 // helperCmd builds a shell command that re-invokes this test binary in
 // helper mode. Args are base64-encoded into a single shell-safe token so
-// quoting hell across sh, cmd, PowerShell, and Go's exec-arg escaping
-// never matters.
+// quoting across sh and cmd never matters.
 func helperCmd(args ...string) string {
 	payload := base64.RawURLEncoding.EncodeToString([]byte(strings.Join(args, "\x00")))
 	if runtime.GOOS == "windows" {
-		// Leave path bare on Windows: Go's CreateProcess arg escaping
-		// turns any quotes we add into literal \" inside cmd /c.
-		// CI temp paths have no spaces.
+		// Leave path bare on Windows: posixQuote's single quotes mean
+		// nothing to cmd. CI temp paths have no spaces.
 		return os.Args[0] + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel + " " + payload
 	}
 	return posixQuote(os.Args[0]) + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel + " " + payload
@@ -327,11 +326,8 @@ func serviceHelperCmd(args ...string) string {
 // forked shell holding the pipe and EOF would not arrive until the command had
 // already finished.
 //
-// It is also placed inside a script rather than inline in the command string.
-// Windows shell selection routes any command containing a redirection operator to
-// PowerShell, where a null redirect is not the same syntax at all; keeping the
-// operators out of the configured command means the shell decision is made on the
-// command alone, which is what the product does for real configurations.
+// It is also placed inside a script rather than inline in the command string, so
+// the configured command stays a plain invocation on every platform.
 func discardOutputScript(t *testing.T, command string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -1476,6 +1472,128 @@ func TestRun_RestartAlwaysResetsBackoffAfterALongIncarnation(t *testing.T) {
 	waits := waitForRestartWaits(t, stamps, 2, 30*time.Second)
 	if growth := waits[1] - waits[0]; growth > 400*time.Millisecond {
 		t.Fatalf("the restart wait grew by %s after a long incarnation (%s then %s), want the reset to about 1s", growth, waits[0], waits[1])
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runner did not stop after cancel")
+	}
+}
+
+// TestRun_StopEndsTheRestartBackoff is the regression for a stop that waited
+// out the restart backoff. The `restart: always` path slept through it, so
+// once the backoff had grown a stop took up to 30 seconds; the failure path
+// returned at once but left the process in "restarting".
+//
+// Both restart paths must end the wait at once and leave the process in the
+// terminal state "exited" with a process.stopped event, and a dependent still
+// waiting for it must end as stopped, not failed. The stop lands in the second
+// restart's two-second wait, so a wait that ignored it would hold Run open for
+// about two seconds.
+func TestRun_StopEndsTheRestartBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		proc config.Process
+	}{
+		{"clean exit under restart always", config.Process{Cmd: helperCmd("exit", "0"), Restart: "always"}},
+		{"failure under restart on-failure", config.Process{Cmd: helperCmd("exit", "1"), Restart: "on-failure"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			svc := tc.proc
+			// Never ready, so the dependent is still waiting at the stop.
+			svc.ReadyWhen = &config.ReadyWhen{Log: "NEVER-MATCHES"}
+			r := makeRunner(map[string]config.Process{
+				"svc": svc,
+				"app": {Cmd: helperCmd("log", "should-not-run"), Restart: "never", DependsOn: []string{"svc"}},
+			})
+			journal := &synchronizedBuffer{}
+			r.Output, r.Journal = io.Discard, journal
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- r.Run(ctx) }()
+
+			inSecondWait := func(s ipc.ProcState) bool { return s.Restarts >= 2 && s.State == "restarting" }
+			if !waitForProcState(t, r, "svc", inSecondWait, 20*time.Second) {
+				t.Fatalf("svc never reached its second restart wait: %+v", snapshotOf(r, "svc"))
+			}
+			stopped := time.Now()
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("Run = %v, want no failure for an operator-requested stop", err)
+				}
+			case <-time.After(20 * time.Second):
+				t.Fatal("runner did not stop after cancel")
+			}
+			if took := time.Since(stopped); took > time.Second {
+				t.Fatalf("Run returned %s after the stop, want the restart backoff to end at once", took)
+			}
+
+			if got := snapshotOf(r, "svc"); got.State != "exited" {
+				t.Fatalf("svc state = %q after a stop during its restart backoff, want exited", got.State)
+			}
+			if got := snapshotOf(r, "app"); got.State != "exited" {
+				t.Fatalf("dependent state = %q after the stop, want exited", got.State)
+			}
+			var last string
+			for _, event := range journalEvents(t, bytes.NewBufferString(journal.String())) {
+				if event.Code == "dependency.failed" {
+					t.Fatalf("a stop was reported as a dependency failure: %+v", event)
+				}
+				if event.Process == "svc" && event.Code != "" {
+					last = event.Code
+				}
+			}
+			if last != "process.stopped" {
+				t.Fatalf("svc's last event = %q, want process.stopped", last)
+			}
+		})
+	}
+}
+
+// TestRun_RestartRequestEndsTheRestartAlwaysBackoff pins that a restart
+// requested while a `restart: always` process waits out its backoff skips the
+// wait, as it does on the failure path. The request used to stay queued until
+// the backoff ran out and then cancelled the incarnation that had just
+// started, so the requested restart came late and replaced the wrong
+// incarnation.
+func TestRun_RestartRequestEndsTheRestartAlwaysBackoff(t *testing.T) {
+	stamps := filepath.Join(t.TempDir(), "stamps")
+	// Two incarnations end at once, so the second wait is two seconds; the
+	// third one stays up.
+	r := makeRunner(map[string]config.Process{
+		"svc": {Cmd: helperCmd("lifecycle-stamps", stamps, "0s,0s,30s"), Restart: "always"},
+	})
+	r.Output = io.Discard
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	inSecondWait := func(s ipc.ProcState) bool { return s.Restarts >= 2 && s.State == "restarting" }
+	if !waitForProcState(t, r, "svc", inSecondWait, 20*time.Second) {
+		t.Fatalf("svc never reached its second restart wait: %+v", snapshotOf(r, "svc"))
+	}
+	if result := r.requestRestart(r.store.Load().get("svc")); result.Status != "ok" {
+		t.Fatalf("restart request = %+v, want ok", result)
+	}
+
+	waits := waitForRestartWaits(t, stamps, 2, 20*time.Second)
+	if waits[1] >= waits[0] {
+		t.Fatalf("the requested restart waited %s, longer than the first one-second wait (%s): the backoff was not skipped", waits[1], waits[0])
+	}
+	if !waitForProcState(t, r, "svc", func(s ipc.ProcState) bool { return s.State == "running" }, 20*time.Second) {
+		t.Fatalf("the requested incarnation never ran: %+v", snapshotOf(r, "svc"))
+	}
+	if got := snapshotOf(r, "svc").Restarts; got != 2 {
+		t.Fatalf("restarts = %d, want 2: the request during the wait replaced no further incarnation", got)
 	}
 
 	cancel()
@@ -4343,6 +4461,81 @@ func TestShutdown_IPCPathReleasesTheAckBarrier(t *testing.T) {
 	assertTerminated(t, pid, "svc", 15*time.Second)
 }
 
+// TestShutdown_UndeliveredVerdictIsJournaled is the #31 consumer regression.
+// The client that asked for the shutdown is gone before its verdict can be
+// written. The server reports the failed write through WaitFlushed, and the
+// runner records the verdict in the event journal as
+// shutdown.verdict_undelivered, the only place it is still found. It used to
+// be released exactly as for a delivered verdict, and nothing recorded that
+// the client never saw it. Run still exits without waiting out the barrier's
+// timeout.
+//
+// The command is queued and its client closed before Run starts, so the ack
+// write is certain to find the client gone.
+func TestShutdown_UndeliveredVerdictIsJournaled(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"svc": {
+			Cmd:             helperCmd("sleep", "120s"),
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+	var journal bytes.Buffer
+	r.Output, r.Journal = io.Discard, &journal
+	socketPath, server, stopServer := ipcServerForTest(t)
+	defer stopServer()
+	r.IPC = server
+
+	client, err := ipc.Dial(socketPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if _, err := client.Recv(); err != nil {
+		t.Fatalf("snapshot recv: %v", err)
+	}
+	if err := client.Send(ipc.Command{Action: "shutdown", Force: true}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	start := time.Now()
+	go func() { runDone <- r.Run(ctx) }()
+	select {
+	case <-runDone:
+	case <-time.After(shutdownFlushTimeout + 30*time.Second):
+		t.Fatal("Run did not exit after a shutdown whose client went away")
+	}
+	if elapsed := time.Since(start); elapsed > shutdownFlushTimeout {
+		t.Fatalf("Run took %s to exit; the ack barrier looks held to its timeout (%s) for a client that is gone",
+			elapsed, shutdownFlushTimeout)
+	}
+	if verdict := r.ShutdownResult(); verdict != nil {
+		t.Fatalf("ShutdownResult = %v, want a verified stop", verdict)
+	}
+
+	var undelivered []ipc.LogEntry
+	for _, event := range journalEvents(t, &journal) {
+		if event.Code == "shutdown.verdict_undelivered" {
+			undelivered = append(undelivered, event)
+		}
+	}
+	if len(undelivered) != 1 {
+		t.Fatalf("%d shutdown.verdict_undelivered events, want 1: the undelivered verdict was not recorded",
+			len(undelivered))
+	}
+	event := undelivered[0]
+	if event.Process != "proc-compose" || event.Level != "error" {
+		t.Fatalf("event = %s/%s, want a proc-compose error", event.Process, event.Level)
+	}
+	if !strings.Contains(event.Line, "verdict: ok") {
+		t.Fatalf("event message = %q, want it to carry the verdict", event.Line)
+	}
+	t.Logf("journal: %s", event.Line)
+}
+
 // ── output EOF is not command exit ───────────────────────────────────────────
 //
 // A managed command's log stream can finish long before the command does: a
@@ -6069,6 +6262,56 @@ func TestReload_AcceptsReorderedResourceLabels(t *testing.T) {
 	}
 }
 
+// TestRun_BeforeStartHandsTheHeldPortToTheProcess pins the launch hook a
+// session plan releases its held ports through: BeforeStart runs with the
+// process's name before the command starts, so the process binds the port the
+// plan held since Acquire. Without the hook the port is still bound and the
+// process cannot serve it.
+func TestRun_BeforeStartHandsTheHeldPortToTheProcess(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	cfg := &config.Config{Processes: map[string]config.Process{"api": {
+		Cmd: "serve", Ports: map[string]int{"http": 0}, ReadyWhen: &config.ReadyWhen{HTTP: "${urls.api.http}/"},
+	}}}
+	plan, err := session.Acquire(cfg, path, "before-start", "before-start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	resolved := *plan.Config
+	resolved.Processes = maps.Clone(resolved.Processes)
+	api := resolved.Processes["api"]
+	api.Cmd = serviceHelperCmd("serve-http", "127.0.0.1:"+strconv.Itoa(plan.Project.Ports["api"]["http"]))
+	resolved.Processes["api"] = api
+	var mu sync.Mutex
+	var launched []string
+	r := &Runner{Config: &resolved, NoColor: true, BeforeStart: func(name string) {
+		mu.Lock()
+		launched = append(launched, name)
+		mu.Unlock()
+		plan.ReleasePorts(name)
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	}()
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Ready }, 10*time.Second) {
+		t.Fatal("the process never served the port the plan held")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(launched, []string{"api"}) {
+		t.Fatalf("BeforeStart saw %q, want one call for api", launched)
+	}
+}
+
 // TestSetup_RequiresCommandContext pins the constraint ProcessGroup.Setup
 // places on its caller.
 //
@@ -6100,17 +6343,18 @@ func TestSetup_RequiresCommandContext(t *testing.T) {
 // TestObservationFailure_ClosesBothPipesOnEveryReturn pins the cleanup on the
 // path where the observation of the command leader's exit fails.
 //
-// os/exec closes only the parent's copies of the child's pipe ends, so the read
-// ends are the runner's to close, and every return from that path has to close
-// them: two leaked descriptors per occurrence, on every launch on the
-// platforms where the observation is unavailable.
+// os/exec closes the read ends only once cmd.Wait has collected the command,
+// and the handoff arm returns before that, so the read ends are the runner's
+// to close, and every return from that path has to close them: two leaked
+// descriptors per occurrence, on every launch on the platforms where the
+// observation is unavailable.
 //
-// The check is a source-level one on purpose. The path needs the observation
-// to fail immediately after the command was started, and observeLeaderExit has
-// no injection seam, so the runtime descriptor count stays deferred until one
-// exists. What is pinned here is the shape the fix introduced: the shared
-// close helper is invoked on each of the three arms of the failure block, and
-// the block returns an error naming the observation failure.
+// The check is a source-level one on purpose. The runtime tests of this path
+// drive it through the observeExit seam, but a descriptor count could not tell
+// the arms apart: on the two reap arms cmd.Wait has already closed the read
+// ends. What is pinned here is the shape the fix introduced: the shared close
+// helper is invoked on each of the three arms of the failure block, and the
+// block returns an error naming the observation failure.
 func TestObservationFailure_ClosesBothPipesOnEveryReturn(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "lifecycle.go", nil, 0)

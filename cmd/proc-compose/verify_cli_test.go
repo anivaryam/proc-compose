@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
@@ -232,41 +234,136 @@ func TestVerifyCLI_InvalidConfigJSON(t *testing.T) {
 	}
 }
 
-// TestVerifyCLI_InvalidSessionIsStructured drives the real entry point: the
-// root pre-run hook validates --session, and commands that promise structured
-// output must still emit it, with the usage exit status.
-func TestVerifyCLI_InvalidSessionIsStructured(t *testing.T) {
+// TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere drives the real entry
+// point over every command that accepts --json. The root pre-run hook refuses
+// an invalid --session before the command does anything, and every command
+// reports it the same way: exit status 2 and, with --json, exactly one JSON
+// object on stdout. verify and compare render their own result kinds; every
+// other command renders {operation, status: "error", message}. Without
+// --json the exit status is the same and the error is on stderr.
+func TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere(t *testing.T) {
 	bin := buildCLI(t)
+	// After the build, which needs the real Go caches: the runs get a
+	// throwaway home.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	// No config exists, so a command that wrongly accepted the session could
+	// not start or change anything.
 	dir := t.TempDir()
-	writeCLIFile(t, filepath.Join(dir, "proc-compose.yml"), "processes:\n  api:\n    cmd: sleep 30\n")
-
-	stdout, stderr, code := runVerifyCLI(t, bin, dir, "--session", "invalid space", "verify", "--json", "--", "true")
-	result := decodeOne(t, stdout)
-	if code != 2 || result["kind"] != "verify.response" || result["exit_code"] != float64(2) || result["attempt_id"] != nil || !strings.HasSuffix(result["config_path"].(string), "proc-compose.yml") {
-		t.Fatalf("verify --json: code %d result %v", code, result)
-	}
-	if errs, _ := result["errors"].([]any); len(errs) != 1 || errs[0].(map[string]any)["code"] != "usage_error" {
-		t.Fatalf("verify --json errors = %v", result["errors"])
-	}
-	if !strings.Contains(stderr, "invalid --session") {
-		t.Fatalf("verify --json stderr = %q", stderr)
-	}
-
-	stdout, stderr, code = runVerifyCLI(t, bin, dir, "--session", "invalid space", "verify", "--", "true")
-	if code != 2 || !strings.Contains(stdout, "verify FAILED (exit 2)") || !strings.Contains(stderr, "invalid --session") {
-		t.Fatalf("verify human: code %d stdout %q stderr %q", code, stdout, stderr)
-	}
-
-	stdout, _, code = runVerifyCLI(t, bin, dir, "--session", "invalid space", "compare", "--baseline", dir, "--candidate", dir, "--json", "--", "true")
-	comparison := decodeOne(t, stdout)
-	if code != 2 || comparison["kind"] != "verify.comparison" || comparison["status"] != "not_comparable" {
-		t.Fatalf("compare --json: code %d result %v", code, comparison)
+	config := filepath.Join(dir, "proc-compose.yml")
+	commands := []struct {
+		operation string   // the command path below the root
+		args      []string // the command's own arguments
+		check     []string // the check after --, for verify and compare
+	}{
+		{operation: "status"},
+		{operation: "logs", args: []string{"api"}},
+		{operation: "why", args: []string{"api"}},
+		{operation: "sessions"},
+		{operation: "config check"},
+		{operation: "config plan"},
+		{operation: "doctor"},
+		{operation: "bootstrap"},
+		{operation: "attempts"},
+		{operation: "up", args: []string{"--silent"}},
+		{operation: "restart", args: []string{"api"}},
+		{operation: "reload"},
+		{operation: "verify", check: []string{"true"}},
+		{operation: "compare", args: []string{"--baseline", dir, "--candidate", dir}, check: []string{"true"}},
 	}
 
-	// Commands without a structured contract keep the plain error.
-	stdout, stderr, code = runVerifyCLI(t, bin, dir, "--session", "invalid space", "status")
-	if code != 1 || stdout != "" || !strings.Contains(stderr, "invalid --session") {
-		t.Fatalf("status: code %d stdout %q stderr %q", code, stdout, stderr)
+	// The table must cover every command with a --json option. The generated
+	// man pages list each command's own options, so a new --json command
+	// that is missing from the table fails here.
+	manDir := t.TempDir()
+	if stdout, stderr, code := runVerifyCLI(t, bin, dir, "man", "--dir", manDir); code != 0 {
+		t.Fatalf("man: code %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	covered := map[string]bool{}
+	for _, tc := range commands {
+		covered["proc-compose-"+strings.ReplaceAll(tc.operation, " ", "-")+".1"] = true
+	}
+	pages, err := os.ReadDir(manDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withJSON := 0
+	for _, page := range pages {
+		data, err := os.ReadFile(filepath.Join(manDir, page.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), `\fB--json\fP`) {
+			continue
+		}
+		withJSON++
+		if !covered[page.Name()] {
+			t.Errorf("%s has a --json option but is not in the table", page.Name())
+		}
+	}
+	if withJSON != len(commands) {
+		t.Errorf("%d man pages have a --json option, the table has %d commands", withJSON, len(commands))
+	}
+
+	for _, tc := range commands {
+		t.Run(strings.ReplaceAll(tc.operation, " ", "_"), func(t *testing.T) {
+			human := append([]string{"-f", config, "--session", "invalid space"}, strings.Fields(tc.operation)...)
+			human = append(human, tc.args...)
+			machine := append(append([]string{}, human...), "--json")
+			if tc.check != nil {
+				human = append(append(human, "--"), tc.check...)
+				machine = append(append(machine, "--"), tc.check...)
+			}
+
+			stdout, stderr, code := runVerifyCLI(t, bin, dir, machine...)
+			if code != 2 {
+				t.Fatalf("--json: exit %d, want 2; stdout %q stderr %q", code, stdout, stderr)
+			}
+			result := decodeOne(t, stdout)
+			switch tc.operation {
+			case "verify":
+				if result["kind"] != "verify.response" || result["exit_code"] != float64(2) || result["attempt_id"] != nil || result["config_path"] != config {
+					t.Fatalf("verify --json result %v", result)
+				}
+			case "compare":
+				if result["kind"] != "verify.comparison" || result["status"] != "not_comparable" || result["exit_code"] != float64(2) {
+					t.Fatalf("compare --json result %v", result)
+				}
+			default:
+				message, _ := result["message"].(string)
+				want := map[string]any{"operation": tc.operation, "status": "error", "message": message}
+				if !reflect.DeepEqual(result, want) || !strings.HasPrefix(message, "invalid --session: ") {
+					t.Fatalf("--json result %v, want the refusal for %q", result, tc.operation)
+				}
+				if stderr != "" {
+					t.Fatalf("--json stderr = %q, want the refusal on stdout only", stderr)
+				}
+			}
+			if tc.check != nil {
+				if errs, _ := result["errors"].([]any); len(errs) != 1 || errs[0].(map[string]any)["code"] != "usage_error" {
+					t.Fatalf("%s --json errors = %v", tc.operation, result["errors"])
+				}
+			}
+
+			stdout, stderr, code = runVerifyCLI(t, bin, dir, human...)
+			if code != 2 || !strings.Contains(stderr, "invalid --session") {
+				t.Fatalf("human: exit %d, want 2; stdout %q stderr %q", code, stdout, stderr)
+			}
+			switch tc.operation {
+			case "verify":
+				if !strings.Contains(stdout, "verify FAILED (exit 2)") {
+					t.Fatalf("verify human stdout = %q", stdout)
+				}
+			case "compare":
+				if !strings.Contains(stdout, "compare NOT_COMPARABLE (exit 2)") {
+					t.Fatalf("compare human stdout = %q", stdout)
+				}
+			default:
+				if stdout != "" {
+					t.Fatalf("human stdout = %q, want the refusal on stderr only", stdout)
+				}
+			}
+		})
 	}
 }
 
@@ -381,5 +478,54 @@ func TestAttemptsListing_SkipsInvalidReceipts(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("rows = %+v, want the invalid receipt skipped", rows)
+	}
+}
+
+// TestLoadAttemptLatest_SkipsInvalidReceipts pins that `attempts latest` and
+// `why --attempt latest`, which both resolve through loadAttempt, take the
+// newest receipt the listing shows: a newer file that is not a receipt — a
+// non-ULID name that sorts before every attempt id, or a ULID-named record
+// with no attempt id — is skipped instead of failing the command. Naming such
+// a file explicitly still fails.
+func TestLoadAttemptLatest_SkipsInvalidReceipts(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	config := filepath.Join(t.TempDir(), "proc-compose.yml")
+	hash, err := paths.FromConfig(config, "latest-receipt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := verify.AttemptsDir(paths.SessionDir(hash))
+	now := time.Now()
+	id, err := verify.NewAttemptID(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := &verify.Result{SchemaVersion: verify.SchemaVersion, AttemptID: &id, State: verify.StateCompleted, Status: verify.StatusPassed, ExitCode: verify.ExitPassed}
+	if err := verify.WriteReceipt(filepath.Join(dir, id+".json"), receipt); err != nil {
+		t.Fatal(err)
+	}
+	newer, err := verify.NewAttemptID(now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"bad.json":      `{"schema_version":1,"kind":"verify.receipt"}`,
+		newer + ".json": `{"schema_version":1,"kind":"verify.receipt","state":"completed","status":"passed"}`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, ref := range []string{"latest", ""} {
+		got, path, err := loadAttempt(hash, ref)
+		if err != nil {
+			t.Fatalf("loadAttempt(%q): %v", ref, err)
+		}
+		if got.AttemptID == nil || *got.AttemptID != id || path != filepath.Join(dir, id+".json") {
+			t.Fatalf("loadAttempt(%q) = %v at %s, want %s", ref, got.AttemptID, path, id)
+		}
+	}
+	if _, _, err := loadAttempt(hash, newer); err == nil || !strings.Contains(err.Error(), "attempt_id") {
+		t.Fatalf("loadAttempt(%s) = %v, want the invalid receipt refused", newer, err)
 	}
 }

@@ -2,32 +2,25 @@
 
 package runner
 
-import "errors"
-
-// errObservationUnsupported reports that this platform has no way to observe the
+// observeLeaderExitPlatform reports that this platform cannot observe the
 // command leader's exit without reaping it.
 //
 // proc-compose ships, tests and documents Linux, macOS and Windows only: the
 // platform matrix in docs/platforms.md, the release build matrix and the CI test matrix cover
 // exactly those three.
 //
-// An observation failure is fatal here, not a fallback. The caller withdraws
-// signalling authority, kills the leader it owns by its own handle, and
-// returns an error: there is no reap-based detection of the exit to fall back
-// to, and terminating a process group the runner cannot prove it owns would
-// be unsound. Every launch therefore fails on these platforms.
-var errObservationUnsupported = errors.New("exit observation without reaping is not supported on this platform")
-
-// newPlatformExitObserver reports that this platform cannot observe the command
-// leader's exit without reaping it.
+// The error is fatal for the launch, not a fallback to a reap-based detection
+// of the exit. Such a detection would race the reap against a cancellation's
+// group signal, and a group signalled after its leader was reaped may reach an
+// unrelated group that reused the identifier. Every launch therefore fails on
+// these platforms.
 //
-// proc-compose ships, tests and documents Linux, macOS and Windows only: the
-// platform matrix in docs/platforms.md, the release build matrix and the CI test matrix cover
-// exactly those three.
-//
-// The error is fatal for the launch: the caller has no reap-based fallback, so
-// every command fails here. docs/platforms.md records these platforms as
-// unsupported.
+// The failure leaves nothing running, though. It says nothing about the
+// leader, which nothing has reaped yet, so the caller kills the whole process
+// group while its identifier is still reserved, then withdraws authority and
+// reaps the leader. The group's membership cannot be enumerated here, so it is
+// never proven empty, and the process is reported as unverified and not
+// restarted. docs/platforms.md records these platforms as unsupported.
 func observeLeaderExitPlatform(pid int) (exitObserver, error) {
 	return nil, errObservationUnsupported
 }

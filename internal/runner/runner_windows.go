@@ -3,8 +3,11 @@
 package runner
 
 import (
+	"context"
+	"os/exec"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 var (
@@ -13,22 +16,50 @@ var (
 	reSleep  = regexp.MustCompile(`(?i)\bsleep\s+(\d+)\b`)
 )
 
-// shellCommand returns the platform shell and arguments for running a command string.
+// shDoubleQuoteEscapes undoes the backslash escapes sh honours inside a
+// double-quoted string. A backslash before any other byte is literal there.
+var shDoubleQuoteEscapes = strings.NewReplacer(`\$`, `$`, "\\`", "`", `\"`, `"`, `\\`, `\`, "\\\n", "")
+
+// shellExec returns the command that runs command through the platform shell.
+//
+// os/exec quotes arguments for programs that split their command line with
+// CommandLineToArgvW, and cmd.exe is not one of them: given the script as one
+// argument, os/exec wraps it in quotes and backslash-escapes every quote inside,
+// and cmd runs those backslashes as part of the command. The command line is
+// therefore written here and handed to CreateProcess as it stands, through
+// SysProcAttr.CmdLine. /s makes cmd remove exactly the quote pair around the
+// script and run what is inside it unchanged, whatever quotes the script
+// contains; without /s, cmd keeps or removes the pair depending on the script.
+//
+// The SysProcAttr is set here, before the process group's Setup, which adds its
+// creation flag to an existing SysProcAttr instead of replacing it.
+func shellExec(ctx context.Context, command string) *exec.Cmd {
+	shell, args := shellCommand(command)
+	cmd := exec.CommandContext(ctx, shell, args...)
+	// args is /c and the script.
+	cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: shell + ` /s /c "` + args[1] + `"`}
+	return cmd
+}
+
+// shellCommand returns the platform shell and the arguments that run command
+// under it. shellExec is what delivers them to cmd intact.
+//
+// Every command runs under cmd, which has the operators a config uses natively:
+// &&, ||, | and the redirections >, >>, < and 2>&1. Windows PowerShell 5.1, the
+// "powershell" on PATH, has no && or ||, writes a > redirection as UTF-16 with a
+// byte-order mark, and reads $(...) as its own subexpression, so no command is
+// routed to it; PowerShell syntax has to name powershell in the command itself.
 func shellCommand(command string) (string, []string) {
-	if isExplicitPowerShellCommand(command) {
-		return "cmd", []string{"/c", command}
+	script := command
+	if !isExplicitPowerShellCommand(command) {
+		// Only the sh -c shim is requoted: anywhere else the command is cmd
+		// syntax, where an apostrophe is ordinary text.
+		if inner, ok := strings.CutPrefix(command, "sh -c "); ok {
+			script = requoteForCMD(unquoteShellWord(inner))
+		}
+		script = translateToCMD(script)
 	}
-
-	if strings.HasPrefix(command, "sh -c ") {
-		inner := strings.TrimPrefix(command, "sh -c ")
-		inner = stripOuterQuotes(inner)
-		return "cmd", []string{"/c", translateToCMD(inner)}
-	}
-
-	if needsPowerShell(command) {
-		return "powershell", []string{"-Command", translateToPowerShell(command)}
-	}
-	return "cmd", []string{"/c", translateToCMD(command)}
+	return "cmd", []string{"/c", script}
 }
 
 func isExplicitPowerShellCommand(command string) bool {
@@ -40,58 +71,114 @@ func isExplicitPowerShellCommand(command string) bool {
 		strings.HasPrefix(lower, "pwsh.exe ")
 }
 
-// stripOuterQuotes removes exactly one matched outer quote pair from s and
-// returns the inner bytes verbatim. A string whose ends do not match, or that
-// is shorter than two bytes, is returned unchanged.
-//
-// The sh -c shim hands the inner text to cmd /c, so only the pair a shell
-// would have removed is removed: cmd has no single-quote semantics and does
-// not interpret a backslash-escaped quote, so the text after the pair is
-// passed through as it stands.
-func stripOuterQuotes(s string) string {
+// unquoteShellWord returns the script an sh -c argument holds, removing its
+// quoting the way sh does: a single-quoted word is taken literally, and inside a
+// double-quoted word a backslash before $, `, ", \ or a line break is removed.
+// Anything else — an unquoted script, an unterminated quote, or text after the
+// closing quote — is returned unchanged.
+func unquoteShellWord(s string) string {
 	if len(s) < 2 {
 		return s
 	}
-	first, last := s[0], s[len(s)-1]
-	if first != last || (first != '"' && first != '\'') {
-		return s
+	switch s[0] {
+	case '\'':
+		if strings.IndexByte(s[1:], '\'') == len(s)-2 {
+			return s[1 : len(s)-1]
+		}
+	case '"':
+		if closingDoubleQuote(s, 0) == len(s)-1 {
+			return shDoubleQuoteEscapes.Replace(s[1 : len(s)-1])
+		}
 	}
-	return s[1 : len(s)-1]
+	return s
 }
 
-// needsPowerShell reports whether a command has to run under PowerShell.
+// requoteForCMD rewrites the quoted strings of an sh script into the quoting
+// cmd and the programs it starts understand, wherever that leaves what a
+// program receives unchanged:
 //
-// The && and || test comes first and answers false, because cmd supports both
-// natively while Windows PowerShell 5.1 — the "powershell" on PATH — has no
-// chain operators at all. It has to be tested before the pipe test: "||"
-// contains "|", so a pipe test evaluated first would send the common "a || b"
-// form to a PowerShell that cannot parse it. A command that mixes operators
-// therefore runs under cmd as well.
-func needsPowerShell(cmd string) bool {
-	if strings.Contains(cmd, "&&") || strings.Contains(cmd, "||") {
+//   - a quoted string made only of letters, digits and -_./:=+ loses its
+//     quotes, as sh would remove them, so echo prints x for 'x' as sh does;
+//   - any other single-quoted string is put in double quotes, the only quotes
+//     cmd and the C runtime's argument parser know, unless it contains ", %, $
+//     or a line break, or ends in a backslash: cmd, the parser or the $VAR
+//     translation would change those, so they are kept as written.
+//
+// Other double-quoted strings are kept as written: the C runtime's argument
+// parser reads them as sh does, escaped quotes included, except that it keeps
+// the backslash of \\, \$ and \`. Everything outside quotes is kept as written
+// too. A script with an unterminated quote is returned unchanged.
+func requoteForCMD(script string) string {
+	var b strings.Builder
+	for i := 0; i < len(script); i++ {
+		switch script[i] {
+		case '\\':
+			// Outside quotes a backslash escapes the next byte, so that byte
+			// cannot open a quote. Both are kept as written.
+			b.WriteString(script[i:min(i+2, len(script))])
+			i++
+		case '\'':
+			end := strings.IndexByte(script[i+1:], '\'')
+			if end < 0 {
+				return script
+			}
+			text := script[i+1 : i+1+end]
+			switch {
+			case isPlainShellText(text):
+				b.WriteString(text)
+			case strings.ContainsAny(text, "\"%$\r\n") || strings.HasSuffix(text, `\`):
+				b.WriteString(script[i : i+end+2])
+			default:
+				b.WriteString(`"` + text + `"`)
+			}
+			i += end + 1
+		case '"':
+			end := closingDoubleQuote(script, i)
+			if end < 0 {
+				return script
+			}
+			if text := script[i+1 : end]; isPlainShellText(text) {
+				b.WriteString(text)
+			} else {
+				b.WriteString(script[i : end+1])
+			}
+			i = end
+		default:
+			b.WriteByte(script[i])
+		}
+	}
+	return b.String()
+}
+
+// closingDoubleQuote returns the index of the quote that closes the
+// double-quoted sh string opened at s[open], or -1 when it is unterminated. A
+// backslash inside the string escapes the byte after it.
+func closingDoubleQuote(s string, open int) int {
+	for i := open + 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '"':
+			return i
+		}
+	}
+	return -1
+}
+
+// isPlainShellText reports whether s is non-empty and made only of letters,
+// digits and -_./:=+, which neither sh nor cmd treats specially, so quoting s
+// changes nothing.
+func isPlainShellText(s string) bool {
+	if s == "" {
 		return false
 	}
-	if strings.Contains(cmd, "|") {
-		return true
-	}
-	if strings.Contains(cmd, ">") || strings.Contains(cmd, "2>") {
-		return true
-	}
-	if strings.Contains(cmd, "$(") {
-		depth := 0
-		for i := 0; i < len(cmd); i++ {
-			if cmd[i] == '$' && i+1 < len(cmd) && cmd[i+1] == '(' {
-				depth++
-				i++
-			} else if cmd[i] == ')' {
-				depth--
-			}
-		}
-		if depth > 0 {
-			return true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || strings.IndexByte("-_./:=+", c) >= 0) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func translateToCMD(cmd string) string {
@@ -114,8 +201,4 @@ func translateToCMD(cmd string) string {
 		return "%(" + subCmd + ")%"
 	})
 	return result
-}
-
-func translateToPowerShell(cmd string) string {
-	return cmd
 }

@@ -280,37 +280,59 @@ type Command struct {
 	Process string             `json:"process,omitempty"` // target process name (for restart)
 	Force   bool               `json:"force,omitempty"`   // "shutdown": kill managed processes instead of asking them to exit
 	Reply   chan CommandResult `json:"-"`
-	// flushed is closed by the server once the acknowledgment carrying Reply
-	// has been written to the client — that is, once the write attempt has
-	// completed, whatever its result. A failed write is reported by the
-	// server on stderr; the barrier is released anyway, because a peer that
-	// has gone away must not wedge the daemon. A "shutdown" handler waits on
-	// it so the daemon does not start tearing its IPC server down while the
-	// caller is still reading the verdict — which is the only place that
-	// reports what could not be terminated. Like Reply it never goes on the
-	// wire.
-	flushed chan struct{}
+	// flushed is the server's account of the acknowledgment carrying Reply.
+	// A "shutdown" handler waits on it so the daemon does not start tearing
+	// its IPC server down while the caller is still reading the verdict —
+	// which is the only place that reports what could not be terminated —
+	// and so it learns when that verdict was not delivered. Like Reply it
+	// never goes on the wire.
+	flushed *ackDelivery
 }
 
-// WaitFlushed blocks until the acknowledgment carrying this command's Reply
-// has been written to the client, or until timeout elapses. It returns
-// immediately for a command that did not come from a Server.
+// ackDelivery reports what became of one acknowledgment. The server closes
+// done once the write attempt has completed, whatever its result, because a
+// peer that has gone away must not wedge the daemon. err is set before done
+// is closed, and is nil only when the acknowledgment carrying the runner's
+// verdict was written to the client in full.
+type ackDelivery struct {
+	done chan struct{}
+	err  error
+}
+
+// finish records the outcome and releases every waiter. It is called once.
+func (d *ackDelivery) finish(err error) {
+	d.err = err
+	close(d.done)
+}
+
+// WaitFlushed blocks until the server has finished with the acknowledgment
+// carrying this command's Reply, or until timeout elapses, and reports
+// whether that acknowledgment was delivered.
 //
-// The barrier is released after the write attempt completes, not after a
-// successful write: the server reports a failed ack write on stderr and
-// releases the barrier regardless, so a peer that has gone away cannot wedge
-// the daemon.
+// It returns nil once the acknowledgment has been written to the client in
+// full, and at once for a command that did not come from a Server, which has
+// no client to deliver to. Otherwise it returns why the verdict was not
+// delivered: the write failed (the client went away or stopped reading), the
+// server had already answered with a timeout instead of the verdict, or
+// timeout elapsed first. A failed write does not hold the caller: it returns
+// as soon as the write attempt completes, so a peer that has gone away
+// cannot wedge the daemon.
 //
 // Use it only for a verdict that must survive the server going away. A
 // "shutdown" verdict qualifies: it is the caller's only report of which
-// managed processes could not be terminated.
-func (c *Command) WaitFlushed(timeout time.Duration) {
+// managed processes could not be terminated, so one that was not delivered
+// has to be recorded where the operator can still find it.
+func (c *Command) WaitFlushed(timeout time.Duration) error {
 	if c.flushed == nil {
-		return
+		return nil
 	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
-	case <-c.flushed:
-	case <-time.After(timeout):
+	case <-c.flushed.done:
+		return c.flushed.err
+	case <-timer.C:
+		return fmt.Errorf("the acknowledgment was not written within %s", timeout)
 	}
 }
 

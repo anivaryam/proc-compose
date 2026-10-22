@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -255,31 +257,45 @@ func TestServer_AckOkWhenAccepted(t *testing.T) {
 		}
 	}
 
-	// The barrier is released once the ack has been written.
+	// The barrier is released once the ack has been written, and reports it
+	// as delivered.
 	select {
 	case cmd := <-commands:
-		select {
-		case <-cmd.flushed:
-		case <-time.After(2 * time.Second):
-			t.Fatal("the ack barrier was not released")
+		if err := cmd.WaitFlushed(2 * time.Second); err != nil {
+			t.Fatalf("WaitFlushed after a delivered ack = %v, want nil", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the runner never received the command")
 	}
 }
 
-// TestServer_ReportsOversizedFrame pins the daemon-side diagnostic for an
-// inbound frame over the cap.
-//
-// The cap stays at 64 KiB: the frame is still dropped and the connection is
-// still closed. What is added is the daemon saying so, instead of an
-// oversized frame being indistinguishable from a client that disconnected.
-func TestServer_ReportsOversizedFrame(t *testing.T) {
+// TestServer_OversizedFrameIsAnsweredAndTheConnectionKept is the #30
+// regression. The 64 KiB inbound cap stays, but a frame over it is answered
+// with an error acknowledgment the client can show, and the connection
+// survives it: the commands queued behind it on the same connection are
+// still processed. bufio.Scanner latched ErrTooLong and tore the connection
+// down, silently dropping every one of them.
+func TestServer_OversizedFrameIsAnsweredAndTheConnectionKept(t *testing.T) {
 	s := NewServer(testSocketPath(t, "pc-oversized-test"))
 	if err := s.Listen(); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
 	defer s.Shutdown()
+
+	commands := make(chan Command, 4)
+	stopRunner := make(chan struct{})
+	defer close(stopRunner)
+	go func() {
+		for {
+			select {
+			case cmd := <-s.cmdCh:
+				commands <- cmd
+				cmd.Reply <- CommandResult{Status: "ok"}
+			case <-stopRunner:
+				return
+			}
+		}
+	}()
 
 	c, err := Dial(s.socketPath)
 	if err != nil {
@@ -294,51 +310,77 @@ func TestServer_ReportsOversizedFrame(t *testing.T) {
 	restore := swapStderrSink(&warnings)
 	defer restore()
 
-	// One byte over the cap.
+	// One byte over the cap, then a frame that takes several buffer fills to
+	// discard (the issue's 100 KiB case and more), each followed by a valid
+	// command on the same connection.
 	written := make(chan error, 1)
 	go func() {
-		_, err := c.conn.Write(commandFrame(maxCommandFrameBytes + 1))
-		written <- err
+		for _, frame := range [][]byte{
+			commandFrame(maxCommandFrameBytes + 1),
+			commandFrame(64),
+			commandFrame(4*maxCommandFrameBytes + 7),
+			commandFrame(64),
+		} {
+			if _, err := c.conn.Write(frame); err != nil {
+				written <- err
+				return
+			}
+		}
+		written <- nil
 	}()
-	select {
-	case <-written:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the oversized frame was never written")
+
+	wantAcks := []string{"error", "ok", "error", "ok"}
+	for i, want := range wantAcks {
+		var ack Event
+		for ack.Type != TypeAck {
+			ack, err = c.RecvTimeout(10 * time.Second)
+			if err != nil {
+				t.Fatalf("ack %d: %v (the connection did not survive the oversized frame)", i, err)
+			}
+		}
+		if ack.Ack != want {
+			t.Fatalf("ack %d = %q (%s), want %q", i, ack.Ack, ack.AckDetail, want)
+		}
+		if want == "error" {
+			// The client can show the reason: it names the condition and the
+			// limit.
+			if !strings.Contains(ack.AckDetail, "command frame too long") ||
+				!strings.Contains(ack.AckDetail, strconv.Itoa(maxCommandFrameBytes)) {
+				t.Fatalf("error ack detail = %q, want it to name the condition and the %d byte limit",
+					ack.AckDetail, maxCommandFrameBytes)
+			}
+		}
+	}
+	if err := <-written; err != nil {
+		t.Fatalf("write: %v", err)
 	}
 
+	// Only the valid commands reached the runner. Each was queued before its
+	// reply, so both are buffered by now.
+	if got := len(commands); got != 2 {
+		t.Fatalf("the runner received %d commands, want the 2 valid ones", got)
+	}
+	for range 2 {
+		if cmd := <-commands; len(cmd.Process) > 64 {
+			t.Fatalf("an oversized frame reached the runner: %d byte process name", len(cmd.Process))
+		}
+	}
+
+	// The daemon reports each discarded frame and names the limit. The peer
+	// is not named: a Unix socket's peer address is empty.
 	if !waitForWarning(&warnings, "command frame too long") {
 		t.Fatalf("no diagnostic for the oversized frame; warnings: %q", warningText(&warnings))
 	}
 	msg := warningText(&warnings)
 	t.Logf("daemon diagnostic: %s", msg)
-
-	// The diagnostic names the cap.
+	if got := strings.Count(msg, "command frame too long"); got != 2 {
+		t.Fatalf("%d diagnostics for 2 oversized frames: %q", got, msg)
+	}
 	if !strings.Contains(msg, strconv.Itoa(maxCommandFrameBytes)) {
 		t.Fatalf("the diagnostic does not name the %d byte cap: %q", maxCommandFrameBytes, msg)
 	}
-
-	// The diagnostic names the peer.
-	idx := strings.Index(msg, "peer ")
-	if idx < 0 {
-		t.Fatalf("the diagnostic does not name the peer: %q", msg)
-	}
-	rest := msg[idx+len("peer "):]
-	if rest == "" || rest[0] == ' ' {
-		t.Fatalf("the diagnostic names an empty peer: %q", msg)
-	}
-
-	// The frame is still dropped: no command reaches the runner.
-	select {
-	case cmd := <-s.cmdCh:
-		t.Fatalf("the oversized frame was processed: %+v", cmd)
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	// The connection is still closed.
-	if _, err := c.RecvTimeout(5 * time.Second); err == nil {
-		t.Fatal("the connection stayed open after the oversized frame")
-	} else if errors.Is(err, ErrRecvTimeout) {
-		t.Fatalf("the connection stayed open after the oversized frame: %v", err)
+	if strings.Contains(msg, "peer") {
+		t.Fatalf("the diagnostic names a peer it cannot identify: %q", msg)
 	}
 }
 
@@ -390,11 +432,13 @@ func TestServer_ProcessesFrameAtTheCap(t *testing.T) {
 	}
 }
 
-// TestServer_AckWriteFailureIsReported pins the daemon-side diagnostic for a
-// failed acknowledgment write, and the barrier that must still be released.
+// TestServer_AckWriteFailureIsReported is the #31 regression. A failed
+// acknowledgment write is reported on the daemon side and to the command's
+// waiter: WaitFlushed says the verdict was not delivered, so the runner can
+// act on it. It used to be released exactly as for a delivered verdict.
 //
-// The barrier release is unconditional: a peer that has gone away must not
-// wedge the daemon for the whole shutdown budget.
+// The barrier is still released at once, not at its timeout: a peer that has
+// gone away must not wedge the daemon for the whole shutdown budget.
 func TestServer_AckWriteFailureIsReported(t *testing.T) {
 	s := NewServer(testSocketPath(t, "pc-ack-fail-test"))
 	if err := s.Listen(); err != nil {
@@ -446,11 +490,194 @@ func TestServer_AckWriteFailureIsReported(t *testing.T) {
 	}
 	t.Logf("daemon diagnostic: %s", warningText(&warnings))
 
-	// The barrier is released anyway.
+	// The barrier is released at once, and reports the verdict undelivered.
+	const flushTimeout = 10 * time.Second
+	start := time.Now()
+	err = cmd.WaitFlushed(flushTimeout)
+	if err == nil {
+		t.Fatal("WaitFlushed after a failed ack write = nil: the verdict is reported delivered")
+	}
+	if elapsed := time.Since(start); elapsed > flushTimeout/2 {
+		t.Fatalf("WaitFlushed took %s after the failed write; the barrier was held to its timeout", elapsed)
+	}
+	if !strings.Contains(err.Error(), "write acknowledgment") {
+		t.Fatalf("WaitFlushed = %v, want the write failure", err)
+	}
+	t.Logf("undelivered: %v", err)
+}
+
+// TestServer_ReplyTimeoutLeavesTheVerdictUndelivered pins the other way a
+// verdict misses its client: the server gave up waiting and answered with a
+// timeout error, so the verdict the runner hands back afterwards is never
+// written. The ack write itself succeeds, but WaitFlushed must not read that
+// as the verdict being delivered.
+func TestServer_ReplyTimeoutLeavesTheVerdictUndelivered(t *testing.T) {
+	s := NewServer(testSocketPath(t, "pc-reply-timeout-test"))
+	s.replyTimeout = 100 * time.Millisecond
+	if err := s.Listen(); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer s.Shutdown()
+
+	commands := make(chan Command, 1)
+	go func() { commands <- <-s.cmdCh }()
+
+	c, err := Dial(s.socketPath)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+	if _, err := c.Recv(); err != nil {
+		t.Fatalf("snapshot Recv: %v", err)
+	}
+	if err := c.Send(Command{Action: "shutdown"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	var cmd Command
 	select {
-	case <-cmd.flushed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the ack barrier was not released after the failed write")
+	case cmd = <-commands:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the runner never received the command")
+	}
+
+	ev, err := c.RecvTimeout(10 * time.Second)
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if ev.Type != TypeAck || ev.Ack != "error" || !strings.Contains(ev.AckDetail, "timed out") {
+		t.Fatalf("event = %+v, want the timeout error ack", ev)
+	}
+
+	// The runner's late verdict goes nowhere, and WaitFlushed says so.
+	cmd.Reply <- CommandResult{Status: "partial", Message: "worker: could not terminate"}
+	err = cmd.WaitFlushed(2 * time.Second)
+	if err == nil {
+		t.Fatal("WaitFlushed after a timeout ack = nil: a verdict the client never saw is reported delivered")
+	}
+	if !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("WaitFlushed = %v, want it to name the timeout", err)
+	}
+}
+
+// TestCommand_WaitFlushedWithoutAServer pins the two outcomes that involve no
+// write: a command that did not come from a Server has no client to deliver
+// to, and a server that has not finished within the timeout has not delivered.
+func TestCommand_WaitFlushedWithoutAServer(t *testing.T) {
+	var direct Command
+	if err := direct.WaitFlushed(time.Hour); err != nil {
+		t.Fatalf("WaitFlushed on a command with no server = %v, want nil", err)
+	}
+
+	pending := Command{flushed: &ackDelivery{done: make(chan struct{})}}
+	if err := pending.WaitFlushed(10 * time.Millisecond); err == nil {
+		t.Fatal("WaitFlushed past its timeout = nil, want the verdict reported undelivered")
+	}
+}
+
+// snapshotWriteFailure fails its first write — the snapshot — the way a
+// write that runs into its deadline does, reporting written bytes as sent.
+// Later writes go through.
+type snapshotWriteFailure struct {
+	net.Conn
+	written int
+	failed  atomic.Bool
+}
+
+func (c *snapshotWriteFailure) Write(b []byte) (int, error) {
+	if c.failed.CompareAndSwap(false, true) {
+		return c.written, os.ErrDeadlineExceeded
+	}
+	return c.Conn.Write(b)
+}
+
+// TestServer_DropsAClientWhoseSnapshotWasCutShort pins the snapshot half of
+// #31 when part of the snapshot was written. The write error used to be
+// discarded and the client served on, although everything after the broken
+// line would be read as its tail. The server now reports the failure,
+// unregisters the client and closes the connection without reading from it.
+func TestServer_DropsAClientWhoseSnapshotWasCutShort(t *testing.T) {
+	s := NewServer("unused")
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+
+	var warnings bytes.Buffer
+	restore := swapStderrSink(&warnings)
+	defer restore()
+
+	handled := make(chan struct{})
+	go func() {
+		s.handle(&snapshotWriteFailure{Conn: serverSide, written: 10})
+		close(handled)
+	}()
+	// Without the fix handle reads commands from the pipe, which nobody
+	// writes to, and never returns.
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server kept serving a client whose snapshot was cut short")
+	}
+
+	if msg := warningText(&warnings); !strings.Contains(msg, "failed to write snapshot") || !strings.Contains(msg, "dropping") {
+		t.Fatalf("no diagnostic for the dropped connection; warnings: %q", msg)
+	}
+	s.mu.RLock()
+	registered := len(s.clients)
+	s.mu.RUnlock()
+	if registered != 0 {
+		t.Fatalf("%d clients still registered after the snapshot write failed", registered)
+	}
+	// The connection is closed, so the client sees the end of the stream.
+	_ = clientSide.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := clientSide.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("client read after the dropped connection = %v, want io.EOF", err)
+	}
+}
+
+// TestServer_ServesAClientWhoseSnapshotWasNotWritten pins the other snapshot
+// failure: nothing was written, so the stream is still well framed. That is
+// what a Windows named pipe does to a client that writes its command before
+// reading — the snapshot write waits out its deadline — and that client must
+// still get its acknowledgment. The failure is reported instead of discarded.
+func TestServer_ServesAClientWhoseSnapshotWasNotWritten(t *testing.T) {
+	s := NewServer("unused")
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+
+	var warnings bytes.Buffer
+	restore := swapStderrSink(&warnings)
+	defer restore()
+
+	go func() {
+		cmd := <-s.cmdCh
+		cmd.Reply <- CommandResult{Status: "ok"}
+	}()
+	handled := make(chan struct{})
+	go func() {
+		s.handle(&snapshotWriteFailure{Conn: serverSide})
+		close(handled)
+	}()
+	defer func() {
+		clientSide.Close()
+		<-handled
+	}()
+
+	sc := bufio.NewScanner(clientSide)
+	sc.Buffer(make([]byte, 64<<10), MaxEventBytes)
+	c := &Client{conn: clientSide, scanner: sc}
+	if err := c.SendTimeout(Command{Action: "restart", Process: "x"}, 5*time.Second); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	// The acknowledgment is the first event: no snapshot, and no part of one.
+	ev, err := c.RecvTimeout(5 * time.Second)
+	if err != nil {
+		t.Fatalf("recv: %v", err)
+	}
+	if ev.Type != TypeAck || ev.Ack != "ok" {
+		t.Fatalf("first event = %+v, want the ok acknowledgment", ev)
+	}
+
+	if msg := warningText(&warnings); !strings.Contains(msg, "failed to write snapshot") {
+		t.Fatalf("no diagnostic for the failed snapshot write; warnings: %q", msg)
 	}
 }
 

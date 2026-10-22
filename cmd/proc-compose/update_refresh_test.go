@@ -28,14 +28,18 @@ import (
 // stallingProxy starts a local HTTP proxy that accepts a connection, holds it
 // for stall, and then closes it without answering. A client that uses it as
 // its HTTPS proxy fails its request after about stall, without touching the
-// network.
+// network. Connections still held when the test ends are closed then.
 func stallingProxy(t *testing.T, stall time.Duration) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		ln.Close()
+	})
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -44,7 +48,10 @@ func stallingProxy(t *testing.T, stall time.Duration) string {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				time.Sleep(stall)
+				select {
+				case <-time.After(stall):
+				case <-done:
+				}
 			}(conn)
 		}
 	}()
@@ -69,6 +76,21 @@ func updateRefreshEnv(t *testing.T, stall time.Duration) (env []string, cacheDir
 		"NO_COLOR=1",
 	)
 	return env, filepath.Join(cacheRoot, "proc-compose")
+}
+
+// recordedLookupOutcome fails the test unless the run that started at started
+// recorded the outcome of its release lookup. The attempt is recorded before
+// the lookup starts, so a recorded file alone does not prove the join: the
+// outcome is stamped after the proxy's stall, the scheduled attempt before it.
+func recordedLookupOutcome(t *testing.T, cacheDir string, started time.Time, stall time.Duration) {
+	t.Helper()
+	ok, checkedAt := recordedUpdateCache(t, cacheDir)
+	if !ok {
+		t.Fatal("the command ended without recording the release lookup")
+	}
+	if checkedAt.Before(started.Add(stall / 2)) {
+		t.Fatalf("recorded attempt stamped %s after the run started, want the lookup's outcome (after the %s stall)", checkedAt.Sub(started), stall)
+	}
 }
 
 // recordedUpdateCache reports whether the run recorded a release lookup, and
@@ -97,16 +119,40 @@ func recordedUpdateCache(t *testing.T, cacheDir string) (bool, time.Time) {
 // recorded, so the next invocation can announce it.
 func TestUpdateRefresh_ShortCommandRecordsTheCache(t *testing.T) {
 	bin := buildTestBinaryVersion(t, "v1.0.0")
-	env, cacheDir := updateRefreshEnv(t, 700*time.Millisecond)
+	const stall = 700 * time.Millisecond
+	env, cacheDir := updateRefreshEnv(t, stall)
 	work := t.TempDir()
 	writeCLIFile(t, filepath.Join(work, "proc-compose.yml"), "processes: {app: {cmd: echo hello}}\n")
 
+	started := time.Now()
 	out := runInteractive(t, bin, work, env, true, "list")
 	if strings.Contains(out, "new proc-compose release") {
 		t.Errorf("a failed lookup announced a release:\n%s", out)
 	}
+	recordedLookupOutcome(t, cacheDir, started, stall)
+}
+
+// TestUpdateRefresh_StalledLookupIsWaitedForOnce is the stalled release API:
+// the proxy accepts and never answers within the run, so the join gives up at
+// its budget. That run must still record the attempt, and the next run must
+// not wait again; otherwise every command would pay the budget.
+func TestUpdateRefresh_StalledLookupIsWaitedForOnce(t *testing.T) {
+	bin := buildTestBinaryVersion(t, "v1.0.0")
+	env, cacheDir := updateRefreshEnv(t, time.Minute)
+	work := t.TempDir()
+	writeCLIFile(t, filepath.Join(work, "proc-compose.yml"), "processes: {app: {cmd: echo hello}}\n")
+
+	started := time.Now()
+	runInteractive(t, bin, work, env, true, "list")
+	first := time.Since(started)
 	if ok, _ := recordedUpdateCache(t, cacheDir); !ok {
-		t.Fatal("the command ended without recording the release lookup")
+		t.Fatalf("a run whose lookup stalled (%s) recorded nothing, so the next run waits again", first)
+	}
+
+	started = time.Now()
+	runInteractive(t, bin, work, env, true, "list")
+	if second := time.Since(started); second >= updateRefreshBudget/2 {
+		t.Fatalf("the run after a stalled lookup took %s (the first took %s), want no second wait for the %s budget", second, first, updateRefreshBudget)
 	}
 }
 
@@ -116,19 +162,19 @@ func TestUpdateRefresh_ShortCommandRecordsTheCache(t *testing.T) {
 // that fails after the notice ran must still record the lookup.
 func TestUpdateRefresh_FailedCommandRecordsTheCache(t *testing.T) {
 	bin := buildTestBinaryVersion(t, "v1.0.0")
-	env, cacheDir := updateRefreshEnv(t, 700*time.Millisecond)
+	const stall = 700 * time.Millisecond
+	env, cacheDir := updateRefreshEnv(t, stall)
 	work := t.TempDir()
 	// A config the loader refuses: the command fails after PersistentPreRunE
 	// has already scheduled the lookup.
 	writeCLIFile(t, filepath.Join(work, "proc-compose.yml"), "processes: {app: {cmd: echo hello}\n")
 
+	started := time.Now()
 	out, err := runInteractiveExit(t, bin, work, env, true, "up")
 	if err == nil {
 		t.Fatalf("a broken config did not fail the command:\n%s", out)
 	}
-	if ok, _ := recordedUpdateCache(t, cacheDir); !ok {
-		t.Fatal("the failed command ended without recording the release lookup")
-	}
+	recordedLookupOutcome(t, cacheDir, started, stall)
 }
 
 // TestUpdateRefresh_NonInteractiveRunDoesNotRecordTheCache pins the

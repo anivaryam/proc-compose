@@ -4,12 +4,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -57,16 +61,16 @@ var diagnosticHints = map[string]string{
 	CodeUnknownField:        "remove the key or correct its spelling; run proc-compose config schema for accepted keys",
 	CodeInvalidType:         "change the value to the type the schema declares",
 	CodeNoProcesses:         "define at least one entry under processes (or a merge section)",
-	CodeInvalidMerge:        "use either merge.client/server/api_prefixes or merge.routes; a name-matched process whose declared PORT differs from the merge port is refused",
+	CodeInvalidMerge:        "use either merge.client/server/api_prefixes or merge.routes; merge.client, merge.server, merge.port and a route's port target are 1-65535; merge.client_process must name a service; an upstream whose PORT (env, env_file or ports.http) differs from the merge port is refused",
 	CodeInvalidProcessName:  "use [-A-Za-z0-9._] and start/end with an alphanumeric character",
 	CodeMissingCmd:          "add a cmd: the shell command that runs this process",
 	CodeInvalidRestart:      "use never, on-failure, or always",
 	CodeInvalidMode:         "use service, task, or teardown",
 	CodeTaskIncompatible:    "remove the field, or change the mode: tasks and teardown processes cannot use it",
-	CodeInvalidValue:        "use a non-negative value consistent with the restart policy",
+	CodeInvalidValue:        fmt.Sprintf("use an accepted value: ready_timeout >= -1 (-1 = no limit); max_restarts, shutdown_timeout and health_interval >= 0 (a teardown's shutdown_timeout <= %d); max_restarts and health_action: restart need restart: on-failure or always; health_interval and health_action need health_when; foreign_listener needs an http or tcp probe", MaxTeardownShutdownTimeout),
 	CodeInvalidReadyWhen:    "set exactly one of ready_when.http, ready_when.tcp, ready_when.cmd, or ready_when.log (a valid Go regex); health_when takes http, tcp, or cmd",
 	CodeInvalidPort:         "`.` is not allowed in port names; the other characters follow the process-name rules; preferred ports are 0-65535 (0 = ephemeral)",
-	CodeEnvFile:             "create the env_file or fix its path (relative paths resolve from the config directory)",
+	CodeEnvFile:             "create the env_file or fix its path (relative paths resolve from the config directory); a line may be at most 1 MiB",
 	CodeSelfDependency:      "remove the process from its own depends_on",
 	CodeUnknownDependency:   "name an existing process in depends_on",
 	CodeDependencyCycle:     "remove one depends_on edge to break the cycle",
@@ -382,38 +386,153 @@ func pathAtLine(nodes map[string]*yaml.Node, line int) string {
 // SchemaID is the versioned identifier of the published config schema.
 const SchemaID = "https://github.com/anivaryam/proc-compose/schema/v1/proc-compose.schema.json"
 
+// spaceClass is the body of a regex character class that matches exactly the
+// runes strings.TrimSpace removes (unicode.IsSpace), built from the
+// unicode.White_Space table. The published schema uses it to state the
+// loader's trimming rules. A rune outside ASCII is written literally, because
+// RE2 and ECMA-262 regexes share no escape for it.
+var spaceClass = func() string {
+	var b strings.Builder
+	add := func(lo, hi, stride uint32) {
+		for r := lo; r <= hi; r += stride {
+			if r < utf8.RuneSelf {
+				fmt.Fprintf(&b, `\x%02X`, r)
+			} else {
+				b.WriteRune(rune(r))
+			}
+		}
+	}
+	for _, r := range unicode.White_Space.R16 {
+		add(uint32(r.Lo), uint32(r.Hi), uint32(r.Stride))
+	}
+	for _, r := range unicode.White_Space.R32 {
+		add(r.Lo, r.Hi, r.Stride)
+	}
+	return b.String()
+}()
+
+// resourceLabelPattern states the resource label rule Load applies: trimmed of
+// surrounding whitespace, a label is non-empty, holds no line break or NUL
+// byte, and is at most maxResourceLabel long. The schema counts characters
+// where Load counts bytes, so the two agree on ASCII labels.
+func resourceLabelPattern() string {
+	space, solid := "["+spaceClass+"]", "[^"+spaceClass+`\x00]`
+	return fmt.Sprintf(`^%s*%s(?:[^\r\n\x00]{0,%d}%s)?%s*$`, space, solid, maxResourceLabel-2, solid, space)
+}
+
+// routeTargetPatterns state checkRouteTarget: a route whose target (after its
+// last "=", trimmed) is an integer must name a port in 1-65535.
+func routeTargetPatterns() (integer, port string) {
+	space := "[" + spaceClass + "]*"
+	integer = "=" + space + `[+-]?[0-9]+` + space + "$"
+	port = "=" + space + `\+?0*(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3})` + space + "$"
+	return integer, port
+}
+
 // schemaExtras adds constraints the Go types cannot express, keyed by
 // "Type.yamlkey" (field) or "Type" (object). Field names come from struct
-// tags, so the property set itself has one source of truth.
+// tags, so the property set itself has one source of truth. Every loader rule
+// JSON Schema can state is stated here; the rest are listed in
+// docs/configuration.md and pinned by TestSchema_VerdictMatchesLoad.
 func schemaExtras() map[string]map[string]any {
 	portName := map[string]any{"pattern": portNameRe.String()}
+	mergePort := map[string]any{"minimum": 0, "maximum": 65535} // 0 = unset
+	integerTarget, portTarget := routeTargetPatterns()
+
+	// set is the condition "field is present with a value the loader treats
+	// as set"; nonEmpty is set for a string field.
+	set := func(field string, value map[string]any) map[string]any {
+		return map[string]any{"required": []string{field}, "properties": map[string]any{field: value}}
+	}
+	nonEmpty := func(field string) map[string]any { return set(field, map[string]any{"minLength": 1}) }
+	ifThen := func(cond, then map[string]any) map[string]any { return map[string]any{"if": cond, "then": then} }
+
+	// A task or teardown process runs once: it cannot use the fields below
+	// (validateTeardown and the task checks in Load). A teardown process also
+	// has no ports or dependencies, and its shutdown_timeout is capped.
+	runOnce := map[string]any{
+		"ready_when": false, "ready_timeout": map[string]any{"const": 0}, "restart": map[string]any{"const": "never"},
+		"max_restarts": map[string]any{"const": 0}, "health_when": false, "health_interval": map[string]any{"const": 0},
+		"health_action": false, "foreign_listener": false,
+	}
+	teardown := maps.Clone(runOnce)
+	teardown["ports"] = map[string]any{"maxProperties": 0}
+	teardown["depends_on"] = map[string]any{"maxItems": 0}
+	teardown["shutdown_timeout"] = map[string]any{"maximum": MaxTeardownShutdownTimeout}
+	inMode := func(mode string, properties map[string]any) map[string]any {
+		return ifThen(set("mode", map[string]any{"const": mode}), map[string]any{"properties": properties})
+	}
+	restarting := slices.DeleteFunc(slices.Clone(RestartPolicies), func(policy string) bool { return policy == "never" })
+	needsRestart := set("restart", map[string]any{"enum": restarting})
+	needsHealth := map[string]any{"required": []string{"health_when"}}
+	socketProbe := func(field string) map[string]any {
+		return set(field, map[string]any{"anyOf": []any{nonEmpty("http"), nonEmpty("tcp")}})
+	}
+
+	// A probe sets exactly one kind to a non-empty value (validateProbe).
+	var exactlyOneKind []any
+	for _, kind := range SortedProcessNames(yamlFields(reflect.TypeOf(ReadyWhen{}))) {
+		exactlyOneKind = append(exactlyOneKind, nonEmpty(kind))
+	}
+
 	return map[string]map[string]any{
-		// At least one of a non-empty processes map or a merge section. The
-		// non-empty rule lives inside the branch, because a bare
-		// minProperties on Config.processes would refuse processes: {} next
-		// to a merge section — which Load accepts.
-		"Config": {"anyOf": []any{
-			map[string]any{
-				"required":   []string{"processes"},
-				"properties": map[string]any{"processes": map[string]any{"minProperties": 1}},
+		"Config": {
+			// At least one of a non-empty processes map or a merge section.
+			// The non-empty rule lives inside the branch, because a bare
+			// minProperties on Config.processes would refuse processes: {}
+			// next to a merge section — which Load accepts.
+			"anyOf": []any{
+				map[string]any{
+					"required":   []string{"processes"},
+					"properties": map[string]any{"processes": map[string]any{"minProperties": 1}},
+				},
+				map[string]any{"required": []string{"merge"}},
 			},
-			map[string]any{"required": []string{"merge"}},
+			// The merge section generates the merge-port process, so a
+			// config with a merge section cannot define one.
+			"dependentSchemas": map[string]any{"merge": map[string]any{
+				"properties": map[string]any{"processes": map[string]any{"not": map[string]any{"required": []string{MergePortProcessName}}}},
+			}},
+		},
+		"Config.processes": {"propertyNames": map[string]any{"pattern": processNameRe.String()}},
+		"Config.resources": {"uniqueItems": true, "items": map[string]any{"type": "string", "pattern": resourceLabelPattern()}},
+		"Merge": {"anyOf": []any{
+			// Simple mode: a client and a server port, and no routes.
+			map[string]any{
+				"required":   []string{"client", "server"},
+				"properties": map[string]any{"client": map[string]any{"minimum": 1}, "server": map[string]any{"minimum": 1}, "routes": map[string]any{"maxItems": 0}},
+			},
+			// Route mode: routes, and none of the simple-mode fields.
+			map[string]any{
+				"required":   []string{"routes"},
+				"properties": map[string]any{"routes": map[string]any{"minItems": 1}, "client": map[string]any{"const": 0}, "server": map[string]any{"const": 0}, "api_prefixes": map[string]any{"maxItems": 0}},
+			},
 		}},
-		"Config.processes":         {"propertyNames": map[string]any{"pattern": processNameRe.String()}},
-		"Config.resources":         {"uniqueItems": true, "items": map[string]any{"type": "string", "minLength": 1, "maxLength": 256}},
-		"Process":                  {"required": []string{"cmd"}},
+		"Merge.client": mergePort,
+		"Merge.server": mergePort,
+		"Merge.port":   mergePort,
+		"Merge.routes": {"items": map[string]any{"type": "string", "if": map[string]any{"pattern": integerTarget}, "then": map[string]any{"pattern": portTarget}}},
+		"Process": {"required": []string{"cmd"}, "allOf": []any{
+			inMode(ProcessModeTask, runOnce),
+			inMode(ProcessModeTeardown, teardown),
+			ifThen(set("max_restarts", map[string]any{"minimum": 1}), needsRestart),
+			ifThen(set("health_interval", map[string]any{"not": map[string]any{"const": 0}}), needsHealth),
+			ifThen(nonEmpty("health_action"), needsHealth),
+			ifThen(set("health_action", map[string]any{"const": HealthActionRestart}), needsRestart),
+			ifThen(nonEmpty("foreign_listener"), map[string]any{"anyOf": []any{socketProbe("ready_when"), socketProbe("health_when")}}),
+		}},
 		"Process.cmd":              {"minLength": 1},
 		"Process.mode":             {"enum": ProcessModes, "default": ProcessModeService},
 		"Process.restart":          {"enum": RestartPolicies, "default": "never"},
 		"Process.max_restarts":     {"minimum": 0},
 		"Process.shutdown_timeout": {"minimum": 0},
 		"Process.ready_timeout":    {"minimum": -1},
-		"Process.health_when":      {"not": map[string]any{"required": []string{"log"}}}, // a log line matches once; validateProbe(allowLog=false)
-		"Process.health_interval":  {"minimum": 0, "default": DefaultHealthInterval},     // 0 = default, like shutdown_timeout
+		"Process.health_when":      {"not": nonEmpty("log")},                         // a log line matches once; validateProbe(allowLog=false)
+		"Process.health_interval":  {"minimum": 0, "default": DefaultHealthInterval}, // 0 = default, like shutdown_timeout
 		"Process.health_action":    {"enum": HealthActions, "default": HealthActionReport},
 		"Process.foreign_listener": {"enum": ForeignListenerPolicies, "default": ForeignListenerAllow},
 		"Process.ports":            {"propertyNames": portName, "additionalProperties": map[string]any{"type": "integer", "minimum": 0, "maximum": 65535}},
-		"ReadyWhen":                {"minProperties": 1, "maxProperties": 1},
+		"ReadyWhen":                {"oneOf": exactlyOneKind},
 	}
 }
 
@@ -635,15 +754,23 @@ func referenceResolvable(cfg *Config, ref string, selected map[string]bool) bool
 	case "session.name", "session.id", "session.dir", "config.dir":
 		return true
 	}
-	namespace, rest, _ := strings.Cut(ref, ".")
-	if namespace != "ports" && namespace != "urls" {
+	namespace, process, port, ok := splitReference(ref)
+	if !ok || (namespace != "ports" && namespace != "urls") {
 		return false
 	}
-	dot := strings.LastIndex(rest, ".")
-	if dot < 0 {
-		return false
-	}
-	process, port := rest[:dot], rest[dot+1:]
 	_, declared := cfg.Processes[process].Ports[port]
 	return selected[process] && declared
+}
+
+// splitReference splits a reference name such as "ports.api.http" into its
+// namespace, process and port. A process name may contain dots and a port
+// name may not, so the port is the part after the last dot; ok is false when
+// the name has no port part.
+func splitReference(ref string) (namespace, process, port string, ok bool) {
+	namespace, rest, _ := strings.Cut(ref, ".")
+	dot := strings.LastIndex(rest, ".")
+	if dot < 0 {
+		return namespace, "", "", false
+	}
+	return namespace, rest[:dot], rest[dot+1:], true
 }

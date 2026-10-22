@@ -2,11 +2,14 @@ package registry
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/anivaryam/proc-compose/internal/daemon"
@@ -115,6 +118,69 @@ func TestDiscover_ReadsMetadataRecordAndLiveness(t *testing.T) {
 	}
 	if runtime.GOOS != "darwin" && self.StartedAt == 0 {
 		t.Fatalf("no start time recorded on %s", runtime.GOOS)
+	}
+}
+
+// TestDiscover_NeverDropsASessionWhileItIsRewritten pins #14 through the
+// registry: while a live session rewrites its metadata and its PID file,
+// Discover lists it every time, with its record, and neither rewrite fails.
+// On Windows the registry's reads used to make the rewrite's rename fail with
+// "Access is denied", and the session then vanished or kept stale metadata.
+func TestDiscover_NeverDropsASessionWhileItIsRewritten(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	config := filepath.Join(t.TempDir(), "proc-compose.yml")
+	hash, err := paths.FromConfig(config, "busy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	project := &ipc.Project{Session: "busy", RunID: "run-busy", ConfigPath: config}
+	if err := session.Save(paths.Metadata(hash), project); err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.WritePID(paths.PID(hash), os.Getpid(), paths.Socket(hash)); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	var readers sync.WaitGroup
+	var discoveries, misses atomic.Int64
+	var miss atomic.Value
+	for i := 0; i < 4; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				sessions, err := Discover()
+				switch {
+				case err != nil:
+					miss.Store(err.Error())
+					misses.Add(1)
+				case len(sessions) != 1 || sessions[0].Record == nil || !sessions[0].Live:
+					miss.Store(fmt.Sprintf("%+v", sessions))
+					misses.Add(1)
+				}
+				discoveries.Add(1)
+			}
+		}()
+	}
+	var writeErr error
+	for i := 0; i < 100 && writeErr == nil; i++ {
+		if writeErr = session.Save(paths.Metadata(hash), project); writeErr == nil {
+			writeErr = daemon.WriteGroups(paths.PID(hash), os.Getpid(), []daemon.Group{{Name: "api", PGID: 4242 + i}})
+		}
+	}
+	close(stop)
+	readers.Wait()
+	if writeErr != nil {
+		t.Fatalf("rewriting a session while the registry reads it: %v", writeErr)
+	}
+	if misses.Load() > 0 {
+		t.Fatalf("%d of %d discoveries missed the session, last: %v", misses.Load(), discoveries.Load(), miss.Load())
 	}
 }
 

@@ -430,9 +430,10 @@ processes:
       PORT: "3000"  # overrides PORT from .env file
 ```
 
-A single line of the env file may be up to 1 MiB long. A longer line is an
-error (`env_file_unreadable`) that names the file, not a silently truncated
-value.
+A single line of the env file may be up to 1 MiB long: 1,048,576 bytes, not
+counting its line terminator (`\n` or `\r\n`). A longer line is an error
+(`env_file_unreadable`) that names the file and the line, not a silently
+truncated value.
 
 ## Shared Resources
 
@@ -456,26 +457,56 @@ error (`invalid_resource`), as is an empty label, a label longer than 256
 on the trimmed label, so a label padded with whitespace is accepted when its
 trimmed form is valid.
 
-The published JSON Schema (`proc-compose config schema`) states
-`uniqueItems: true` for `resources`, which is **raw**-scoped: JSON Schema
-cannot express trimming, so the schema rejects `" db "` next to `"db"` while
-the loader accepts it. The loader is the authority for what is accepted at
-runtime.
+The lease identity is taken after the label's references are expanded. A label
+that is then an absolute path is cleaned lexically, like Go's `filepath.Clean`
+(symlinks are not resolved): `${config.dir}/db`, the literal path, and a
+spelling with a doubled or trailing separator — or, on Windows, `/` where the
+path has `\` — are one resource, and `status --json` lists the cleaned path.
+Every other label is compared exactly as written: `db`, `tcp:127.0.0.1:5432`,
+a URL, a relative path such as `./db`, and a path behind a prefix such as
+`next-build:${config.dir}/apps/web`, so spell such a label the same way in
+every config that shares it.
 
-The schema also requires a non-empty `processes` map or a `merge` section, as
-the loader does. A few loader rules are still **not** expressed in the schema,
-so a file can be schema-valid and refused at load time:
+## JSON Schema
 
-- a resource label that is only whitespace (the loader trims it and refuses an
-  empty label; the schema's `minLength: 1` accepts it) — the loader is the
-  authority, so the schema does not add a whitespace rule that would also
-  forbid the padded labels the loader accepts;
-- the mode-conditional rules: a `task` or `teardown` process may not use
-  `ready_when`, `ready_timeout`, a restart policy, `max_restarts`, the
-  `health_*` fields, `foreign_listener`, `ports` or `depends_on`;
-- `health_interval`, `health_action` or `foreign_listener` without the probe
-  they need;
-- `max_restarts` together with `restart: never`.
+`proc-compose config schema` prints the published JSON Schema (draft
+2020-12). It states every loader rule that JSON Schema can express: a
+non-empty `processes` map or a `merge` section, the field types, ranges and
+enums, the `task` and `teardown` restrictions, the fields that need a probe or
+a restarting policy, exactly one non-empty kind per probe, the `merge` modes
+and port ranges, the reserved `merge-port` name next to a `merge` section, and
+the resource label rule. A resource label is checked on its trimmed form, as
+the loader checks it: `" db "` is valid, `" "` is not. `uniqueItems` compares
+the labels as written, so `db` next to `" db "` is valid there too, as it is
+for the loader. The patterns use a character class that matches exactly the
+whitespace the loader trims.
+
+The loader is the authority for what runs. These loader rules cannot be
+expressed in JSON Schema, so a file can be schema-valid and still refused at
+load time:
+
+- a `depends_on` entry that names an unknown process, the process itself or a
+  teardown process, or that closes a cycle;
+- a merge upstream started with a `PORT` other than the merge port (see
+  [Startup ordering and readiness](#startup-ordering-and-readiness));
+- a `merge.client_process` that names a task or teardown process;
+- an unset `merge.port` while the `PORT` environment variable is out of range;
+- a `ready_when.log` that is not a valid Go regular expression;
+- an `env_file` that cannot be read or has a line longer than 1 MiB;
+- a resource label of at most 256 characters but more than 256 bytes (the
+  schema counts characters, the loader bytes);
+- an integer too large for the platform's `int`.
+
+The YAML decoder is more lenient than the schema's types, so these values are
+refused by the schema and accepted by the loader:
+
+- a `null` value, which the loader reads as unset;
+- an empty `mode`, `restart`, `health_action` or `foreign_listener`, which the
+  loader reads as the default;
+- a number or boolean where a string is expected, which the loader reads as
+  its text;
+- a fractional number where an integer is expected, which the loader
+  truncates.
 
 ## merge-port Integration
 
@@ -518,7 +549,7 @@ merge:
 | `port` | `$PORT` → `8080` | Proxy listen port — reads `$PORT` env var if not set, then falls back to `8080`; must be 1-65535 |
 | `api_prefixes` | `[/api]` | Path prefixes routed to server (simple mode) |
 | `routes` | — | Explicit `prefix=target` routes (route mode) |
-| `client_process` | auto | Override the process name treated as the client (for env auto-injection) |
+| `client_process` | auto | Override the process treated as the client (upstream wiring and env auto-injection); must name a service |
 
 `routes` cannot be combined with `client`, `server`, or `api_prefixes`.
 
@@ -526,7 +557,10 @@ merge:
 value outside that range is refused when the config is loaded
 (`invalid_merge`) — including a `PORT` environment variable outside the range,
 which the `port` fallback would otherwise pick up. `port: 0` still means
-"unset", so the `$PORT` value and then `8080` are used.
+"unset", so the `$PORT` value and then `8080` are used. A route whose target
+is a port number (`/api=3001`) must name a port between 1 and 65535 as well,
+and is refused at `merge.routes[<index>]` otherwise; a target written as a URL
+is passed to merge-port as written.
 
 Auto-detection of `api_prefixes` only matches top-level Express/Koa/Fastify/Hono handlers (`app.use`, `server.get`, etc.) and Go chi/gorilla/`net/http` handlers (`Route`, `Mount`, `Handle`, `HandleFunc`). Sub-router files and other frameworks (Django, Rails, Flask, etc.) need explicit `api_prefixes`.
 
@@ -540,18 +574,27 @@ When a `merge:` section is present, proc-compose wires the upstream ports automa
 Only **service** processes can be upstreams. A `task` or `teardown` process is
 never selected as one, so it gets neither the readiness probe nor the
 dependency edge — the merge wiring never writes a field the process's mode
-forbids.
+forbids. The same candidates feed every merge selection: the upstream wiring,
+the `api_prefixes` scan and the client env injection, so a task named `server`
+is not scanned and a task named `web` gets no injected API URL. A
+`merge.client_process` that names a task or teardown process is refused
+(`invalid_merge` at `merge.client_process`).
 
 The upshot: a fresh `proc-compose up` on the simple example below boots `client` and `server`, waits for both to bind their ports, *then* starts `merge-port`. Requests that hit `:8080` after the daemon prints "ready" can never land on an unbound upstream.
 
 Override the auto-detected client process with `merge.client_process` (also used by the env-injection step). Upstream ports that don't match any managed process are left alone — proc-compose won't fabricate dependencies on external services.
 
-A process selected by name (or by `merge.client_process`) must serve the merge
-port it was selected for. If it declares a `PORT` that differs from
-`merge.client` or `merge.server`, the config is refused (`invalid_merge` at
-`merge.client` / `merge.server`) instead of being probed on a port the process
-does not serve. A process that declares no `PORT` at all is still probed at the
-merge port — the documented guess.
+An upstream is matched by the `PORT` it is started with, and a process selected
+by name (or by `merge.client_process`) must be started on the merge port it was
+selected for. That `PORT` is the one the session gives the process: its
+`env.PORT`, else the `PORT` in its `env_file`, else its `ports.http` port; a
+`${ports.<process>.<port>}` reference counts as the referenced port's preferred
+value. If that `PORT` differs from `merge.client` or `merge.server`, the config
+is refused (`invalid_merge` at `merge.client` / `merge.server`) instead of being
+probed on a port the process does not serve. A process whose `PORT` cannot be
+known when the config is loaded — none is declared, `ports.http` is `0`
+(ephemeral), or a reference only the session resolves — is still probed at the
+merge port: the documented guess.
 
 The proxy is injected under the reserved process name `merge-port`. A config
 that defines a process with that name **and** a `merge:` section is refused
@@ -566,14 +609,19 @@ startup (`resource "tcp:127.0.0.1:8080" is owned by another session`) instead
 of failing later, when the proxy cannot bind. The lease is taken only when the
 proxy is part of the selected process set: a filtered start that does not
 select `merge-port` never binds the port, so it does not hold the lease and
-does not refuse another session that would bind it. The lease excludes **other
-proc-compose sessions only** — a third-party program can still take the port
-between the check and the proxy's bind, and `up --silent` checks the port in
-the parent process before the daemon child takes the lease. `verify` runs no
-port check of its own, so the lease is what keeps it from colliding with
-another session; a collision there is reported as `resource_unavailable`. The
-merge port is never reallocated and never reported as a named port: a managed
-process that prefers the same port is moved to the next free port.
+does not refuse another session that would bind it. Unlike a named port, which
+the session keeps bound until its process is launched, the merge port is only
+leased: the lease excludes **other proc-compose sessions only** — a third-party
+program can still take the port between the check and the proxy's bind, and
+`up --silent` checks the port in the parent process before the daemon child
+takes the lease. `verify` runs no port check of its own, so the lease is what
+keeps it from colliding with another session; a collision there is reported as
+`resource_unavailable`. The merge port is never reallocated and never reported
+as a named port: a managed process that prefers the same port is moved to the
+next free port. A reload that changes `merge.port` is refused (`merge port
+changed; restart the session`), as a change to the resources or named ports
+is; a reload that removes the `merge:` section leaves the running proxy and its
+lease alone.
 
 ### Client API URL auto-injection
 
@@ -581,4 +629,4 @@ When a `merge:` section is present, proc-compose looks at the client process's `
 
 `VITE_API_BASE_URL`, `VITE_API_URL`, `VITE_SERVER_URL`, `REACT_APP_API_URL`, `REACT_APP_BASE_URL`, `REACT_APP_API_BASE_URL`, `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_API_BASE_URL`, `NUXT_PUBLIC_API_BASE`, `PUBLIC_API_URL`.
 
-The path suffix from the example value is preserved (e.g. `http://1.2.3.4:3000/api` → `http://localhost:8080/api`). Anything you set explicitly under the process's `env:` block always wins. The client process is detected by matching `merge.client` against each process's `PORT` env var, or by name (`client`, `frontend`, `web`, `ui`, `app`); set `merge.client_process` to override.
+The path suffix from the example value is preserved (e.g. `http://1.2.3.4:3000/api` → `http://localhost:8080/api`). Anything you set explicitly under the process's `env:` block always wins. The client process is the service started on `merge.client` (see [Startup ordering and readiness](#startup-ordering-and-readiness)), else the first service named `client`, `frontend`, `web`, `ui` or `app`; set `merge.client_process` to override. A task or teardown process never gets the injection.

@@ -10,13 +10,14 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/logrotate"
+	"github.com/anivaryam/proc-compose/internal/sharedfile"
 )
 
 type Options struct {
@@ -198,17 +199,22 @@ const snapshotAttempts = 5
 // is far longer than the window it has to cover.
 var snapshotRetryDelay = time.Millisecond
 
+// openJournal opens one file of the journal family for reading. The handle
+// lets the writer rename and delete the file while the query has it pinned.
+func openJournal(path string) (*os.File, error) { return sharedfile.Open(path) }
+
 // Pin a coherent set of file handles before scanning. Opening each rotated
 // pathname only after reading the previous one can replay or skip entire files
 // if rotation occurs during the query. Validate names after opening and retry
 // a bounded number of times; a busy journal returns an explicit retryable error.
 //
-// A rotation renames the live journal aside before it installs the replacement,
-// so a reader that opens the journal in that window finds the live path
-// missing. That absence is a rotation in flight, not a missing journal: the
-// snapshot is taken again instead of reporting that the journal does not
-// exist. The journal is reported as gone only when no file of its family is
-// left.
+// While a rotation is in flight, and after one that failed could not put the
+// live journal back, the live path is absent and the newest events are in the
+// staged file, so the staged file is read in its place. A live path that is
+// absent with nothing staged is a journal whose live file was removed, or a
+// rotation between installing the newest copy and the new live file: the
+// rotated copies are the whole journal then. The journal is reported as
+// missing only when no file of it is left.
 func snapshotFiles(path string) ([]retainedFile, error) {
 	for attempt := 0; attempt < snapshotAttempts; attempt++ {
 		if attempt > 0 {
@@ -217,20 +223,21 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 		var files []retainedFile
 		observed := make(map[string]os.FileInfo)
 		var openErr error
-		liveMissing := false
 		for index := 3; index >= 0; index-- {
 			name := path
 			if index != 0 {
 				name = fmt.Sprintf("%s.%d", path, index)
 			}
 			file, err := openJournal(name)
+			if index == 0 && errors.Is(err, fs.ErrNotExist) {
+				observed[name] = nil
+				name = path + logrotate.StagingSuffix
+				file, err = openJournal(name)
+			}
 			// errors.Is, not os.IsNotExist: on Windows a name that rotation is
 			// deleting at this moment also reports as not existing.
 			if errors.Is(err, fs.ErrNotExist) {
 				observed[name] = nil
-				if index == 0 {
-					liveMissing = true
-				}
 				continue
 			}
 			if err != nil {
@@ -246,11 +253,7 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 			observed[name] = info
 			files = append(files, retainedFile{file: file, info: info})
 		}
-		// The live journal is always there: the writer creates it with the
-		// session and a rotation replaces it within the same operation. A
-		// missing live file therefore means a rotation is in flight, so the
-		// snapshot is not coherent and has to be taken again.
-		stable := openErr == nil && !liveMissing
+		stable := openErr == nil
 		if stable {
 			for name, info := range observed {
 				current, err := os.Stat(name)
@@ -264,6 +267,9 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 			}
 		}
 		if stable {
+			if len(files) == 0 {
+				return nil, os.ErrNotExist
+			}
 			return files, nil
 		}
 		for _, file := range files {
@@ -273,33 +279,7 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 			return nil, openErr
 		}
 	}
-	// The live journal stayed unavailable for the whole budget. It is really
-	// gone only when no file of its family is left; anything else means a
-	// rotation is in flight and the query has to be retried.
-	if !journalFamilyPresent(path) {
-		return nil, os.ErrNotExist
-	}
 	return nil, fmt.Errorf("journal rotated repeatedly while opening history; retry this query with the same cursor")
-}
-
-// journalFamilyPresent reports whether any file of the journal family is still
-// on disk.
-//
-// The live journal is renamed aside while it is rotated, so the rotated copies
-// and the writer's staged file are the evidence that the journal exists and
-// that the query has to be read again rather than reported as missing.
-func journalFamilyPresent(path string) bool {
-	entries, err := os.ReadDir(filepath.Dir(path))
-	if err != nil {
-		return false
-	}
-	prefix := filepath.Base(path) + "."
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 func completeLines(data []byte, atEOF bool) (int, []byte, error) {

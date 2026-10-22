@@ -19,9 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer reported as a `dependency.failed` event; a dependency that really
   failed still fails its dependent.
 - The `restart: always` policy now waits between restarts the way the failure
-  path does: the delay doubles from 1 second up to a maximum of 30 seconds
-  (1, 2, 4, 8, 16, 30, 30) instead of staying at one second. The failure
-  path's ceiling is 30 seconds as documented, not 32.
+  path does: the delay doubles from 1 second up to a maximum of 30 seconds (1,
+  2, 4, 8, 16, 30, 30) instead of staying at one second. The failure path's
+  ceiling is 30 seconds as documented, not 32. On both paths a stop ends the
+  wait at once, so stopping a stack never waits out the delay.
 - The shutdown verdict names the processes that survived it. When the members
   of a process group could be enumerated, their PIDs are listed instead of
   saying that the members could not be enumerated. The explanation of an
@@ -59,7 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   character checks on a label now run on the trimmed label.
 - Two resource labels that expand to the same path no longer make a session
   conflict with itself: the session starts instead of failing with a lease
-  error that names a foreign owner that does not exist.
+  error that names a foreign owner that does not exist. A label that is an
+  absolute path once expanded is cleaned lexically, so `${config.dir}/db`, the
+  literal path, a doubled or trailing separator and, on Windows, `/` for `\`
+  are one resource. Any other label, including a path behind a prefix such as
+  `next-build:`, is compared as written.
 - The merge proxy's port is leased for the session's lifetime. A second
   proc-compose session that declares the same merge port is refused at startup
   (`resource "tcp:127.0.0.1:<port>" is owned by another session`) instead of
@@ -80,20 +85,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such file or directory`. The socket path stays sanitized — the raw home
   path is never printed — and the returned error can be matched with
   `errors.Is`.
-- The daemon reports an inbound command frame that is over the 64 KiB limit
-  instead of dropping it silently. The frame is still dropped and the
-  connection still closed; the diagnostic names the condition, the limit and
-  the peer.
-- The daemon reports a failed acknowledgment write. The barrier that releases
-  the shutdown verdict stays unconditional, so a client that has gone away
-  cannot wedge the daemon.
-- A log rotation that fails no longer truncates the live log. The live file
-  is renamed aside before anything else happens, so a failed rename keeps
-  every byte that was written, and the write reports the failure instead of
-  claiming success. A rotation that cannot install the new file keeps the
-  writer usable: the live path stays absent for the rest of the run, the
-  retained handle keeps appending into the rotated copy `.1`, and every later
-  rotation aborts at the staging rename with `ENOENT`. A run whose journal
+- An inbound command frame over the daemon's 64 KiB limit no longer tears down
+  the connection. The daemon discards that one line and answers it with an
+  `error` acknowledgment that names the limit, so the client can show why;
+  commands sent after it on the same connection are still processed. The
+  daemon also logs the discarded frame on stderr; the warning no longer names
+  a peer, which is empty for a Unix socket.
+- A shutdown verdict that the daemon could not deliver is no longer treated as
+  delivered. When the acknowledgment write fails (the `stop` client went away)
+  or the client was already answered with a timeout, the daemon records the
+  verdict and the reason in the event journal as
+  `shutdown.verdict_undelivered` (error). The barrier that holds the daemon's
+  exit for the verdict is still released as soon as the write attempt
+  completes, so a client that has gone away cannot wedge the daemon.
+- A log rotation that fails no longer truncates the live log or leaves the log
+  without a live file. The live file is renamed aside before anything else
+  happens, so a failed rename keeps every byte that was written, and the write
+  reports the failure instead of claiming success. A failure after that point
+  is rolled back: the live file returns to its path and keeps growing past the
+  limit, and every later write retries the rotation, so a transient failure
+  such as running out of file descriptors heals at the next write. Retrying
+  never drops another rotated copy, and a rotated copy that cannot be moved
+  stops the rotation instead of being overwritten. A rotation interrupted by a
+  crash is put back when the session next starts. A live log removed by
+  another process is recreated at the next rotation, and that write reports
+  that the bytes written to the removed file are lost. A run whose journal
   cannot be rotated ends with an `event journal: …` error and exits non-zero.
 - `doctor` no longer reports a `missing_dir` error for a process `dir:` that
   still holds a runtime template such as `${config.dir}` or `${session.dir}`.
@@ -113,21 +129,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report then omits `log_file`; a log file the child wrote to is kept.
 - A verification attempt's receipt no longer claims a failed verdict while it
   is still running. The receipt written before the attempt starts carries
-  `status: not_run` with `state: active` instead of `status: failed` with
-  exit code 0; the terminal receipt still carries the real verdict.
-- A receipt file that does not satisfy the receipt contract — a known attempt
-  `state` and a known overall `status` — is refused like an unreadable one.
-  `proc-compose attempts` skips it and it is preserved rather than pruned.
-- `why --attempt` on a record that carries no attempt id is scoped to the
-  attempt's run instead of the whole journal. The diagnosis reports
-  `boundary: run_id` and the limitation `attempt_boundary_unavailable`.
-- `compare`'s verdict `outcomes_equal` is `null` when no verdict could be
-  proven: when one side's own repetitions disagree, or when a compared output
-  was truncated at the 4 KiB capture cap. The reason is named in
-  `limitations` (`nondeterministic_within_side`, `output_truncated`). A proven
-  difference is still `false`, `status` stays `comparable` and the exit
-  status stays 0. The human output now states the undetermined verdict
-  instead of omitting it.
+  `status: not_run`, `state: active` and the documented `precedence:
+  no_verdict`, instead of `status: failed` with exit code 0 and an empty
+  `precedence`; the terminal receipt still carries the real verdict. Every
+  `precedence` value is documented in `docs/verify.md`.
+- A receipt file that does not satisfy the receipt contract is refused like an
+  unreadable one. A receipt is named after its `attempt_id` (a ULID), carries
+  an `exit_code`, and records a `state`, `status` and `exit_code` that the
+  writer produces together: `active` with `not_run` and 0 (or `failed` and 0,
+  from earlier releases), or `completed` with `passed`/0, `failed`/1 or
+  `interrupted`/130. `proc-compose attempts` skips such a file, `attempts
+  latest` and `why --attempt latest` take the newest valid receipt instead of
+  failing on it, and the file is preserved rather than pruned. Every receipt
+  verify has written satisfies the contract.
+- `why --attempt` never scans the whole journal for one attempt. A receipt
+  without an attempt id is refused (see the receipt contract).
+  `verify.Diagnose` scopes a record without one to its run (`boundary:
+  run_id`, limitation `attempt_boundary_unavailable`). A record whose run id
+  is null or empty reports `history_missing` with the limitation
+  `journal_unavailable`, instead of an empty run id being read as no filter.
+- `compare`'s verdict `outcomes_equal` is `false` only for a proven
+  difference. It is `null` when nothing was proven but the data cannot rule a
+  difference out: when one side's own repetitions disagree, or when an output
+  was truncated at the 4 KiB capture cap. Truncated output that is equal up to
+  the cap is no longer reported as equal, and it does not hide a difference
+  proven elsewhere: a differing status, check status or exit code is `false`
+  however much output was cut, and so are truncated outputs that differ at a
+  byte both captures hold. When repetitions disagree, a field proves a
+  difference only when it differs in every pairing of a baseline and a
+  candidate repetition. Every limitation that applies is named in
+  `limitations` (`nondeterministic_within_side`, `output_truncated`), also
+  beside `false`. `status` stays `comparable` and the exit status stays 0. The
+  human output now states the undetermined verdict instead of omitting it.
 - `compare`'s `median_check_ms` is the true median of the check durations:
   the middle value for an odd number of samples, and the average of the two
   middle values for an even number, rounded half up.
@@ -162,46 +195,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probe into a process whose mode forbids it and no longer adds a dependency
   edge to a teardown process.
 - A merge port is no longer probed on a port the selected process does not
-  serve. A process selected by name (or by `merge.client_process`) that
-  declares a `PORT` different from `merge.client` / `merge.server` is refused
-  with `invalid_merge` at `merge.client` / `merge.server` instead of being
-  probed on the wrong port. A process that declares no `PORT` is still probed
-  at the merge port.
+  serve. An upstream is matched by the `PORT` it is started with — its
+  `env.PORT`, else the `PORT` in its `env_file`, else its `ports.http` port,
+  with a `${ports.<process>.<port>}` reference resolved to that port's
+  preferred value. A process selected by name (or by `merge.client_process`)
+  whose `PORT` differs from `merge.client` / `merge.server` is refused with
+  `invalid_merge` at `merge.client` / `merge.server` instead of being probed
+  on the wrong port. A process whose `PORT` cannot be known when the config is
+  loaded (none declared, an ephemeral `ports.http: 0`, or a reference only the
+  session resolves) is still probed at the merge port.
 - The merge upstream selection is deterministic. When two processes declare the
   same `PORT`, the lexicographically first one is now always selected, so the
   readiness probe, the dependency edge and the proxy command line are the same
   on every load.
-- An `env_file` line longer than 1 MiB is now an error that names the file
-  (`env_file_unreadable`) instead of a silently truncated environment. A
-  value of up to 1 MiB is parsed in full.
+- An `env_file` line longer than 1 MiB is now an error that names the file and
+  the line (`env_file_unreadable`) instead of a silently truncated
+  environment. A line of up to 1 MiB (1,048,576 bytes, not counting its `\n`
+  or `\r\n` terminator) is parsed in full, whatever the line ending. The
+  `env_file_unreadable` hint now states the line limit.
 - `ready_timeout` below `-1` is refused (`invalid_value`). The published
   schema already declared `-1` as the floor.
-- An `sh -c "..."` command on Windows no longer loses the tail of its inner
-  text. Exactly one matched outer quote pair is removed instead of trimming
-  every quote character, so the inner text reaches `cmd /c` intact. The shim
-  stays best-effort: `cmd` has no single-quote semantics and does not
-  interpret `\"`.
+- An `sh -c "..."` command on Windows now runs the script `sh` would run. The
+  script argument loses exactly the quoting `sh` removes (one matched outer
+  pair, and `\"`, `\\`, `\$` and `` \` `` inside double quotes) instead of
+  every quote character being trimmed, and the quoted strings inside the
+  script are requoted for `cmd`: `sh -c "echo 'x'"` and `sh -c "echo
+  \"hello\""` print `x` and `hello` as on Linux and macOS, and a single-quoted
+  argument with spaces reaches a program as one argument. The shim stays
+  best-effort; docs/platforms.md lists what `cmd` cannot express.
 - A daemon that dies during startup now reports `died during startup` instead
   of `did not become ready within 10s`, and the failure is reported as soon as
   the child exits rather than after the readiness timeout.
 - A log query that opens the journal while it is being rotated no longer
-  reports that the journal does not exist. The rotation replaces the live
-  journal file, so the query waits the rotation out and reads the journal; a
-  journal that is really gone is still reported as missing. If a rotation
-  fails permanently, the live journal path stays absent for the rest of the
-  run and the query reports a retryable error instead of the events.
+  reports that the journal does not exist or asks to be retried: it reads the
+  staged file `<journal>.staging` in place of the live journal. A journal
+  whose live file is missing with nothing staged is read from its rotated
+  copies; a journal with no file left is still reported as missing. The `retry
+  this query` error remains only for a journal that keeps rotating while the
+  query opens it.
 - A dependent that is cancelled while its dependency is between a restart
   request and the dependency's next incarnation now ends in the terminal state
   `exited` instead of being failed with a `dependency.failed` event.
-- The release lookup that the update notice schedules is now joined with the
-  lookup's own HTTP timeout, so a cold round trip to the release API is inside
-  the budget and the result is recorded. The lookup stays silent and
-  best-effort, and a run without a terminal still never schedules one.
+- The release lookup that the update notice schedules is now waited for before
+  the process exits, for at most the lookup's own 3-second timeout, so a short
+  command records the result for the next invocation. The attempt is recorded
+  before the lookup starts, so a release API that stalls or answers too slowly
+  is waited for at most once per 24 hours instead of on every command; when
+  the attempt cannot be recorded, no lookup is made. The lookup stays silent
+  and best-effort, and a run without a terminal still never schedules one.
 - The out-of-range merge-port error now names the field it is about
   (`merge.client`, `merge.server` or `merge.port`) instead of the whole
-  `merge` section. The `invalid_merge` hint also mentions that a name-matched
-  process whose declared `PORT` differs from the merge port is refused, and
-  the `invalid_port` hint says that `.` is not allowed in port names.
+  `merge` section. The `invalid_merge` hint now states the 1-65535 port range,
+  the `merge.client_process` rule and that an upstream whose `PORT` differs
+  from the merge port is refused, and the `invalid_port` hint says that `.` is
+  not allowed in port names.
+- A process that is stopped while it waits to be restarted now ends in the
+  terminal state `exited`, with a `process.stopped` event, instead of staying
+  `restarting`.
+- A `restart` request for a `restart: always` process that is waiting to be
+  restarted now restarts it at once, as on the failure path. The request used
+  to wait for the delay to end and then stop the incarnation that had just
+  started.
+- A launch whose exit cannot be observed no longer orphans the command's
+  descendants or starts copies beside them. On FreeBSD, OpenBSD and NetBSD,
+  which cannot observe an exit without reaping it, the command's whole process
+  group is killed before the launch fails. When the wait on the command itself
+  fails, no group signal is sent, as before; the process is then not restarted
+  while its group may still have members, whatever its `restart` policy, and
+  the shutdown verdict reports it as unverified.
+- On Linux and macOS, process-group setup forces `Pgid` to 0 and honours a
+  caller's `Setsid` instead of combining it with `Setpgid`, so a
+  caller-supplied `SysProcAttr` can neither move the command into another
+  group nor make it fail to start.
+- Windows commands that contain double quotes now run as written. The command
+  line is handed to `cmd /s /c` verbatim instead of through Go's argument
+  escaping, which `cmd` does not understand and which turned every `"` into
+  `\"`. A command that started with a quoted path, such as `"C:\Program
+  Files\app\app.exe" --flag`, failed with "is not recognized", a quoted
+  argument reached the program split and with its quotes, and the PowerShell
+  template from `init --template minimal` printed its own command text instead
+  of running it.
+- A named port is held bound from the moment the session assigns it until
+  right before the first process that declares or references it is launched,
+  instead of being free between assignment and the application's bind. Another
+  program, or the OS ephemeral range for `ports: {http: 0}`, can no longer
+  take it while the stack starts; the remaining window is the launch itself. A
+  port whose process never starts is held until the session ends. On Windows
+  the hold covers `127.0.0.1` only: a program that binds the wildcard address
+  can still take the port.
+- A reload that changes `merge.port` is refused with `merge port changed;
+  restart the session`, like a change to the resources or named ports, instead
+  of restarting the proxy on a port the session does not lease.
+- The daemon no longer discards a failed write of a client's initial snapshot.
+  If part of the snapshot was written, the client is dropped instead of being
+  served a stream whose framing is broken; if nothing was written, the client
+  is still served without a snapshot. Either way the failure is logged on
+  stderr.
+- The `invalid_value` hint no longer tells you to use a non-negative value: it
+  states each field's floor, including `ready_timeout: -1` (no limit), and the
+  restart-policy and probe requirements.
+- Every command that accepts `--json` reports an invalid `--session` as one
+  JSON object on stdout. `verify` and `compare` keep their own result kinds
+  (`usage_error`); every other command prints `{"operation", "status":
+  "error", "message"}`, the form `restart` and `reload` already used, with
+  nothing on stderr. `status`, `logs`, `why`, `sessions`, `config check`,
+  `config plan`, `doctor`, `bootstrap`, `attempts` and `up --silent` used to
+  print only a text error on stderr and leave stdout empty.
+- A verification attempt whose injected clock (`verify.Options.Now`) reads the
+  zero time now runs on the system clock, instead of panicking or failing with
+  `startup_timeout` and `cleanup_unverified`. `Options.Now` documents that
+  phase budgets are enforced against the system clock.
+- On Windows, rewriting the session metadata, the PID file or a verify receipt
+  no longer fails with `Access is denied` while another proc-compose command
+  reads it, so `sessions`, `status` and cross-session attribution no longer
+  miss a session or keep stale metadata during a save. proc-compose's readers
+  allow the replace and the replace uses POSIX rename semantics; a reader
+  outside proc-compose that blocks it is waited out for up to about 130 ms.
 
 ### Changed
 
@@ -218,10 +327,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between 1 and 65535 and are refused with `invalid_merge` otherwise — an
   out-of-range `merge.port` used to surface as the misleading preflight
   message "port(s) already in use". `port: 0` still means unset.
-- The published JSON Schema now requires a non-empty `processes` map or a
-  `merge` section, as the loader does. The schema's `resources` rule stays
-  raw-scoped: the loader is the authority, so the schema does not forbid the
-  whitespace-padded labels the loader accepts.
+- The published JSON Schema now states every loader rule JSON Schema can
+  express: a non-empty `processes` map or a `merge` section, the
+  `task`/`teardown` restrictions, the fields that need a probe or a restarting
+  policy, exactly one non-empty probe kind, the `merge` modes and port ranges
+  (including numeric route targets), the reserved `merge-port` name next to a
+  `merge` section, and the trimmed resource label rule (a whitespace-only
+  label, or one with an inner line break or NUL, is now schema-invalid; a
+  padded label stays valid). The configuration docs list the loader rules it
+  cannot express, and the values the YAML decoder reads more leniently than
+  the schema.
 - `up --survive` refuses a project path that contains a newline, a carriage
   return, a NUL byte, a quote, a backslash or `$`, and its error message now
   names those characters instead of claiming that spaces are refused. A path
@@ -234,18 +349,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order and the output can be compared across runs. The reported pair of a
   duplicate-port finding is now the two lexicographically-first processes; the
   number of findings does not change.
-- The platform documentation now states the leader-side `setsid(2)` restriction
-  on Linux and macOS: a managed command leads its own process group, so a
-  program that calls `setsid(2)` itself fails with `EPERM`. Descendants may
-  call it, and the `setsid(1)` utility is unaffected, so `cmd: setsid server`
-  keeps working. FreeBSD, OpenBSD and NetBSD are recorded as unsupported: they
+- The platform documentation now states the leader-side `setsid(2)`
+  restriction on Linux and macOS: a managed command leads its own process
+  group, so a program that calls `setsid(2)` itself fails with `EPERM`.
+  Descendants may call it. On Linux the util-linux `setsid(1)` utility is
+  unaffected, so `cmd: setsid server` keeps working there; macOS ships no
+  `setsid(1)`. FreeBSD, OpenBSD and NetBSD are recorded as unsupported: they
   build, but every launch fails there.
-- A command that chains with `&&` or `||` now runs under `cmd /c` on Windows,
-  including a command that mixes `&&`/`||` with other operators. The `&&`/`||`
-  test is evaluated before the `|` test, so `||` is no longer routed to
-  PowerShell, which has no chain operators at all. A command with no `&&` or
-  `||` that uses `|` or `>` still routes to PowerShell, and the `$(` routing
-  is unchanged (a balanced `$(...)` stays under `cmd /c`).
+- Every command on Windows now runs under `cmd`, including one that uses `&&`,
+  `||`, `|`, `>`, `>>`, `<` or `2>&1`, and one with an unbalanced `$(`.
+  Nothing is routed to Windows PowerShell 5.1, which has no `&&` or `||`,
+  writes a `>` redirection as UTF-16 with a byte-order mark, and cannot parse
+  an unbalanced `$(` either. `echo hi > out.txt` now writes `hi \r\n` (cmd's
+  `echo` keeps the space before `>`) instead of UTF-16. PowerShell syntax has
+  to name `powershell` in the command.
+- A merge route whose target is a port number must name a port between 1 and
+  65535 and is refused with `invalid_merge` at `merge.routes[<index>]`
+  otherwise (`/api=99999` used to load). A target written as a URL is passed
+  to merge-port as written.
+- `merge.client_process` must name a service: a task or teardown process is
+  refused with `invalid_merge` at `merge.client_process`. The `api_prefixes`
+  scan and the client API URL injection now pick from the same service
+  candidates as the upstream wiring, so a task named like the server is no
+  longer scanned and a task named like the client no longer receives the
+  injected API URL.
+- An invalid `--session` exits with status `2` on every command, with or
+  without `--json`, the usage status `verify` and `compare` already used.
+  Every other command, including `restart --json` and `reload --json`, exited
+  `1`. Other errors keep their exit statuses.
+- On Windows, the event journal and a `--log-file` rotated with
+  `--max-log-size` stay open in a mode that lets other programs rename or
+  delete them, as on Linux and macOS; a removed live file is recreated at the
+  next rotation.
 
 ## [1.11.0] - 2026-10-19
 

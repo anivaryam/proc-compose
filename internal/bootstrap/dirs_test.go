@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strconv"
 	"testing"
 
 	"github.com/anivaryam/proc-compose/internal/config"
@@ -128,7 +130,8 @@ func TestRunVerifyRemovesTemporaryConfigCopy(t *testing.T) {
 	if _, err := os.Stat(verifier.path); !os.IsNotExist(err) {
 		t.Fatalf("temporary config copy was not removed: %v", err)
 	}
-	if verifier.mode != 0600 {
+	// Windows does not expose POSIX file permission bits.
+	if runtime.GOOS != "windows" && verifier.mode != 0600 {
 		t.Fatalf("temporary config copy mode = %o, want 600", verifier.mode)
 	}
 }
@@ -191,7 +194,13 @@ processes:
 // TestAbsProcessDirsKeepsAbsoluteDirs: an absolute dir is already resolved
 // and must not be rewritten.
 func TestAbsProcessDirsKeepsAbsoluteDirs(t *testing.T) {
-	out, err := absProcessDirs([]byte("processes:\n  api:\n    cmd: npm run dev\n    dir: /srv/api\n"), "/base")
+	// /srv/api has no volume name, so it is not absolute on Windows; Abs gives
+	// this platform's absolute form of it (/srv/api itself on Unix).
+	abs, err := filepath.Abs(filepath.FromSlash("/srv/api"))
+	if err != nil {
+		t.Fatalf("absolute dir: %v", err)
+	}
+	out, err := absProcessDirs([]byte("processes:\n  api:\n    cmd: npm run dev\n    dir: "+strconv.Quote(abs)+"\n"), "/base")
 	if err != nil {
 		t.Fatalf("absProcessDirs returned error: %v", err)
 	}
@@ -199,8 +208,8 @@ func TestAbsProcessDirsKeepsAbsoluteDirs(t *testing.T) {
 	if err := yaml.Unmarshal(out, &cfg); err != nil {
 		t.Fatalf("decode rewritten: %v", err)
 	}
-	if got := cfg.Processes["api"].Dir; got != "/srv/api" {
-		t.Fatalf("api dir = %q, want %q", got, "/srv/api")
+	if got := cfg.Processes["api"].Dir; got != abs {
+		t.Fatalf("api dir = %q, want %q", got, abs)
 	}
 }
 

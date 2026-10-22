@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/daemon"
+	"github.com/anivaryam/proc-compose/internal/sharedfile"
 )
 
 // RetainedTerminalReceipts is how many terminal receipts a session keeps.
@@ -191,12 +192,31 @@ func WriteReceipt(path string, result *Result) error {
 	return daemon.WriteFileAtomic(path, append(data, '\n'), 0600)
 }
 
-// ReadReceipt loads one receipt. A receipt that does not satisfy the receipt
-// contract — a known attempt state and a known overall status — is refused
-// like an unreadable file: the attempts listing skips it and Prune preserves
-// it, so a corrupt or hand-made file is never consumed as an attempt.
+// validAttemptID reports whether id has the shape NewAttemptID gives every
+// attempt: 26 Crockford base32 digits.
+func validAttemptID(id string) bool {
+	if len(id) != 26 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if strings.IndexByte(crockford, id[i]) < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// ReadReceipt loads one receipt. A file that does not satisfy the receipt
+// contract is refused like an unreadable one: the attempts listing skips it
+// and Prune preserves it, so a corrupt or hand-made file is never consumed as
+// an attempt. The contract is what every receipt has carried since the first
+// release of verify: an attempt_id with the shape of one, which names the
+// file (<attempt_id>.json); an exit_code; and a state, overall status and
+// exit code the writer records together (recordedVerdict). run_id is not
+// required: it only scopes the journal evidence, and Diagnose reports a
+// record without one as having no journal history.
 func ReadReceipt(path string) (*Result, error) {
-	data, err := os.ReadFile(path)
+	data, err := sharedfile.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -207,17 +227,33 @@ func ReadReceipt(path string) (*Result, error) {
 	if result.SchemaVersion != SchemaVersion || result.Kind != KindReceipt {
 		return nil, fmt.Errorf("receipt %s: unsupported schema %d/%q", path, result.SchemaVersion, result.Kind)
 	}
-	if !knownState(result.State) {
-		return nil, fmt.Errorf("receipt %s: state %q is not a known attempt state", path, result.State)
+	// A missing exit_code decodes as 0, the exit code of a pass.
+	var present struct {
+		ExitCode *int `json:"exit_code"`
 	}
-	if !knownOverallStatus(result.Status) {
-		return nil, fmt.Errorf("receipt %s: status %q is not a known overall status", path, result.Status)
+	if err := json.Unmarshal(data, &present); err != nil {
+		return nil, fmt.Errorf("receipt %s: %w", path, err)
+	}
+	switch {
+	case result.AttemptID == nil:
+		return nil, fmt.Errorf("receipt %s: attempt_id is missing", path)
+	case !validAttemptID(*result.AttemptID):
+		return nil, fmt.Errorf("receipt %s: attempt_id %q is not an attempt id", path, *result.AttemptID)
+	case filepath.Base(path) != *result.AttemptID+".json":
+		return nil, fmt.Errorf("receipt %s: the file is not named after attempt_id %q", path, *result.AttemptID)
+	case present.ExitCode == nil:
+		return nil, fmt.Errorf("receipt %s: exit_code is missing", path)
+	case !recordedVerdict(result.State, result.Status, result.ExitCode):
+		return nil, fmt.Errorf("receipt %s: state %q with status %q and exit_code %d is not an attempt record", path, result.State, result.Status, result.ExitCode)
 	}
 	return &result, nil
 }
 
-// ListReceipts returns receipt paths in a session's attempts directory, newest
-// first. A missing directory is an empty list.
+// ListReceipts returns the paths of a session's receipts, newest first: the
+// files in its attempts directory that ReadReceipt accepts. A receipt is named
+// after its attempt id, a ULID, so name order is creation order, and a file
+// that is not a receipt never sorts in as the newest one. A missing directory
+// is an empty list.
 func ListReceipts(sessionDir string) ([]string, error) {
 	entries, err := os.ReadDir(AttemptsDir(sessionDir))
 	if errors.Is(err, os.ErrNotExist) {
@@ -231,15 +267,19 @@ func ListReceipts(sessionDir string) ([]string, error) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
-		out = append(out, filepath.Join(AttemptsDir(sessionDir), entry.Name()))
+		path := filepath.Join(AttemptsDir(sessionDir), entry.Name())
+		if _, err := ReadReceipt(path); err != nil {
+			continue
+		}
+		out = append(out, path)
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(out)))
 	return out, nil
 }
 
 // Prune removes the oldest terminal receipts beyond the retention count. keep
-// is the receipt just written; it is never removed. Unreadable, active, and
-// indeterminate receipts are preserved.
+// is the receipt just written; it is never removed. Active receipts and files
+// that are not receipts (unreadable or invalid) are preserved.
 func Prune(sessionDir, keep string) error {
 	paths, err := ListReceipts(sessionDir)
 	if err != nil {

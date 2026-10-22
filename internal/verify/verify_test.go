@@ -86,6 +86,22 @@ func helper(mode, arg string) int {
 	case "bigerr":
 		fmt.Fprint(os.Stderr, strings.Repeat("x", 2*MaxOutputBytes))
 		return 0
+	case "bigexit":
+		// More output than the capture holds, the same on every side, and
+		// the exit code the caller names.
+		fmt.Print(strings.Repeat("x", 2*MaxOutputBytes))
+		code, _ := strconv.Atoi(arg)
+		return code
+	case "bigrep":
+		// rep's repetition difference inside the captured prefix, followed
+		// by more output than the capture holds.
+		if os.Getenv("PROC_COMPOSE_COMPARE_REPETITION") == "2" {
+			fmt.Printf("second side=%s\n", os.Getenv("PROC_COMPOSE_COMPARE_SIDE"))
+		} else {
+			fmt.Println("same")
+		}
+		fmt.Print(strings.Repeat("x", 2*MaxOutputBytes))
+		return 0
 	case "env":
 		fmt.Printf("[%s|%s]\n", os.Getenv("FOO"), os.Getenv("PROC_COMPOSE_COMPARE_SIDE"))
 		return 0
@@ -452,8 +468,8 @@ func TestRun_CrossSessionAnswerFailsStartupNamingTheSession(t *testing.T) {
 // earlier versions read, which ignores the new fields.
 func TestReadReceipt_OwnerScopeIsAdditive(t *testing.T) {
 	dir := t.TempDir()
-	older := filepath.Join(dir, "older.json")
-	body := `{"schema_version":1,"kind":"verify.receipt","state":"completed","status":"passed","startup":{"status":"passed","readiness_observations":[` +
+	older := filepath.Join(dir, "01J00000000000000000000001.json")
+	body := `{"schema_version":1,"kind":"verify.receipt","attempt_id":"01J00000000000000000000001","state":"completed","status":"passed","exit_code":0,"startup":{"status":"passed","readiness_observations":[` +
 		`{"process":"api","generation":1,"probe":"http","status":"passed","observed_at":null,"owner":{"result":"foreign","address":"127.0.0.1:3000","pid":42,"command":"node"}}]}}`
 	if err := os.WriteFile(older, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -468,8 +484,8 @@ func TestReadReceipt_OwnerScopeIsAdditive(t *testing.T) {
 
 	labelled := &ipc.EndpointOwner{Result: ipc.OwnerForeign, Address: "127.0.0.1:3000", PID: 42, Command: "node", Scope: ipc.ScopeCrossSession,
 		Session: &ipc.OwnerSession{Name: "dev", RunID: "r1", Worktree: "/work/dev", Process: "web", Port: "http", Evidence: ipc.EvidencePortLease}}
-	newer := filepath.Join(dir, "newer.json")
-	result := &Result{SchemaVersion: SchemaVersion, State: StateCompleted, Status: StatusPassed,
+	newer := filepath.Join(dir, "01J00000000000000000000002.json")
+	result := &Result{SchemaVersion: SchemaVersion, State: StateCompleted, Status: StatusPassed, AttemptID: ptr("01J00000000000000000000002"),
 		Startup: Startup{ReadinessObservations: []ReadinessObservation{{Process: "api", Status: StatusPassed, Owner: labelled}}}}
 	if err := WriteReceipt(newer, result); err != nil {
 		t.Fatal(err)
@@ -507,11 +523,32 @@ func TestReadReceipt_OwnerScopeIsAdditive(t *testing.T) {
 }
 
 // TestReadReceipt_ValidatesTheReceiptContract pins the receipt contract a
-// reader enforces: a receipt carries a known attempt state and a known
-// overall status. A record without them is refused like an unreadable file,
-// so a corrupt or hand-made file is never consumed as an attempt.
+// reader enforces: an attempt_id with the shape of one, which names the file;
+// an exit_code; and a state, overall status and exit code the writer records
+// together. A record without them is refused like an unreadable file, so a
+// corrupt or hand-made file is never consumed as an attempt. run_id is not
+// part of the contract.
 func TestReadReceipt_ValidatesTheReceiptContract(t *testing.T) {
 	dir := t.TempDir()
+	const id, other = "01ARZ3NDEKTSV4RRFFQ69G5FAV", "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+	type omitted struct{}
+	// body is a completed, passed receipt with change applied; an omitted
+	// value removes the field.
+	body := func(change map[string]any) string {
+		fields := map[string]any{"schema_version": SchemaVersion, "kind": KindReceipt, "attempt_id": id, "state": StateCompleted, "status": StatusPassed, "exit_code": ExitPassed}
+		for key, value := range change {
+			if _, ok := value.(omitted); ok {
+				delete(fields, key)
+				continue
+			}
+			fields[key] = value
+		}
+		data, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
 	write := func(name, body string) string {
 		path := filepath.Join(dir, name)
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
@@ -519,15 +556,36 @@ func TestReadReceipt_ValidatesTheReceiptContract(t *testing.T) {
 		}
 		return path
 	}
-	for name, body := range map[string]string{
-		"no state or status": `{"schema_version":1,"kind":"verify.receipt"}`,
-		"unknown state":      `{"schema_version":1,"kind":"verify.receipt","state":"weird","status":"passed"}`,
-		"empty state":        `{"schema_version":1,"kind":"verify.receipt","state":"","status":"passed"}`,
-		"no status":          `{"schema_version":1,"kind":"verify.receipt","state":"completed"}`,
-		"unknown status":     `{"schema_version":1,"kind":"verify.receipt","state":"completed","status":"weird"}`,
-		"phase status":       `{"schema_version":1,"kind":"verify.receipt","state":"completed","status":"not_configured"}`,
+	verdict := func(state, status string, exit int) map[string]any {
+		return map[string]any{"state": state, "status": status, "exit_code": exit}
+	}
+	for name, tc := range map[string]struct {
+		file, body, field string
+	}{
+		"a record of nothing":              {id, `{"schema_version":1,"kind":"verify.receipt"}`, "attempt_id"},
+		"a verdict without an attempt":     {id, `{"schema_version":1,"kind":"verify.receipt","state":"completed","status":"passed"}`, "attempt_id"},
+		"no attempt id":                    {id, body(map[string]any{"attempt_id": omitted{}}), "attempt_id"},
+		"null attempt id":                  {id, body(map[string]any{"attempt_id": nil}), "attempt_id"},
+		"empty attempt id":                 {"", body(map[string]any{"attempt_id": ""}), "attempt_id"},
+		"attempt id of another shape":      {"bad", body(map[string]any{"attempt_id": "bad"}), "attempt_id"},
+		"file named after another attempt": {other, body(nil), "attempt_id"},
+		"no exit code":                     {id, body(map[string]any{"exit_code": omitted{}}), "exit_code"},
+		"null exit code":                   {id, body(map[string]any{"exit_code": nil}), "exit_code"},
+		"no state":                         {id, body(map[string]any{"state": omitted{}}), "state"},
+		"unknown state":                    {id, body(map[string]any{"state": "weird"}), "state"},
+		"abandoned is never recorded":      {id, body(map[string]any{"state": StateAbandoned}), "state"},
+		"indeterminate is never recorded":  {id, body(map[string]any{"state": StateIndeterminate}), "state"},
+		"no status":                        {id, body(map[string]any{"status": omitted{}}), "status"},
+		"phase status":                     {id, body(map[string]any{"status": StatusNotConfig}), "status"},
+		"completed without a verdict":      {id, body(verdict(StateCompleted, StatusNotRun, 0)), "status"},
+		"active with a pass":               {id, body(verdict(StateActive, StatusPassed, 0)), "status"},
+		"active with an interruption":      {id, body(verdict(StateActive, StatusInterrupted, 0)), "status"},
+		"active with an exit":              {id, body(verdict(StateActive, StatusNotRun, ExitFailed)), "exit_code"},
+		"passed with a failing exit":       {id, body(verdict(StateCompleted, StatusPassed, ExitFailed)), "exit_code"},
+		"failed with a passing exit":       {id, body(verdict(StateCompleted, StatusFailed, ExitPassed)), "exit_code"},
+		"interrupted with a failing exit":  {id, body(verdict(StateCompleted, StatusInterrupted, ExitFailed)), "exit_code"},
 	} {
-		path := write(strings.ReplaceAll(name, " ", "-")+".json", body)
+		path := write(tc.file+".json", tc.body)
 		receipt, err := ReadReceipt(path)
 		if err == nil {
 			t.Errorf("%s: accepted %+v", name, receipt)
@@ -536,23 +594,93 @@ func TestReadReceipt_ValidatesTheReceiptContract(t *testing.T) {
 		if !strings.Contains(err.Error(), "receipt "+path) {
 			t.Errorf("%s: error %v does not name the receipt", name, err)
 		}
-		if !strings.Contains(err.Error(), "state") && !strings.Contains(err.Error(), "status") {
-			t.Errorf("%s: error %v does not name the offending field", name, err)
+		if !strings.Contains(err.Error(), tc.field) {
+			t.Errorf("%s: error %v does not name %s", name, err, tc.field)
 		}
 	}
-	// Every documented state and overall status is accepted.
-	for _, state := range []string{StateActive, StateCompleted, StateAbandoned, StateIndeterminate} {
-		for _, status := range []string{StatusPassed, StatusFailed, StatusInterrupted, StatusNotRun} {
-			path := write("ok.json", fmt.Sprintf(`{"schema_version":1,"kind":"verify.receipt","state":%q,"status":%q}`, state, status))
-			receipt, err := ReadReceipt(path)
-			if err != nil {
-				t.Errorf("%s/%s: %v", state, status, err)
-				continue
-			}
-			if receipt.State != state || receipt.Status != status {
-				t.Errorf("%s/%s: read %s/%s", state, status, receipt.State, receipt.Status)
-			}
+	// Every combination the writer records is accepted, including the active
+	// receipt earlier releases wrote with status failed, and with or without
+	// a run id.
+	for name, change := range map[string]map[string]any{
+		"active":                      verdict(StateActive, StatusNotRun, 0),
+		"active from earlier release": verdict(StateActive, StatusFailed, 0),
+		"passed":                      verdict(StateCompleted, StatusPassed, ExitPassed),
+		"failed":                      verdict(StateCompleted, StatusFailed, ExitFailed),
+		"interrupted":                 verdict(StateCompleted, StatusInterrupted, ExitInterrupted),
+		"no run id":                   {"run_id": omitted{}},
+		"null run id":                 {"run_id": nil},
+		"empty run id":                {"run_id": ""},
+	} {
+		path := write(id+".json", body(change))
+		receipt, err := ReadReceipt(path)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
 		}
+		if receipt.AttemptID == nil || *receipt.AttemptID != id {
+			t.Errorf("%s: read attempt id %v", name, receipt.AttemptID)
+		}
+		if state, ok := change["state"]; ok && (receipt.State != state || receipt.Status != change["status"] || receipt.ExitCode != change["exit_code"]) {
+			t.Errorf("%s: read %s/%s/%d", name, receipt.State, receipt.Status, receipt.ExitCode)
+		}
+	}
+}
+
+// writeTestReceipt writes the receipt of attempt 01J…i the way the writer
+// does: active without a verdict, or completed and passed.
+func writeTestReceipt(t *testing.T, sessionDir string, i int, state string) string {
+	t.Helper()
+	id := fmt.Sprintf("01J%023d", i)
+	path := filepath.Join(AttemptsDir(sessionDir), id+".json")
+	r := newResult(Options{ConfigPath: "/x/c.yml"}, time.Now())
+	r.State, r.AttemptID = state, &id
+	if state == StateCompleted {
+		r.Status, r.ExitCode, r.Precedence = StatusPassed, ExitPassed, PrecedencePassed
+	}
+	if err := WriteReceipt(path, r); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestListReceipts_ListsOnlyReceiptsNewestFirst pins what the listing, and
+// so `attempts latest` and `why --attempt latest`, take for a receipt: a
+// file ReadReceipt accepts. A file that is not one is skipped wherever it
+// sorts, including a non-ULID name that sorts before every attempt id and a
+// valid record copied under another name.
+func TestListReceipts_ListsOnlyReceiptsNewestFirst(t *testing.T) {
+	dir := t.TempDir()
+	older := writeTestReceipt(t, dir, 1, StateCompleted)
+	newer := writeTestReceipt(t, dir, 2, StateActive)
+	// A valid record of attempt 3, kept only under other names.
+	moved := writeTestReceipt(t, dir, 3, StateCompleted)
+	copied, err := os.ReadFile(moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(moved); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"bad.json":                         `{"schema_version":1,"kind":"verify.receipt"}`,
+		"zz-copy.json":                     string(copied),
+		"01J99999999999999999999999.json":  `{"schema_version":1,"kind":"verify.receipt","state":"completed","status":"passed"}`,
+		"01J99999999999999999999998.json":  `{`,
+		".01J00000000000000000000004.json": string(copied),
+	} {
+		if err := os.WriteFile(filepath.Join(AttemptsDir(dir), name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths, err := ListReceipts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{newer, older}; strings.Join(paths, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("receipts = %v, want %v", paths, want)
+	}
+	if paths, err := ListReceipts(filepath.Join(dir, "missing")); err != nil || len(paths) != 0 {
+		t.Fatalf("missing directory = %v, %v; want an empty list", paths, err)
 	}
 }
 
@@ -571,14 +699,7 @@ func TestPrune_PreservesInvalidReceiptsAndAppliesTheRetentionCount(t *testing.T)
 	}
 	var last string
 	for i := 0; i <= RetainedTerminalReceipts; i++ {
-		id := fmt.Sprintf("01J%023d", i)
-		path := filepath.Join(AttemptsDir(dir), id+".json")
-		r := newResult(Options{ConfigPath: "/x/c.yml"}, time.Now())
-		r.State = StateCompleted
-		if err := WriteReceipt(path, r); err != nil {
-			t.Fatal(err)
-		}
-		last = path
+		last = writeTestReceipt(t, dir, i, StateCompleted)
 	}
 	if err := Prune(dir, last); err != nil {
 		t.Fatal(err)
@@ -639,8 +760,8 @@ func TestRun_UnprobedServiceIsDistinguishedFromProbeReadiness(t *testing.T) {
 
 // TestRun_ActiveReceiptCarriesNoVerdict pins the receipt written before the
 // attempt has any outcome: it must not claim a failed verdict (with exit
-// code 0) before one exists. The terminal receipt still carries the real
-// verdict.
+// code 0) before one exists, and its precedence is the documented no_verdict.
+// The terminal receipt still carries the real verdict.
 func TestRun_ActiveReceiptCarriesNoVerdict(t *testing.T) {
 	f := newFixture(t, serviceConfig)
 	withHelper(t, "exit")
@@ -661,8 +782,8 @@ func TestRun_ActiveReceiptCarriesNoVerdict(t *testing.T) {
 			t.Errorf("the active receipt does not read back: %v", err)
 			return nil
 		}
-		if read.Status != StatusNotRun || read.State != StateActive {
-			t.Errorf("the active receipt reads back as %s/%s", read.State, read.Status)
+		if read.Status != StatusNotRun || read.State != StateActive || read.Precedence != PrecedenceNoVerdict {
+			t.Errorf("the active receipt reads back as %s/%s precedence %q", read.State, read.Status, read.Precedence)
 		}
 		return nil
 	}
@@ -673,8 +794,8 @@ func TestRun_ActiveReceiptCarriesNoVerdict(t *testing.T) {
 	if first.Kind != KindReceipt || first.State != StateActive || first.Phase != PhaseStarting {
 		t.Fatalf("active receipt = %s/%s/%s, want a receipt in the starting phase", first.Kind, first.State, first.Phase)
 	}
-	if first.Status != StatusNotRun || first.ExitCode != 0 || first.Precedence != "" {
-		t.Fatalf("active receipt verdict = %s exit %d precedence %q, want not_run/0/empty", first.Status, first.ExitCode, first.Precedence)
+	if first.Status != StatusNotRun || first.ExitCode != 0 || first.Precedence != PrecedenceNoVerdict {
+		t.Fatalf("active receipt verdict = %s exit %d precedence %q, want not_run/0/%s", first.Status, first.ExitCode, first.Precedence, PrecedenceNoVerdict)
 	}
 	if result.Status != StatusPassed {
 		t.Fatalf("result = %s errors=%v", result.Status, result.Errors)
@@ -1213,20 +1334,10 @@ func TestClassify_RequiresPositiveOwnerLossAndReleasedLease(t *testing.T) {
 
 func TestPrune_KeepsRecentTerminalAndAllNonterminal(t *testing.T) {
 	dir := t.TempDir()
-	write := func(i int, state string) string {
-		id := fmt.Sprintf("01J%023d", i)
-		path := filepath.Join(AttemptsDir(dir), id+".json")
-		r := newResult(Options{ConfigPath: "/x/c.yml"}, time.Now())
-		r.State = state
-		if err := WriteReceipt(path, r); err != nil {
-			t.Fatal(err)
-		}
-		return path
-	}
-	activeOld := write(0, StateActive)
+	activeOld := writeTestReceipt(t, dir, 0, StateActive)
 	var last string
 	for i := 1; i <= RetainedTerminalReceipts+5; i++ {
-		last = write(i, StateCompleted)
+		last = writeTestReceipt(t, dir, i, StateCompleted)
 	}
 	if err := Prune(dir, last); err != nil {
 		t.Fatal(err)
@@ -1366,6 +1477,25 @@ func TestDiagnose_WithoutAttemptIDScansTheRun(t *testing.T) {
 	if !named {
 		t.Fatalf("limitations = %v, want the inferred boundary named", inferred.Limitations)
 	}
+
+	// An empty run id is no run id: as a filter it selects nothing, so the
+	// diagnosis never scans the journal with it, from either scope, and
+	// reports the history missing instead of the whole journal.
+	for name, attemptID := range map[string]*string{"no attempt id": nil, "unmatched attempt id": ptr("01ARZ3NDEKTSV4RRFFQ69G5FAV")} {
+		empty := *receipt
+		empty.AttemptID, empty.RunID = attemptID, ptr("")
+		d := Diagnose(&empty, StateCompleted, nil)
+		if d.Boundary != "unavailable" || !d.HistoryMissing || d.EventsScanned != 0 || len(d.Processes) != 0 {
+			t.Fatalf("%s and an empty run id: diagnosis = %+v", name, d)
+		}
+		named = false
+		for _, limitation := range d.Limitations {
+			named = named || limitation == "journal_unavailable"
+		}
+		if !named {
+			t.Fatalf("%s and an empty run id: limitations = %v, want journal_unavailable", name, d.Limitations)
+		}
+	}
 }
 
 func TestCompare_ReportsDifferencesWithoutAttribution(t *testing.T) {
@@ -1395,10 +1525,11 @@ func TestCompare_ReportsDifferencesWithoutAttribution(t *testing.T) {
 }
 
 // TestCompare_VerdictIsNullWhenUndeterminable pins the comparison verdict.
-// The sides agree iff every repetition pair agrees; a side that is not
-// internally consistent, or a compared output that was truncated, leaves the
-// verdict undeterminable: outcomes_equal is null and the reason is named.
-// A proven difference still yields false.
+// The sides agree iff every repetition pair agrees; without a proven
+// difference, a side that is not internally consistent, or a compared output
+// that was truncated, leaves the verdict undeterminable: outcomes_equal is
+// null and every reason is named. A proven difference still yields false,
+// truncated output or not, and the truncation is still named.
 func TestCompare_VerdictIsNullWhenUndeterminable(t *testing.T) {
 	base := newFixture(t, serviceConfig)
 	cand := newFixture(t, serviceConfig)
@@ -1452,6 +1583,47 @@ func TestCompare_VerdictIsNullWhenUndeterminable(t *testing.T) {
 		})
 	}
 
+	// Truncated output does not hide a difference proven elsewhere: the
+	// same truncated output with exit codes 0 and 3 is false, and the
+	// truncation is still named.
+	withHelper(t, "bigexit")
+	cut := Compare(context.Background(),
+		base.options(t, "cut-baseline", checkArgv("bigexit", "0")...),
+		cand.options(t, "cut-candidate", checkArgv("bigexit", "3")...), 1)
+	if cut.Status != "comparable" || cut.ExitCode != 0 {
+		t.Fatalf("comparison = %+v", cut)
+	}
+	if cut.OutcomesEqual == nil || *cut.OutcomesEqual {
+		t.Fatalf("outcomes_equal = %v, want false for exit codes that differ beside truncated output", cut.OutcomesEqual)
+	}
+	if !has(cut.Limitations, "output_truncated") {
+		t.Fatalf("limitations = %v, want the truncation named", cut.Limitations)
+	}
+	fields := map[string]bool{}
+	for _, d := range cut.Differences {
+		fields[d.Field] = true
+	}
+	if !fields["status"] || !fields["check.status"] || !fields["check.exit_code"] || fields["check.stdout_sha256"] {
+		t.Fatalf("differences = %+v, want status, check.status and check.exit_code only", cut.Differences)
+	}
+
+	// Both limitations at once: each side's repetitions disagree inside the
+	// captured prefix and every output was truncated. Nothing is proven, so
+	// the verdict is null and both reasons are named.
+	withHelper(t, "bigrep")
+	both := Compare(context.Background(),
+		base.options(t, "both-baseline", checkArgv("bigrep", "")...),
+		cand.options(t, "both-candidate", checkArgv("bigrep", "")...), 2)
+	if both.Status != "comparable" || both.ExitCode != 0 {
+		t.Fatalf("comparison = %+v", both)
+	}
+	if both.OutcomesEqual != nil {
+		t.Fatalf("outcomes_equal = %t, want null", *both.OutcomesEqual)
+	}
+	if !has(both.Limitations, "nondeterministic_within_side") || !has(both.Limitations, "output_truncated") {
+		t.Fatalf("limitations = %v, want both the inconsistent side and the truncation named", both.Limitations)
+	}
+
 	// A proven difference is still false, with the differing field named.
 	withHelper(t, "exit")
 	proven := Compare(context.Background(),
@@ -1482,6 +1654,80 @@ func TestCompare_VerdictIsNullWhenUndeterminable(t *testing.T) {
 		if limitation != want[i] {
 			t.Fatalf("limitations = %v, want %v", single.Limitations, want)
 		}
+	}
+}
+
+// TestCompareJudge_ProvesDifferencesFromRecordedData pins what counts as a
+// proven difference. Status, check status and exit code are recorded in
+// full. A complete output proves a difference whenever it differs; once an
+// output was truncated, only where the captured prefixes disagree at a byte
+// both hold. When a side's repetitions disagree, a field must differ in every
+// pairing of a baseline with a candidate repetition. Every limitation that
+// applies is listed, and it withholds the verdict only when nothing is
+// proven.
+func TestCompareJudge_ProvesDifferencesFromRecordedData(t *testing.T) {
+	type run struct {
+		exit      int
+		stdout    string
+		truncated bool
+	}
+	result := func(r run) *Result {
+		status := StatusPassed
+		if r.exit != 0 {
+			status = StatusFailed
+		}
+		exit := r.exit
+		return &Result{Status: status, Check: Check{Status: status, ExitCode: &exit, Stdout: r.stdout, OutputTruncated: r.truncated}}
+	}
+	show := func(verdict *bool) string {
+		if verdict == nil {
+			return "null"
+		}
+		return strconv.FormatBool(*verdict)
+	}
+	prefix := strings.Repeat("x", MaxOutputBytes-8)
+	for _, tc := range []struct {
+		name                    string
+		baseline, candidate     []run
+		want                    *bool
+		inconsistent, truncated bool
+	}{
+		{"equal complete output", []run{{0, "ok\n", false}}, []run{{0, "ok\n", false}}, ptr(true), false, false},
+		{"differing complete output", []run{{0, "ok\n", false}}, []run{{0, "no\n", false}}, ptr(false), false, false},
+		{"equal truncated captures", []run{{0, prefix + "aaaaaaa", true}}, []run{{0, prefix + "aaaaaaa", true}}, nil, false, true},
+		{"truncated captures that disagree", []run{{0, prefix + "aaaaaaa", true}}, []run{{0, prefix + "aaaabbb", true}}, ptr(false), false, true},
+		{"a complete output that prefixes a truncated one", []run{{0, "ok\n", false}}, []run{{0, "ok\n" + prefix, true}}, nil, false, true},
+		{"a capture the size limit emptied", []run{{0, "", true}}, []run{{0, prefix, true}}, nil, false, true},
+		{"exit codes that differ beside truncated output", []run{{0, prefix, true}}, []run{{3, prefix, true}}, ptr(false), false, true},
+		{"a side that disagrees with itself", []run{{0, "a\n", false}, {0, "b\n", false}}, []run{{0, "a\n", false}, {0, "a\n", false}}, nil, true, false},
+		{"pairs that differ, but not every pairing", []run{{0, "a\n", false}, {0, "b\n", false}}, []run{{0, "b\n", false}, {0, "a\n", false}}, nil, true, false},
+		{"every pairing differs beside a side that disagrees", []run{{0, "ok\n", false}, {0, "ok\n", false}}, []run{{3, "ok\n", false}, {4, "ok\n", false}}, ptr(false), true, false},
+		{"both limitations without a proof", []run{{0, "a\n" + prefix, true}, {0, "b\n" + prefix, true}}, []run{{0, "a\n" + prefix, true}, {0, "c\n" + prefix, true}}, nil, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			results := map[string][]*Result{}
+			for side, runs := range map[string][]run{"baseline": tc.baseline, "candidate": tc.candidate} {
+				for _, r := range runs {
+					results[side] = append(results[side], result(r))
+				}
+			}
+			c := &Comparison{Differences: []Difference{}, Limitations: []string{}}
+			c.Sides = summaries(map[string]Options{"baseline": {}, "candidate": {}}, results)
+			c.judge(results["baseline"], results["candidate"])
+			if show(c.OutcomesEqual) != show(tc.want) {
+				t.Fatalf("outcomes_equal = %s, want %s (differences %+v)", show(c.OutcomesEqual), show(tc.want), c.Differences)
+			}
+			want := []string{}
+			if tc.inconsistent {
+				want = append(want, "nondeterministic_within_side")
+			}
+			if tc.truncated {
+				want = append(want, "output_truncated")
+			}
+			if strings.Join(c.Limitations, ",") != strings.Join(want, ",") {
+				t.Fatalf("limitations = %v, want %v", c.Limitations, want)
+			}
+		})
 	}
 }
 
@@ -1550,18 +1796,49 @@ func TestCompare_MergesCallerExtraEnv(t *testing.T) {
 // TestUsage_ZeroClockIsTolerated pins that an injected zero clock is
 // tolerated: the attempt records an empty started_at instead of panicking.
 func TestUsage_ZeroClockIsTolerated(t *testing.T) {
+	before := time.Now()
 	result := Usage(Options{Now: func() time.Time { return time.Time{} }}, CodeUsage)
-	if result.StartedAt != "" {
-		t.Fatalf("started_at = %q, want an empty string", result.StartedAt)
-	}
-	if result.FinishedAt != nil {
-		t.Fatalf("finished_at = %q, want null", *result.FinishedAt)
+	for name, value := range map[string]*string{"started_at": &result.StartedAt, "finished_at": result.FinishedAt} {
+		if value == nil {
+			t.Fatalf("%s = null, want the system time", name)
+		}
+		at, err := time.Parse(time.RFC3339Nano, *value)
+		if err != nil || at.Before(before) || at.After(time.Now()) {
+			t.Fatalf("%s = %q, want the system time", name, *value)
+		}
 	}
 	if result.Status != StatusFailed || result.ExitCode != ExitUsage {
 		t.Fatalf("usage result = %s/%d", result.Status, result.ExitCode)
 	}
 	if got := newResult(Options{}, time.Time{}); got.StartedAt != "" {
 		t.Fatalf("started_at = %q, want an empty string", got.StartedAt)
+	}
+}
+
+// TestRun_ZeroClockUsesTheSystemClock pins that a whole attempt tolerates a
+// zero clock: its phase budgets start at the system time instead of in year
+// 1, so it passes instead of failing with startup_timeout and
+// cleanup_unverified, and its attempt id orders by the system time.
+func TestRun_ZeroClockUsesTheSystemClock(t *testing.T) {
+	f := newFixture(t, serviceConfig)
+	withHelper(t, "exit")
+	opts := f.options(t, "zero-clock", checkArgv("exit", "0")...)
+	opts.Now = func() time.Time { return time.Time{} }
+	before := time.Now()
+	result := Run(context.Background(), opts)
+	if result.Status != StatusPassed || len(result.Errors) != 0 {
+		t.Fatalf("result = %s errors=%v", result.Status, result.Errors)
+	}
+	started, err := time.Parse(time.RFC3339Nano, result.StartedAt)
+	if err != nil || started.Before(before) {
+		t.Fatalf("started_at = %q, want the system time", result.StartedAt)
+	}
+	earliest, err := NewAttemptID(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id := *result.AttemptID; !validAttemptID(id) || id[:10] < earliest[:10] {
+		t.Fatalf("attempt id %s does not order after %s", id, earliest)
 	}
 }
 

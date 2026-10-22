@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/anivaryam/proc-compose/internal/sharedfile"
 )
 
 // Record is the PID file's content: the daemon's own identity and, on Unix,
@@ -159,6 +161,11 @@ func writeRecord(pidPath string, rec Record) error {
 // directory that is synced and then renamed over path, so a reader never
 // observes a partial file. The directory must already exist.
 //
+// The rename goes through sharedfile.Replace: on Windows a rename over a file
+// that a reader has open fails unless the reader allows delete sharing and the
+// rename uses POSIX semantics, so readers of these files read through
+// sharedfile as well.
+//
 // After the rename the parent directory is flushed as well, so the directory
 // entry the rename created survives a machine-level failure and not only the
 // file's contents. That step is best-effort hardening: this helper promises
@@ -185,7 +192,7 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
+	if err := sharedfile.Replace(tmp.Name(), path); err != nil {
 		return err
 	}
 	// Flush the directory entry the rename created. The error is discarded on
@@ -197,9 +204,10 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 }
 
 // ReadRecord reads the whole PID file. A file that does not parse is an error;
-// it is never treated as a legacy file without groups.
+// it is never treated as a legacy file without groups. It reads through
+// sharedfile, so a concurrent WriteFileAtomic still succeeds on Windows.
 func ReadRecord(pidPath string) (Record, error) {
-	data, err := os.ReadFile(pidPath)
+	data, err := sharedfile.ReadFile(pidPath)
 	if err != nil {
 		return Record{}, err
 	}

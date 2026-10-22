@@ -176,53 +176,109 @@ func Compare(ctx context.Context, baseline, candidate Options, repeat int) *Comp
 		c.Status, c.ExitCode = "not_comparable", ExitFailed
 	default:
 		c.Status, c.ExitCode = "comparable", ExitPassed
-		// The sides agree iff every repetition pair agrees: repetition i of
-		// the baseline against repetition i of the candidate. The differing
-		// fields are aggregated by name, first occurrence wins.
-		baseline, candidate := c.Sides["baseline"].Attempts, c.Sides["candidate"].Attempts
-		pairs := len(baseline)
-		if len(candidate) < pairs {
-			pairs = len(candidate)
-		}
-		seen := map[string]bool{}
-		add := func(field string, x, y any, same bool) {
-			if same || seen[field] {
-				return
-			}
-			seen[field] = true
-			c.Differences = append(c.Differences, Difference{Field: field, Baseline: x, Candidate: y})
-		}
-		for i := 0; i < pairs; i++ {
-			b, k := baseline[i], candidate[i]
-			add("status", b.Status, k.Status, b.Status == k.Status)
-			add("check.status", b.CheckStatus, k.CheckStatus, b.CheckStatus == k.CheckStatus)
-			bk, kk := b.key(), k.key()
-			add("check.exit_code", b.CheckExitCode, k.CheckExitCode, outcomeKey{CheckExit: bk.CheckExit}.equal(outcomeKey{CheckExit: kk.CheckExit}))
-			add("check.stdout_sha256", b.StdoutSHA256, k.StdoutSHA256, b.StdoutSHA256 == k.StdoutSHA256)
-			add("check.stderr_sha256", b.StderrSHA256, k.StderrSHA256, b.StderrSHA256 == k.StderrSHA256)
-		}
-		// The verdict is only proven on data the tool has in full: an
-		// internally inconsistent side and a truncated capture both leave it
-		// undeterminable, and undeterminable is null, never false.
-		truncated := false
-		for _, side := range []string{"baseline", "candidate"} {
-			for _, a := range c.Sides[side].Attempts {
-				truncated = truncated || a.OutputTruncated
-			}
-		}
-		switch {
-		case !c.Sides["baseline"].Consistent || !c.Sides["candidate"].Consistent:
-			c.Limitations = append(c.Limitations, "nondeterministic_within_side")
-			c.OutcomesEqual = nil
-		case truncated:
-			c.Limitations = append(c.Limitations, "output_truncated")
-			c.OutcomesEqual = nil
-		default:
-			equal := len(c.Differences) == 0
-			c.OutcomesEqual = &equal
-		}
+		c.judge(results["baseline"], results["candidate"])
 	}
 	return c
+}
+
+// judge records the differences and the verdict of a comparable comparison;
+// c.Sides summarizes the same results. The sides agree iff every repetition
+// pair agrees: repetition i of the baseline against repetition i of the
+// candidate. The differing fields are observations, aggregated by name, first
+// occurrence wins.
+//
+// A proven difference is false. A side whose own repetitions disagree, and an
+// output captured only in part, are limitations: each is listed whenever it
+// applies, and without a proven difference either one leaves the verdict
+// undeterminable, which is null, never false.
+func (c *Comparison) judge(baseline, candidate []*Result) {
+	attempts := map[string][]AttemptOutcome{"baseline": c.Sides["baseline"].Attempts, "candidate": c.Sides["candidate"].Attempts}
+	pairs := min(len(attempts["baseline"]), len(attempts["candidate"]))
+	seen := map[string]bool{}
+	add := func(field string, x, y any, same bool) {
+		if same || seen[field] {
+			return
+		}
+		seen[field] = true
+		c.Differences = append(c.Differences, Difference{Field: field, Baseline: x, Candidate: y})
+	}
+	for i := 0; i < pairs; i++ {
+		b, k := attempts["baseline"][i], attempts["candidate"][i]
+		add("status", b.Status, k.Status, b.Status == k.Status)
+		add("check.status", b.CheckStatus, k.CheckStatus, b.CheckStatus == k.CheckStatus)
+		bk, kk := b.key(), k.key()
+		add("check.exit_code", b.CheckExitCode, k.CheckExitCode, outcomeKey{CheckExit: bk.CheckExit}.equal(outcomeKey{CheckExit: kk.CheckExit}))
+		add("check.stdout_sha256", b.StdoutSHA256, k.StdoutSHA256, b.StdoutSHA256 == k.StdoutSHA256)
+		add("check.stderr_sha256", b.StderrSHA256, k.StderrSHA256, b.StderrSHA256 == k.StderrSHA256)
+	}
+	inconsistent := !c.Sides["baseline"].Consistent || !c.Sides["candidate"].Consistent
+	truncated := false
+	for _, side := range attempts {
+		for _, a := range side {
+			truncated = truncated || a.OutputTruncated
+		}
+	}
+	if inconsistent {
+		c.Limitations = append(c.Limitations, "nondeterministic_within_side")
+	}
+	if truncated {
+		c.Limitations = append(c.Limitations, "output_truncated")
+	}
+	switch {
+	case provenDifference(baseline, candidate):
+		c.OutcomesEqual = ptr(false)
+	case inconsistent || truncated:
+		c.OutcomesEqual = nil
+	default:
+		c.OutcomesEqual = ptr(len(c.Differences) == 0)
+	}
+}
+
+// provenDifference reports whether a compared field differs provably. When a
+// side's own repetitions disagree, which repetitions ran together is
+// incidental, so a field counts only when every baseline repetition differs
+// from every candidate repetition in it; with consistent sides that is the
+// difference of the pairs. Status, check status and exit code are recorded in
+// full; output streams are judged by captureDiffers.
+func provenDifference(baseline, candidate []*Result) bool {
+	truncated := func(b, k *Result) bool { return b.Check.OutputTruncated || k.Check.OutputTruncated }
+	fields := []func(b, k *Result) bool{
+		func(b, k *Result) bool { return b.Status != k.Status },
+		func(b, k *Result) bool { return b.Check.Status != k.Check.Status },
+		func(b, k *Result) bool {
+			return !outcomeKey{CheckExit: b.Check.ExitCode}.equal(outcomeKey{CheckExit: k.Check.ExitCode})
+		},
+		func(b, k *Result) bool { return captureDiffers(b.Check.Stdout, k.Check.Stdout, truncated(b, k)) },
+		func(b, k *Result) bool { return captureDiffers(b.Check.Stderr, k.Check.Stderr, truncated(b, k)) },
+	}
+	for _, differs := range fields {
+		proven := len(baseline) > 0 && len(candidate) > 0
+		for _, b := range baseline {
+			for _, k := range candidate {
+				proven = proven && differs(b, k)
+			}
+		}
+		if proven {
+			return true
+		}
+	}
+	return false
+}
+
+// captureDiffers reports whether two captures of one output stream prove the
+// outputs differ. A complete capture holds the whole stream (as the runner
+// records it, line by line), so complete captures that differ prove it. A
+// truncated capture holds only a prefix of it, and output_truncated covers
+// both streams of an attempt, so once either attempt was truncated the
+// captures prove a difference only where they disagree at a byte both hold.
+// A capture that is a prefix of the other proves nothing about what followed
+// the cap, and neither does one the result size limit emptied.
+func captureDiffers(x, y string, truncated bool) bool {
+	if !truncated {
+		return x != y
+	}
+	n := min(len(x), len(y))
+	return x[:n] != y[:n]
 }
 
 func summaries(sides map[string]Options, results map[string][]*Result) map[string]SideSummary {

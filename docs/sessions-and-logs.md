@@ -64,12 +64,23 @@ Sessions in the same runtime directory hold these advisory leases for their
 entire lifetime. A conflicting session fails before configured commands start.
 A label is trimmed when the config is loaded, so `db` and `" db "` name the
 same resource: the first occurrence wins and the session holds one lease. An
-exactly repeated label is still a configuration error.
+exactly repeated label is still a configuration error. A label that is an
+absolute path once its references are expanded is cleaned lexically (symlinks
+are not resolved), so `${config.dir}/db`, the literal path, and a spelling with
+a doubled or trailing separator (or, on Windows, `/` for `\`) are one resource.
+Every other label, including a path behind a prefix such as
+`next-build:${config.dir}/apps/web`, is compared exactly as written.
 Separate ports alone do not isolate databases or build directories: use separate
 worktrees and application-specific provisioning tasks, and declare shared
 resources that must serialize. Named-port leases coordinate proc-compose
-sessions; an unrelated program can still race the application's bind, which
-must succeed and pass its configured readiness check. On Linux and Windows,
+sessions. The session also keeps each assigned port bound on `127.0.0.1` from
+assignment until right before the first process that declares it or references
+it (`${ports.*}` or `${urls.*}` in its `cmd`, `env`, `dir` or probes) is
+launched, or until the session ends if no such process starts, so another
+program cannot take it while the stack starts. An unrelated program can still
+race the application's bind between that release and the bind itself, and on
+Windows the hold does not stop a program that binds the wildcard address; the
+bind must succeed and pass its configured readiness check. On Linux and Windows,
 `status --json` shows who answered that check as `readiness_owner`: `foreign`
 with the holder's PID means another program serves the port, and its `scope`
 says whether that program belongs to another live session. Set
@@ -87,8 +98,25 @@ the binary and linked from `--help`.
 Every managed output, lifecycle transition, readiness failure, and cleanup
 verdict enters one ordered event model. A separate rotating JSON-lines journal
 retains events even when human output is text or uses a custom `--log-file`.
-A journal that cannot be rotated keeps the events it already recorded and
-makes the run's result carry an `event journal: …` error.
+The journal is rotated at 10 MiB and keeps three rotated copies
+(`<journal>.1` to `<journal>.3`, newest first).
+
+A journal that cannot be rotated keeps every event it recorded and makes the
+run's result carry an `event journal: …` error. The failed rotation is rolled
+back: the live journal stays in place and grows past the limit, and every
+later event retries the rotation, so a transient failure such as running out
+of file descriptors heals at the next event. Retrying never drops another
+rotated copy. While a rotation is in flight, and in the rare case where a
+failed rotation could not even be rolled back, the newest events are in
+`<journal>.staging` and queries read that file in place of the live journal.
+The next rotation, or the session's next start after a crash, puts the
+staged file back. If another process removes the live journal, the next
+rotation recreates it; the events written to the removed file are lost, and
+the run's result reports that. Queries keep reading the rotated copies in the
+meantime.
+
+On Windows, as on Linux and macOS, the journal can be rotated, and the session
+metadata and PID file replaced, while other proc-compose commands read them.
 
 ```sh
 proc-compose --session feature logs worker --json --level error --max-bytes 4096
@@ -119,7 +147,10 @@ with the usual `process.failed` and `process.restarting` events. Teardown
 processes (`mode: teardown`) produce `teardown.started` (info),
 `teardown.completed` (info), `teardown.failed` (error, with the reason), and
 `teardown.skipped` (error, from `proc-compose`, when termination was not
-verified and no teardown ran). Explicit application JSON `level` or `severity` strings are
+verified and no teardown ran). `shutdown.verdict_undelivered` (error, from
+`proc-compose`) records a shutdown verdict that could not be delivered to the
+`stop` that asked for it — the client went away, or it had already been
+answered with a timeout — and carries that verdict with the reason. Explicit application JSON `level` or `severity` strings are
 normalized; ordinary stderr preserves its stream without assuming it is an error.
 
 JSON query pages contain `events`, `next_cursor`, `has_more`, `gap`,
@@ -153,7 +184,9 @@ distinguishes live state from retained post-stop evidence. It reports observed
 failures rather than inferring business-level causes from arbitrary log text.
 
 Reload preserves existing endpoint leases and rejects mode/dependency changes
-that require restarting the stack. `restart --wait-ready` waits for the new
+that require restarting the stack. A reload that would change a lease — the
+resource set, a process's named ports, or the `merge.port` the session leased —
+is refused with `…; restart the session`. `restart --wait-ready` waits for the new
 generation rather than accepting an earlier incarnation's readiness. The
 optional supervisor HTTP server also exposes `/ready` alongside `/health`.
 

@@ -38,12 +38,24 @@ type unixProcessGroup struct {
 
 func newProcessGroup() ProcessGroup { return &unixProcessGroup{} }
 
+// Setup keeps any attributes the caller set and forces only the ones the group
+// model depends on: the command must lead a new process group whose ID is its
+// own PID, because Track records the PID as the group ID and every signal is
+// sent to it.
+//
+//   - Pgid is forced to 0. Any other value joins an existing group, whose ID is
+//     not the command's PID: signals would go to a group the command is not in
+//     and be answered with ESRCH, which reads as "nothing left to signal".
+//   - Setsid is kept. setsid(2) already makes the command the leader of a new
+//     group whose ID is its own PID, and setpgid(2) on a session leader fails
+//     with EPERM, so the group flag is set only without it. A caller's Setctty
+//     needs Setsid, so it keeps working.
 func (pg *unixProcessGroup) Setup(cmd *exec.Cmd) {
-	// Keep any attributes the caller set; only the process-group flag is added.
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.SysProcAttr.Setpgid = true
+	cmd.SysProcAttr.Pgid = 0
+	cmd.SysProcAttr.Setpgid = !cmd.SysProcAttr.Setsid
 	cmd.Cancel = func() error { return pg.Terminate() }
 	if cmd.WaitDelay == 0 {
 		cmd.WaitDelay = defaultShutdownGrace

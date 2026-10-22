@@ -5,14 +5,18 @@
 // latest published release?" — and prints the supported upgrade command. It
 // never downloads, installs, or replaces anything.
 //
-// The check never blocks the command that triggered it. A cached result is
-// reused for CacheTTL; when that cache is missing or stale the lookup runs in
-// the background so the notice surfaces on the next invocation. A caller that
-// wants the result recorded before its own process exits can wait for it with
-// WaitRefresh, which is bounded and returns at once when nothing was
-// scheduled. Every failure mode — no network, rate limiting, an unparseable
-// tag, an unwritable cache — is silent, because an update hint is never worth
-// changing what a command prints or the status it exits with.
+// The notice never waits on the network. A cached result is reused for
+// CacheTTL; when that cache is missing or stale the attempt is recorded and
+// the lookup runs in the background, so the notice surfaces on the next
+// invocation. A caller that wants the lookup's outcome recorded before its own
+// process exits can wait for it with WaitRefresh, which is bounded and returns
+// at once when nothing was scheduled. Because the attempt is recorded before
+// the lookup starts, a lookup that is still unanswered when that wait gives up
+// keeps the CacheTTL backoff: such a caller pays the wait at most once per
+// CacheTTL, not on every invocation. Every failure mode — no network, rate
+// limiting, an unparseable tag, an unwritable cache — is silent, because an
+// update hint is never worth changing what a command prints or the status it
+// exits with.
 package update
 
 import (
@@ -58,8 +62,9 @@ const (
 	// document is a few KB; anything past this is not ours.
 	maxBodyBytes = 1 << 20
 
-	// HTTPTimeout bounds the background lookup. It is short because nothing
-	// waits on it: a slow or unreachable API just means no refresh.
+	// HTTPTimeout bounds the background lookup. A slow or unreachable API just
+	// means no refresh: the attempt was recorded before the lookup started, so
+	// it is not repeated, or waited for, until CacheTTL has passed.
 	//
 	// It is exported so a caller that joins the background lookup can budget
 	// the same timeout the lookup itself uses.
@@ -243,13 +248,20 @@ func (c *Checker) Refresh() error {
 	return c.refresh(ctx)
 }
 
-// refreshAsync schedules one background lookup for this Checker. The goroutine
-// may be cut short when the process exits before the HTTP timeout elapses; that
-// is harmless, because a missing entry only means the next invocation tries
-// again. A caller that wants the result recorded before its own process exits
-// waits for it with WaitRefresh.
+// refreshAsync schedules one background lookup for this Checker.
+//
+// The attempt is recorded before the lookup starts, as a failed attempt that
+// the lookup's own outcome then replaces. The goroutine may be cut short when
+// the process exits first, or when a caller stops waiting for it with
+// WaitRefresh; the recorded attempt still holds the CacheTTL backoff, so the
+// next invocation neither repeats the lookup nor waits for it. An attempt that
+// cannot be recorded is not made: nothing would hold its backoff, and its
+// outcome could not be kept either.
 func (c *Checker) refreshAsync() {
 	c.refreshOnce.Do(func() {
+		if err := c.write(cacheEntry{CheckedAt: c.now()}); err != nil {
+			return
+		}
 		done := make(chan struct{})
 		c.refreshMu.Lock()
 		c.refreshDone = done
@@ -270,8 +282,10 @@ func (c *Checker) refreshAsync() {
 // It returns at once when nothing was scheduled. Notice returns "" both when
 // the cache is fresh and when it schedules a refresh, so only the Checker
 // itself knows whether a lookup is in flight. A refresh that has not finished
-// when the budget runs out is left running and abandoned with the process,
-// exactly as it is today.
+// when the budget runs out is left running and abandoned with the process. The
+// attempt it recorded when it was scheduled keeps the backoff, so the next
+// invocation does not schedule another lookup, or wait for one, until CacheTTL
+// has passed.
 func (c *Checker) WaitRefresh(timeout time.Duration) bool {
 	c.refreshMu.Lock()
 	done := c.refreshDone

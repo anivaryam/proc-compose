@@ -3504,11 +3504,13 @@ func TestMutationCLI_JSONValidation(t *testing.T) {
 		name, message string
 		args          []string
 		plain         bool
+		code          int // 0 means the mutation failure status, 1
 	}{
 		{name: "restart_missing_process", args: []string{"restart", "--json"}, message: "accepts 1 arg(s), received 0"},
 		{name: "restart_extra_process", args: []string{"restart", "api", "worker", "--json"}, message: "accepts 1 arg(s), received 2"},
-		{name: "restart_invalid_session", args: []string{"--session", "bad/name", "restart", "api", "--json"}, message: "invalid --session"},
-		{name: "reload_invalid_session", args: []string{"--session", "bad/name", "reload", "--json"}, message: "invalid --session"},
+		// An invalid --session is refused as on every command: exit 2.
+		{name: "restart_invalid_session", args: []string{"--session", "bad/name", "restart", "api", "--json"}, message: "invalid --session", code: 2},
+		{name: "reload_invalid_session", args: []string{"--session", "bad/name", "reload", "--json"}, message: "invalid --session", code: 2},
 		{name: "restart_no_daemon", args: []string{"restart", "api", "--json"}, message: "no proc-compose daemon running"},
 		{name: "reload_no_daemon", args: []string{"reload", "--json"}, message: "no proc-compose daemon running"},
 		{name: "restart_bad_flag", args: []string{"restart", "api", "--json", "--bogus"}, message: "unknown flag: --bogus", plain: true},
@@ -3519,8 +3521,12 @@ func TestMutationCLI_JSONValidation(t *testing.T) {
 			dir, runtimeDir := t.TempDir(), testTempDir(t)
 			args := append([]string{"--file", filepath.Join(dir, "not-created.yml")}, tc.args...)
 			stdout, stderr, code := runVerifyCLIIn(t, bin, dir, runtimeDir, args...)
-			if code != 1 {
-				t.Fatalf("exit=%d, want 1; stdout=%q stderr=%q", code, stdout, stderr)
+			want := 1
+			if tc.code != 0 {
+				want = tc.code
+			}
+			if code != want {
+				t.Fatalf("exit=%d, want %d; stdout=%q stderr=%q", code, want, stdout, stderr)
 			}
 			if tc.plain {
 				if stdout != "" || !strings.Contains(stderr, tc.message) {

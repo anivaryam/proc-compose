@@ -139,52 +139,107 @@ func TestQuery_ConcurrentRotationNeverSilentlySkipsOrReplays(t *testing.T) {
 
 // A rotation renames the live journal aside before it installs the
 // replacement, so a reader that opens the journal in that window finds the live
-// path missing. That is a rotation in flight, not a missing journal: the reader
-// must report a retryable error, never "file does not exist".
-func TestQuery_MidRotationLiveFileIsRetryableNotMissing(t *testing.T) {
+// path missing. The newest events are in the staged file then — also after a
+// failed rotation that could not put the live journal back — so the reader
+// reads it in place of the live journal: the journal is neither missing nor
+// a reason to retry, and no event is out of the query's reach.
+func TestQuery_MidRotationReadsTheStagedJournal(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "events.jsonl")
+	rotated, err := os.Create(path + ".1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeEvents(t, rotated, 1, 2)
+	rotated.Close()
 	writer, err := logrotate.New(path, 1<<20, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer writer.Close()
-	data, _ := json.Marshal(ipc.LogEntry{Version: 1, ID: "run:1", RunID: "run", Sequence: 1, Line: "ready"})
-	if _, err := writer.Write(append(data, '\n')); err != nil {
-		t.Fatal(err)
-	}
+	writeEvents(t, writer, 3, 3)
 	// Reproduce the rotation window: the live journal has been renamed aside
-	// and the replacement has not been installed yet.
-	staged := path + ".staging"
-	if err := os.Rename(path, staged); err != nil {
+	// while the writer has it open, and no replacement has been installed.
+	if err := os.Rename(path, path+logrotate.StagingSuffix); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Query(path, Options{After: "start"})
-	if err == nil {
-		t.Fatal("the query succeeded although the live journal was rotated away")
+	// What the writer writes now lands in the staged file.
+	writeEvents(t, writer, 4, 4)
+	page, err := Query(path, Options{After: "start"})
+	if err != nil {
+		t.Fatalf("query while the live journal is staged: %v", err)
 	}
-	if errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("error = %v, want a retryable error, not a missing journal", err)
+	if got := eventIDs(page); got != "run:1,run:2,run:3,run:4" {
+		t.Fatalf("page = %s, want the rotated copy followed by the staged journal", got)
 	}
-	if !strings.Contains(err.Error(), "retry this query") {
-		t.Fatalf("error = %v, want a retryable error", err)
+	// Once the live journal is back the journal is read normally again.
+	if err := os.Rename(path+logrotate.StagingSuffix, path); err != nil {
+		t.Fatal(err)
 	}
-	// Once the rotation has installed its replacement the journal is read
-	// normally again.
-	if err := os.Rename(staged, path); err != nil {
+	page, err = Query(path, Options{After: "start"})
+	if err != nil {
+		t.Fatalf("query after the live journal came back: %v", err)
+	}
+	if got := eventIDs(page); got != "run:1,run:2,run:3,run:4" {
+		t.Fatalf("page = %s, want every recorded event", got)
+	}
+}
+
+// A live journal that another process removed leaves the rotated copies, and
+// a rotation between installing the newest copy and the new live file leaves
+// the same state: the copies are the whole journal then. The query reads them
+// instead of reporting a rotation in progress until the writer next rotates,
+// and a journal with no file left is still reported as missing.
+func TestQuery_ReadsTheRotatedCopiesWhenTheLiveJournalIsGone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	writer, err := logrotate.New(path, 1<<20, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeEvents(t, writer, 1, 2)
+	writer.Close()
+	if err := os.Rename(path, path+".1"); err != nil {
 		t.Fatal(err)
 	}
 	page, err := Query(path, Options{After: "start"})
 	if err != nil {
-		t.Fatalf("query after the rotation completed: %v", err)
+		t.Fatalf("query without a live journal: %v", err)
 	}
-	if len(page.Events) != 1 || page.Events[0].ID != "run:1" {
-		t.Fatalf("page = %+v, want the single recorded event", page.Events)
+	if got := eventIDs(page); got != "run:1,run:2" {
+		t.Fatalf("page = %s, want the rotated copy's events", got)
+	}
+
+	if err := os.Remove(path + ".1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Query(path, Options{After: "start"}); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("query of a journal with no file left = %v, want a missing journal", err)
 	}
 }
 
-// A reader that opens the journal while the rotation is in flight waits the
-// rotation out and reads the journal once its replacement is installed.
+// writeEvents writes the events from to last of run "run" to writer.
+func writeEvents(t *testing.T, writer io.Writer, from, last uint64) {
+	t.Helper()
+	for i := from; i <= last; i++ {
+		data, _ := json.Marshal(ipc.LogEntry{Version: 1, ID: fmt.Sprintf("run:%d", i), RunID: "run", Sequence: i, Line: "ready"})
+		if _, err := writer.Write(append(data, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// eventIDs lists the page's event ids, comma separated.
+func eventIDs(page Page) string {
+	ids := make([]string, 0, len(page.Events))
+	for _, event := range page.Events {
+		ids = append(ids, event.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
+// A reader that opens the journal while the rotation is in flight reads it
+// whether it pins the staged file or the file installed at the live path; a
+// rename between its opens makes it pin the journal again.
 func TestQuery_RecoversWhenTheRotationInstallsItsReplacement(t *testing.T) {
 	restore := snapshotRetryDelay
 	snapshotRetryDelay = 20 * time.Millisecond
@@ -201,11 +256,11 @@ func TestQuery_RecoversWhenTheRotationInstallsItsReplacement(t *testing.T) {
 	if _, err := writer.Write(append(data, '\n')); err != nil {
 		t.Fatal(err)
 	}
-	staged := path + ".staging"
+	staged := path + logrotate.StagingSuffix
 	if err := os.Rename(path, staged); err != nil {
 		t.Fatal(err)
 	}
-	// The rotation completes while the reader waits out its first attempt.
+	// The rotation completes while the reader pins the journal.
 	go func() {
 		time.Sleep(5 * time.Millisecond)
 		_ = os.Rename(staged, path)

@@ -71,6 +71,17 @@ Flags (init):
 Flags (logs): see `proc-compose logs --help` and [Sessions and logs](sessions-and-logs.md)
 ```
 
+### An invalid `--session`
+
+A `--session` name must match `[A-Za-z0-9._-]{1,64}`. Every command refuses
+any other name the same way, before it does anything: it exits `2`. With
+`--json`, stdout holds exactly one JSON object. `verify` and `compare` report
+the refusal in their own result (error code `usage_error`); every other
+command prints `{"operation": …, "status": "error", "message": "invalid
+--session: …"}`, where `operation` is the command, such as `status` or
+`config check`, and leaves stderr empty. Without `--json`, the error is
+printed on stderr.
+
 ## Environment variables
 
 | Variable | Read by | Effect |
@@ -100,6 +111,11 @@ On Unix, the paths are:
 ```
 
 Windows uses a named pipe (`\\.\pipe\pc-<hash>`) for IPC instead of a Unix socket.
+
+Each command a client sends over the socket is one JSON line of at most 64 KiB,
+newline included. The daemon discards a longer line and answers it with an
+`error` acknowledgment that names the limit. The connection stays open, so the
+commands sent after it on the same connection are still processed.
 
 The PID file is JSON and is replaced atomically, so a reader never sees a
 partial file. On Linux and macOS it also records every process group the
@@ -282,7 +298,9 @@ readiness. Reload does not wait for replacement readiness and omits `ready`.
 
 Exit `0` still includes both full and **partial** reloads: inspect `status`,
 not just the exit code. Busy, rejection, missing daemon, failed readiness and
-semantic usage errors exit `1`. Flag-parsing errors (such as an unknown flag,
+semantic usage errors exit `1`, except an invalid `--session`, which exits `2`
+as on every command ([An invalid `--session`](#an-invalid---session)); its
+JSON object is the same `status: error` result. Flag-parsing errors (such as an unknown flag,
 even after `--json`) remain exit `1` with plaintext stderr and empty stdout;
 `--help` remains normal help text. A stdout write failure also exits nonzero
 and cannot guarantee a complete JSON object.
@@ -305,7 +323,10 @@ them exited. `stop` exits 0 only when the daemon verified this. When
 termination could not be verified, `stop` names what it could not confirm and
 exits non-zero. `--timeout` (default 10) bounds the wait for that verdict. If
 the daemon cannot be reached and has to be killed directly, the final kill
-can add up to 5 seconds.
+can add up to 5 seconds. A `stop` that never receives the verdict (it was
+interrupted, or its `--timeout` ran out first) cannot report it, so the daemon records the verdict
+in the session's event journal as `shutdown.verdict_undelivered`; read it with
+`proc-compose logs --json --level error`.
 
 When the stack declares [teardown processes](configuration.md#teardown-processes),
 the daemon runs them after termination is verified (also with `--force`), and

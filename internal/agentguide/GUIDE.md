@@ -3,7 +3,10 @@
 Offline and version-matched: `proc-compose agent-guide`. Use `<command> --help`
 for exact flags. Schema version 1. Pass the same explicit
 `-f /abs/proc-compose.yml --session NAME` to every command; session identity is
-the absolute config path plus the optional name.
+the absolute config path plus the optional name. A NAME outside
+`[A-Za-z0-9._-]{1,64}` is refused by every command before it does anything:
+exit 2 and, with `--json`, one object on stdout (`verify`/`compare`: their own
+kind with `usage_error`; others: `{operation, status: "error", message}`).
 
 ## To check a change, use `verify`
 
@@ -82,9 +85,12 @@ events. For each process you get state transitions and output, with
 identical consecutive lines grouped into `count`, plus
 `first_id`/`last_id` for `logs --after`. `history_missing`, `gap`, and
 `truncated` mark incomplete evidence. It shows temporal order, not causes.
-A record without an attempt id is scoped to its run instead (`boundary:
-run_id`, limitation `attempt_boundary_unavailable`).
-`attempts --json` lists receipts. A nonterminal receipt is `active` only while
+A record without a run id reports `history_missing` (limitation
+`journal_unavailable`) instead of scanning the whole journal.
+`attempts --json` lists receipts; a file that is not a valid receipt is
+skipped, and `latest` is the newest valid one. A running attempt's receipt
+has `status: not_run`, `exit_code: 0`, `precedence: no_verdict`.
+A nonterminal receipt is `active` only while
 its owner lives and still runs the session, `abandoned` only with positive owner loss plus a free lease,
 and otherwise `indeterminate`; it is never a pass. `sessions` never probes the
 lease, so it shows a gone owner as `indeterminate`. Receipts live in the runtime
@@ -114,12 +120,14 @@ proc-compose -f /repo/proc-compose.yml --session task-1 stop --timeout 30
   does not prove readiness. Restart reports the acknowledged `generation` when
   available; with `--wait-ready`, `ready: true` proves that replacement passed
   readiness, while `ready: false` is not a pass. Plain restart omits `ready`.
+  Errors exit 1, except an invalid `--session` (exit 2, as everywhere).
   Flag-parsing errors remain exit 1 with text stderr and empty stdout.
 - `sessions --json` lists every session: owner (command, PID,
   `PROC_COMPOSE_OWNER` label, worktree), URLs, latest attempt, and a stop
   command. It only reads.
 - Other commands and flag-parsing failures may print only stderr text; do not
-  assume every failure has JSON to decode.
+  assume every failure has JSON to decode. An invalid `--session` is the
+  exception: it always has its JSON object under `--json`.
 
 ## Logs and failure packets
 
@@ -152,7 +160,9 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why api --json
 
 - `config check --json` gives `{code,path,line,column,message,hint}`
   diagnostics. `config plan --json` gives start order, readiness kinds, and
-  endpoint references. `config schema` prints the JSON Schema. `validate`,
+  endpoint references. `config schema` prints the JSON Schema; it cannot state
+  every rule (dependencies, env files, a merge upstream's `PORT`), so
+  `config check` is the authority. `validate`,
   `up --dry-run`, and `bootstrap --verify` (`validation_status`) are static and
   start nothing.
 - Readiness: without a probe, a service is ready once it starts. Tasks are ready
@@ -171,6 +181,9 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why api --json
 - `compare --baseline DIR --candidate DIR --json -- CMD` runs one check against
   two worktrees. `outcomes_equal`/`differences` are observations, not
   attributions, and isolating data is the caller's job. `outcomes_equal` is
-  `null` when no verdict could be proven (one side's own repetitions
-  disagree, or a compared output was truncated); the reason is named in
-  `limitations`.
+  `false` when a difference was proven, even beside a limitation: in every
+  pairing of a baseline with a candidate repetition, status, check status, or
+  exit code differ, or output does (complete output whenever it differs;
+  truncated output only where both captures hold different bytes). It is
+  `null` when nothing was proven and one side's own repetitions disagree or
+  an output was truncated; every such reason is named in `limitations`.

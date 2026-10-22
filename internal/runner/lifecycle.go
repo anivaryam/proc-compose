@@ -31,6 +31,11 @@ type processRunResult struct {
 // Returns failure metadata when the process ended in the "failed" state.
 var errCleanupHandoff = errors.New("runner cleanup handoff")
 
+// errTreeUnconfirmed marks an incarnation that ended without proof that its
+// process tree is gone. The restart policy does not apply to it: a restart
+// could start a second copy beside a tree that is still alive.
+var errTreeUnconfirmed = errors.New("its process tree could not be proven terminated, so it is not restarted")
+
 // dependencyVerdict is what waiting for a dependency concluded.
 type dependencyVerdict struct {
 	// verdict is readySatisfied when the dependency became ready,
@@ -277,10 +282,10 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 				st.state = "restarting"
 				st.mu.Unlock()
 				r.broadcastState(p, st)
-				if waitForCleanupHandoff(backoff, handoff) {
-					return processRunResult{quiesced: true}
+				var restart bool
+				if backoff, restart = r.waitBeforeRestart(ctx, p, st, backoff); !restart {
+					return processRunResult{}
 				}
-				backoff = nextBackoff(backoff)
 				continue
 			}
 			// The lifecycle is over and the process will not run again, so a
@@ -299,7 +304,10 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		}
 		st.mu.Unlock()
 
-		if p.proc.Restart == "never" {
+		// An incarnation whose process tree could not be proven gone is not
+		// restarted whatever the policy says: the new copy could run beside a
+		// tree that is still alive.
+		if p.proc.Restart == "never" || errors.Is(err, errTreeUnconfirmed) {
 			st.failProcess("")
 			r.broadcastState(p, st)
 			return processRunResult{failed: true}
@@ -322,22 +330,42 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		r.broadcastState(p, st)
 		r.processLog(p, "info", "process.restarting", fmt.Sprintf("restarting in %s...", backoff))
 
-		select {
-		case <-ctx.Done():
-			// The cycle ends without a verdict and no further cycle follows:
-			// a dependent that re-reads the current cycle sees the same
-			// cycle and ends its wait instead of waiting forever.
-			st.publishAgain()
+		var restart bool
+		if backoff, restart = r.waitBeforeRestart(ctx, p, st, backoff); !restart {
 			return processRunResult{}
-		case <-st.restartCh:
-			// Restart requested during backoff — skip the wait. Readiness
-			// was already reset above, before the wait started.
-			backoff = time.Second
-			continue
-		case <-time.After(backoff):
 		}
+	}
+}
 
-		backoff = nextBackoff(backoff)
+// waitBeforeRestart waits out one restart backoff and returns the backoff for
+// the restart after this one. It reports false when the run was stopped during
+// the wait; the process has then ended.
+//
+// Both restart paths wait here, so one rule covers them: the wait ends at once
+// when the run is stopped or a restart is requested, and otherwise when the
+// backoff runs out. The backoff grows to 30 seconds, so a wait that ignored the
+// stop would hold the whole stack's shutdown open for that long. The cleanup
+// handoff needs no case of its own: it is only ever released after the run
+// context is cancelled, so the stop has already ended the wait.
+//
+// A stop ends the process the way every other stop does: in the terminal state
+// "exited" with a process.stopped event, and with the stopped readiness verdict,
+// so a dependent still waiting for it ends as stopped rather than failed.
+func (r *Runner) waitBeforeRestart(ctx context.Context, p procInfo, st *procState, backoff time.Duration) (time.Duration, bool) {
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		st.stopProcess("")
+		r.broadcastState(p, st)
+		r.processLog(p, "info", "process.stopped", "stopped")
+		return backoff, false
+	case <-st.restartCh:
+		// A restart requested during the wait skips it. Readiness was
+		// already reset before the wait started.
+		return time.Second, true
+	case <-timer.C:
+		return nextBackoff(backoff), true
 	}
 }
 
@@ -486,8 +514,7 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	if len(p.argv) > 0 {
 		cmd = exec.CommandContext(ctx, p.argv[0], p.argv[1:]...)
 	} else {
-		shell, args := shellCommand(p.proc.Cmd)
-		cmd = exec.CommandContext(ctx, shell, args...)
+		cmd = shellExec(ctx, p.proc.Cmd)
 	}
 
 	// Per-process shutdown_timeout is the window between the graceful group
@@ -542,6 +569,9 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 		_ = stderr.Close()
 		_ = pg.Close()
 		return fmt.Errorf("record process group: %w", err)
+	}
+	if r.BeforeStart != nil {
+		r.BeforeStart(p.name)
 	}
 	if err := cmd.Start(); err != nil {
 		r.recordDrop(entry)
@@ -607,22 +637,37 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	// pipe after the group has been killed.
 	//
 	// It is defined before the observation below because that observation's
-	// failure path must close both pipes too: os/exec closes only the parent's
-	// copies of the child's pipe ends, so the read ends are the runner's to
-	// close. The readers are never started on that path, so closing them there
-	// cannot take a pipe away from anything that still needs it.
+	// failure path must close both pipes too: os/exec closes the read ends only
+	// once cmd.Wait has collected the command, and that path can return before
+	// the reap has completed, so the read ends are the runner's to close. The
+	// readers are never started on that path, so closing them there cannot
+	// take a pipe away from anything that still needs it.
 	closeStdout := sync.OnceFunc(func() { _ = stdout.Close(); _ = stderr.Close() })
 
 	// Setup must not block: a long-running service would otherwise delay its own
 	// start. The observer is built once and reports whether the leader has
 	// already exited.
 	var observation exitObservation
-	observer, obsErr := observeLeaderExit(cmd.Process.Pid)
+	observer, obsErr := r.observeLeader(cmd.Process.Pid)
 	if obsErr != nil {
-		// The leader's waitable state could not be established, so its
-		// identifier can no longer be proven to be ours. Authority is withdrawn
-		// BEFORE anything else so that no group signal can be emitted on the
-		// strength of an identifier we cannot vouch for.
+		// The exit cannot be observed without reaping it, so the command cannot
+		// be run: it is ended here and the launch fails.
+		//
+		// Whether its whole tree can be ended depends on what failed. When the
+		// platform merely has no reap-free observation, the leader is still
+		// unreaped, so its process-group ID is still ours: the group is killed
+		// while that holds, before authority is withdrawn, and the command's
+		// descendants are not orphaned.
+		//
+		// Any other failure means the leader's waitable state could not be
+		// established, so its identifier can no longer be proven to be ours.
+		// Authority is then withdrawn BEFORE anything else so that no group
+		// signal can be emitted on the strength of an identifier we cannot
+		// vouch for.
+		signalled := leaderStillReserved(obsErr)
+		if signalled {
+			terminateSealedGroup(pg)
+		}
 		pg.Withdraw()
 		// The command is still running and this runner started it, so
 		// reclaiming it is cleanup the runner owns rather than a group signal:
@@ -644,7 +689,7 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 			_ = reap.recv()
 			closeStdout()
 		}
-		return fmt.Errorf("observe leader exit: %w", obsErr)
+		return r.settleUnobserved(p, pg, groupIdentity, handoff, signalled, fmt.Errorf("observe leader exit: %w", obsErr))
 	}
 
 	var escaped atomic.Bool
@@ -882,6 +927,38 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	r.recordDropGroup(pg)
 	pg.Close()
 	r.lifecycleMu.Unlock()
+	return err
+}
+
+// settleUnobserved verifies what a launch whose exit could not be observed left
+// behind, once its leader has been collected, and returns err for the launch.
+//
+// The verification is the one a teardown ends with. A group proven empty is
+// released and err is returned as it is, so the restart policy applies. Any
+// other group is recorded as unverified and stays registered, like a teardown
+// survivor, and err carries errTreeUnconfirmed: restarting would start a
+// second copy beside a tree that may still be alive. signalled reports whether
+// the group was killed before authority was withdrawn.
+func (r *Runner) settleUnobserved(p procInfo, pg ProcessGroup, identity string, handoff <-chan struct{}, signalled bool, err error) error {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	// The terminal sweep took the registry, so this group is its to report.
+	if handoff != nil && r.sealing.Load() && !p.teardown {
+		return errCleanupHandoff
+	}
+	if state := pg.State(); state != GroupEmpty {
+		what := "the leader's identity could not be established, so no process group signal was sent"
+		if signalled {
+			what = "its process group was killed"
+		}
+		r.recordUnverified(p.name, identity, fmt.Sprintf(
+			"%s: %v; %s, and the group could not be proven empty afterwards (%s), so %s is not restarted",
+			p.name, err, what, state, p.name))
+		return fmt.Errorf("%w: %w", err, errTreeUnconfirmed)
+	}
+	r.untrackGroup(p.name, pg)
+	r.recordDropGroup(pg)
+	pg.Close()
 	return err
 }
 
@@ -1227,6 +1304,10 @@ const sweepDrain = 250 * time.Millisecond
 // already spent, and the drain that follows it is short. A group that survives
 // the drain is reported as a survivor by the caller.
 //
+// A launch whose exit cannot be observed ends its group the same way: it is
+// about to withdraw the authority too, and the command was refused rather than
+// asked to stop.
+//
 // The caller must not hold a runner lock: the kill reaches processes outside
 // the runner.
 func terminateSealedGroup(pg ProcessGroup) {
@@ -1283,6 +1364,15 @@ func (r *Runner) createProcessGroup() ProcessGroup {
 	return newProcessGroup()
 }
 
+// observeLeader sets up the observation of the command leader's exit, through
+// the observeExit seam when a test installed one.
+func (r *Runner) observeLeader(pid int) (exitObserver, error) {
+	if r.observeExit != nil {
+		return r.observeExit(pid)
+	}
+	return observeLeaderExit(pid)
+}
+
 func (r *Runner) startReap(name, identity string, cmd *exec.Cmd, reap *singleReap) {
 	if reap.started() {
 		return
@@ -1332,21 +1422,6 @@ func (r *Runner) pruneTakenReapsLocked() {
 	}
 	clear(r.reapers[len(keep):])
 	r.reapers = keep
-}
-
-func waitForCleanupHandoff(delay time.Duration, handoff <-chan struct{}) bool {
-	if handoff == nil {
-		time.Sleep(delay)
-		return false
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-handoff:
-		return true
-	case <-timer.C:
-		return false
-	}
 }
 
 // shutdownProblems returns the accumulated verdict problems.

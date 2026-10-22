@@ -58,7 +58,11 @@ type Runner struct {
 	// verification attempt, so diagnosis can scope evidence to one attempt.
 	AttemptID     string
 	ResolveConfig func(*config.Config) (*config.Config, error)
-	RecordPath    string // daemon PID file that records launched process groups (Unix); empty disables recording
+	// BeforeStart, when set, is called with the process's name right before
+	// each launch, after admission and immediately before exec. A session plan
+	// releases the ports it holds for that process here.
+	BeforeStart func(name string)
+	RecordPath  string // daemon PID file that records launched process groups (Unix); empty disables recording
 	// RefuseCrossSession refuses an http or tcp readiness or health answer
 	// that belongs to another live session (scope cross_session), as
 	// foreign_listener: reject refuses a foreign one. verify sets it unless
@@ -102,6 +106,9 @@ type Runner struct {
 	recordMu sync.Mutex
 	records  []*recEntry
 	recordOn bool
+	// observeExit replaces observeLeaderExit when set (test seam), so a test
+	// can make the observation of a started command's exit fail.
+	observeExit func(pid int) (exitObserver, error)
 	// processGroupFactory defaults to the platform implementation. Tests can
 	// wrap the existing group to hold the start-to-track admission boundary.
 	processGroupFactory func() ProcessGroup
@@ -685,12 +692,22 @@ func (r *Runner) handleCommands(ctx context.Context, store *stateStore) {
 		}
 		// The server writes the acknowledgment carrying the verdict once the
 		// runner has replied, and only this goroutine can observe both the
-		// reply and the flush. The barrier is released after the write
-		// attempt completes, whatever its result — the server reports a
-		// failed write on stderr — so WaitFlushed returns on disconnect,
-		// write failure and timeout alike, and a client that goes away
+		// reply and the flush. WaitFlushed returns as soon as the write
+		// attempt completes, whatever its result, so a client that goes away
 		// cannot wedge the daemon.
-		cmd.WaitFlushed(shutdownFlushTimeout)
+		//
+		// A verdict that was not delivered is recorded in the event journal
+		// before the barrier is released, while the journal is still open:
+		// the client that asked for it never saw it, and it is the only
+		// account of what could not be terminated.
+		if err := cmd.WaitFlushed(shutdownFlushTimeout); err != nil {
+			verdict := res.Status
+			if res.Message != "" {
+				verdict += ": " + res.Message
+			}
+			r.systemLog("error", "shutdown.verdict_undelivered",
+				fmt.Sprintf("the shutdown verdict was not delivered to the client that requested it (%v); verdict: %s", err, verdict))
+		}
 		r.stopAck.leave()
 	}
 }

@@ -67,10 +67,12 @@ type Options struct {
 	// to another live session (runner.Runner.RefuseCrossSession). The
 	// verify command sets it unless --allow-cross-session is given.
 	RefuseCrossSession bool
-	// Now supplies the attempt's clock. It is a supported injection point for
-	// library callers and tests, not a test-only seam. A zero clock is
-	// tolerated: the attempt then records an empty started_at (and a null
-	// finished_at) instead of panicking.
+	// Now supplies the attempt's clock: its recorded timestamps, its attempt
+	// id, and the start of each phase budget. It is a supported injection
+	// point for library callers and tests, not a test-only seam. The budgets
+	// run out against the system clock, so Now must report wall-clock time:
+	// a clock offset from it moves every deadline by the offset. A nil Now,
+	// or a reading of the zero time, uses time.Now.
 	Now func() time.Time
 
 	// writeReceipt is a test seam; nil uses WriteReceipt.
@@ -105,9 +107,14 @@ func Usage(opts Options, code string) *Result {
 	return result
 }
 
+// now reads the attempt's clock. A zero reading is no time at all: deadlines
+// computed from it have already passed, so it falls back to time.Now like an
+// unset clock.
 func (o Options) now() time.Time {
 	if o.Now != nil {
-		return o.Now()
+		if t := o.Now(); !t.IsZero() {
+			return t
+		}
 	}
 	return time.Now()
 }
@@ -118,12 +125,14 @@ func newResult(opts Options, started time.Time) *Result {
 		name = "default"
 	}
 	// The seeded status is not a verdict: an attempt that has not run has no
-	// verdict yet. failPreAcquisition and finishVerdict set the real one.
+	// verdict yet, which the active receipt records as such.
+	// failPreAcquisition and finishVerdict set the real one.
 	result := &Result{
 		SchemaVersion:     SchemaVersion,
 		Kind:              KindResponse,
 		State:             StateCompleted,
 		Status:            StatusNotRun,
+		Precedence:        PrecedenceNoVerdict,
 		Phase:             PhaseValidation,
 		Session:           name,
 		ConfigPath:        opts.ConfigPath,
@@ -140,8 +149,9 @@ func newResult(opts Options, started time.Time) *Result {
 		Errors:            []ErrorRecord{},
 		Retention:         "no receipt created",
 	}
-	// A zero clock has no timestamp: timestamp returns nil for the zero time,
-	// so the attempt records an empty started_at instead of dereferencing nil.
+	// Options.now never returns the zero time, but timestamp returns nil for
+	// it, so a zero started records an empty started_at instead of
+	// dereferencing nil.
 	if !started.IsZero() {
 		result.StartedAt = *timestamp(started)
 	}
@@ -434,6 +444,7 @@ func (a *attempt) startAndCheck(ctx context.Context) {
 		Journal:               journal,
 		Project:               plan.Project,
 		ResolveConfig:         plan.Resolve,
+		BeforeStart:           plan.ReleasePorts,
 		CleanupHandoffTimeout: opts.CleanupTimeout - opts.sealReserve(),
 		// Stack teardown gets what remains of the one cleanup budget minus the
 		// seal reserve, from whichever trigger started it: verify's cleanup,

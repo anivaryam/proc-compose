@@ -145,6 +145,14 @@ var portNameRe = regexp.MustCompile(`^[A-Za-z0-9][-A-Za-z0-9_]*[A-Za-z0-9]$|^[A-
 // leased.
 const MergePortProcessName = "merge-port"
 
+// maxResourceLabel is the longest resource label, in bytes of the trimmed
+// label, that Load accepts.
+const maxResourceLabel = 256
+
+// maxEnvFileLine is the longest env_file line, in bytes without its line
+// terminator, that parseEnvFile accepts.
+const maxEnvFileLine = 1 << 20
+
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -171,6 +179,12 @@ func Load(path string) (*Config, error) {
 	// absolute path rooted at the config file directory, not the caller's CWD.
 	normalizeProcessDirs(cfg.Processes, configDir)
 
+	// Every env_file is read once, up front: the merge wiring needs the PORT
+	// an env_file declares before the validation loop merges the file into
+	// the process env. A read error is kept and reported by that loop, at the
+	// process's env_file and in the usual order.
+	envFiles := readEnvFiles(cfg.Processes, configDir)
+
 	if cfg.Merge != nil {
 		// The merge section generates a proxy process under a reserved name.
 		// A user process with that name would be silently overwritten, so
@@ -180,11 +194,20 @@ func Load(path string) (*Config, error) {
 				"process name %q is reserved for the proxy the merge section generates; rename the process", MergePortProcessName)
 		}
 
+		// Only services can be merge upstreams, and every selection below —
+		// the api_prefixes scan, the upstream wiring and the client env
+		// injection — picks from the same candidates, so they never disagree
+		// about which process is the client or the server.
+		candidates := serviceUpstreams(cfg.Processes)
+		if err := checkClientProcess(cfg.Processes, cfg.Merge); err != nil {
+			return nil, err
+		}
+		served := servedPorts(cfg.Processes, envFiles)
+
 		// Auto-detect api_prefixes by scanning server source when none are configured.
 		if len(cfg.Merge.ApiPrefixes) == 0 && len(cfg.Merge.Routes) == 0 {
-			serverDir := findProcDir(cfg.Processes, cfg.Merge.Server, []string{"server", "backend", "api"}, configDir)
-			if serverDir != "" {
-				if detected := scanRoutes(serverDir); len(detected) > 0 {
+			if server := findServerProc(candidates, served, cfg.Merge); server != "" {
+				if detected := scanRoutes(procDir(candidates[server].Dir, configDir)); len(detected) > 0 {
 					cfg.Merge.ApiPrefixes = detected
 				}
 			}
@@ -211,7 +234,7 @@ func Load(path string) (*Config, error) {
 		// its backends are accepting connections. Without this, merge-port
 		// boots in parallel with the client/server and any traffic that
 		// arrives before the backends bind their ports gets a 502.
-		upstreams, err := resolveUpstreamProcesses(cfg.Processes, cfg.Merge)
+		upstreams, err := resolveUpstreamProcesses(candidates, served, cfg.Merge)
 		if err != nil {
 			return nil, err
 		}
@@ -239,7 +262,7 @@ func Load(path string) (*Config, error) {
 
 		// Auto-inject the merge-port URL into the client process env so users
 		// don't need to edit .env or remove hardcoded fallback ports.
-		if clientName := findClientProc(cfg.Processes, cfg.Merge); clientName != "" {
+		if clientName := findClientProc(candidates, served, cfg.Merge); clientName != "" {
 			clientDir := procDir(cfg.Processes[clientName].Dir, configDir)
 			injectClientAPIEnv(cfg.Processes, clientName, clientDir, cfg.Merge)
 		}
@@ -330,11 +353,7 @@ func Load(path string) (*Config, error) {
 			return nil, err
 		}
 		if proc.EnvFile != "" {
-			envFilePath := proc.EnvFile
-			if !filepath.IsAbs(envFilePath) {
-				envFilePath = filepath.Join(configDir, envFilePath)
-			}
-			fileVars, err := parseEnvFile(envFilePath)
+			fileVars, err := envFiles[name].vars, envFiles[name].err
 			if err != nil {
 				return nil, invalid(CodeEnvFile, at("env_file"), err, "process %q: %w", name, err)
 			}
@@ -394,7 +413,7 @@ func Load(path string) (*Config, error) {
 		}
 		seenResources[resource] = true
 		trimmed := strings.TrimSpace(resource)
-		if trimmed == "" || len(trimmed) > 256 || strings.ContainsAny(trimmed, "\r\n\x00") {
+		if trimmed == "" || len(trimmed) > maxResourceLabel || strings.ContainsAny(trimmed, "\r\n\x00") {
 			return nil, invalid(CodeInvalidResource, []any{"resources", i}, nil, "invalid or duplicate resource label %q", resource)
 		}
 		if seenTrimmed[trimmed] {
@@ -677,7 +696,10 @@ func buildMergeCmd(m *Merge) (string, error) {
 	parts = append(parts, "merge-port")
 
 	if routeMode {
-		for _, r := range m.Routes {
+		for i, r := range m.Routes {
+			if err := checkRouteTarget(i, r); err != nil {
+				return "", err
+			}
 			parts = append(parts, fmt.Sprintf("--route %s", r))
 		}
 	} else {
@@ -728,6 +750,25 @@ func checkPortRange(field string, port int) error {
 	if port < 1 || port > 65535 {
 		return invalid(CodeInvalidMerge, []any{"merge", field}, nil,
 			"merge.%s port %d is out of range (1-65535)", field, port)
+	}
+	return nil
+}
+
+// integerRe matches a route target written as an integer: a port number, as
+// opposed to a URL. It is the form strconv.Atoi parses.
+var integerRe = regexp.MustCompile(`^[+-]?[0-9]+$`)
+
+// checkRouteTarget refuses a route whose target is a port number outside
+// 1-65535, at merge.routes[i]. A target written as a URL is passed to
+// merge-port as written.
+func checkRouteTarget(i int, route string) error {
+	target, ok := routeTarget(route)
+	if !ok || !integerRe.MatchString(target) {
+		return nil
+	}
+	if port, err := strconv.Atoi(target); err != nil || port < 1 || port > 65535 {
+		return invalid(CodeInvalidMerge, []any{"merge", "routes", i}, nil,
+			"merge.routes[%d] target port %s is out of range (1-65535)", i, target)
 	}
 	return nil
 }
@@ -893,60 +934,42 @@ func rebaseURL(exampleVal, mergeBase string) string {
 
 // ─── Process lookup helpers ───────────────────────────────────────────────────
 
-// findProcDir finds the resolved directory for the process whose PORT env
-// matches port, falling back to the first process whose name is in names.
-func findProcDir(procs map[string]Process, port int, names []string, configDir string) string {
-	portStr := fmt.Sprintf("%d", port)
-	for _, name := range SortedProcessNames(procs) {
-		proc := procs[name]
-		if proc.Env["PORT"] == portStr {
-			return procDir(proc.Dir, configDir)
-		}
-	}
-	for _, name := range names {
-		if proc, ok := procs[name]; ok {
-			return procDir(proc.Dir, configDir)
-		}
-	}
-	return ""
-}
-
 // resolveUpstreamProcesses returns a map of {process_name → port} for every
 // process that merge-port will proxy traffic to. Used by Load() to wire
 // readiness probes onto upstreams and depends_on onto merge-port itself.
 //
-// Only services can be upstreams: a task or teardown process is not waited
-// for, and the merge wiring must not write a ready_when probe into it.
+// procs holds the candidates only (serviceUpstreams): a task or teardown
+// process is not waited for, and the merge wiring must not write a
+// ready_when probe into it.
 //
-// Simple mode: client + server (looked up by PORT env match, then by name,
-// honouring merge.client_process). Route mode: every process whose PORT
-// matches a "/prefix=PORT" target.
+// Simple mode: client + server (looked up by served PORT, then by name,
+// honouring merge.client_process). Route mode: every process whose served
+// PORT matches a "/prefix=PORT" target.
 //
 // Processes that already declare ready_when are left alone — the upstream
 // dependency edge is still added (the user's probe is what we wait on).
-func resolveUpstreamProcesses(procs map[string]Process, m *Merge) (map[string]int, error) {
+func resolveUpstreamProcesses(procs map[string]Process, served map[string]servedPort, m *Merge) (map[string]int, error) {
 	out := make(map[string]int)
-	candidates := serviceUpstreams(procs)
 	if len(m.Routes) > 0 {
 		for _, route := range m.Routes {
 			port := parseRoutePort(route)
 			if port == 0 {
 				continue
 			}
-			if name := procWithPort(candidates, port); name != "" {
+			if name := procWithPort(procs, served, port); name != "" {
 				out[name] = port
 			}
 		}
 		return out, nil
 	}
-	if name := findClientProc(candidates, m); name != "" && m.Client > 0 {
-		if err := checkUpstreamPort("client", name, candidates[name], m.Client); err != nil {
+	if name := findClientProc(procs, served, m); name != "" && m.Client > 0 {
+		if err := checkUpstreamPort("client", name, served, m.Client); err != nil {
 			return nil, err
 		}
 		out[name] = m.Client
 	}
-	if name := findServerProc(candidates, m); name != "" && m.Server > 0 {
-		if err := checkUpstreamPort("server", name, candidates[name], m.Server); err != nil {
+	if name := findServerProc(procs, served, m); name != "" && m.Server > 0 {
+		if err := checkUpstreamPort("server", name, served, m.Server); err != nil {
 			return nil, err
 		}
 		out[name] = m.Server
@@ -967,34 +990,118 @@ func serviceUpstreams(procs map[string]Process) map[string]Process {
 	return out
 }
 
-// checkUpstreamPort refuses an upstream that declares a PORT other than the
-// merge port it was selected for: the injected readiness probe would target a
-// port the process does not serve, and the proxy points at the merge port too.
-// A process that declares no PORT is probed at the merge port — the documented
-// guess. The declared port is compared numerically, so PORT: "05173" is the
-// merge port 5173.
-func checkUpstreamPort(field, name string, proc Process, mergePort int) error {
-	declared, ok := proc.Env["PORT"]
-	if !ok || strings.TrimSpace(declared) == "" {
+// checkClientProcess refuses a merge.client_process that names a task or
+// teardown process. Only a service can be an upstream, so the upstream wiring
+// would skip it while the client env injection still targeted it. A name
+// that matches no process is left to the auto-detection, as before.
+func checkClientProcess(procs map[string]Process, m *Merge) error {
+	proc, ok := procs[m.ClientProcess]
+	if m.ClientProcess == "" || !ok || proc.EffectiveMode() == ProcessModeService {
 		return nil
 	}
-	value, err := strconv.Atoi(strings.TrimSpace(declared))
-	if err != nil || value != mergePort {
-		return invalid(CodeInvalidMerge, []any{"merge", field}, nil,
-			"process %q declares PORT %q but merge.%s is %d: the proxy and its readiness probe target the merge port",
-			name, declared, field, mergePort)
+	return invalid(CodeInvalidMerge, []any{"merge", "client_process"}, nil,
+		"merge.client_process names %q, a %s process: only a service can be the merge client", m.ClientProcess, proc.EffectiveMode())
+}
+
+// servedPort is the PORT a process is started with, as far as Load can know
+// it.
+type servedPort struct {
+	port     int    // the port; 0 when the declared value is not a port number
+	declared string // how the PORT is declared, for messages
+}
+
+// servedPorts returns the PORT each process is started with, as far as Load
+// can know it. The session starts a process with the PORT its env declares —
+// the env block over its env_file, with ${ports.*} references resolved — and
+// otherwise with the port it assigns to ports.http. A process is left out when
+// Load cannot know its PORT: none is declared, the PORT is empty, the
+// ports.http port is ephemeral (0), or a reference cannot be resolved before
+// the session assigns the ports.
+func servedPorts(procs map[string]Process, envFiles map[string]envFile) map[string]servedPort {
+	out := make(map[string]servedPort, len(procs))
+	for name, proc := range procs {
+		value, declared := proc.Env["PORT"]
+		where := ""
+		if !declared {
+			value, declared = envFiles[name].vars["PORT"]
+			where = " in its env_file"
+		}
+		if !declared {
+			// An out-of-range preferred port is refused by the port check
+			// with its own diagnostic.
+			if preferred := proc.Ports["http"]; preferred >= 1 && preferred <= 65535 {
+				out[name] = servedPort{port: preferred, declared: fmt.Sprintf("is given PORT %d by ports.http", preferred)}
+			}
+			continue
+		}
+		resolved, ok := resolvePortReferences(procs, value)
+		resolved = strings.TrimSpace(resolved)
+		if !ok || resolved == "" {
+			continue
+		}
+		s := servedPort{declared: fmt.Sprintf("declares PORT %q%s", value, where)}
+		if resolved != strings.TrimSpace(value) {
+			s.declared = fmt.Sprintf("declares PORT %q (%s)%s", value, resolved, where)
+		}
+		if port, err := strconv.Atoi(resolved); err == nil && port > 0 {
+			s.port = port
+		}
+		out[name] = s
 	}
-	return nil
+	return out
+}
+
+// resolvePortReferences replaces each ${ports.<process>.<port>} reference in
+// value with that port's preferred port — the port the session assigns when
+// it is free. ok is false when value holds a reference Load cannot resolve:
+// an ephemeral (0) or undeclared port, or any other reference namespace.
+func resolvePortReferences(procs map[string]Process, value string) (string, bool) {
+	ok := true
+	resolved := referenceRe.ReplaceAllStringFunc(value, func(ref string) string {
+		namespace, process, portName, split := splitReference(referenceRe.FindStringSubmatch(ref)[1])
+		if preferred := procs[process].Ports[portName]; split && namespace == "ports" && preferred >= 1 && preferred <= 65535 {
+			return strconv.Itoa(preferred)
+		}
+		ok = false
+		return ref
+	})
+	return resolved, ok
+}
+
+// checkUpstreamPort refuses an upstream that is started with a PORT other
+// than the merge port it was selected for: the injected readiness probe would
+// target a port the process does not serve, and the proxy points at the merge
+// port too. A process whose PORT Load cannot know is probed at the merge port
+// — the documented guess. The served port is compared numerically, so PORT:
+// "05173" is the merge port 5173.
+func checkUpstreamPort(field, name string, served map[string]servedPort, mergePort int) error {
+	s, known := served[name]
+	if !known || s.port == mergePort {
+		return nil
+	}
+	return invalid(CodeInvalidMerge, []any{"merge", field}, nil,
+		"process %q %s but merge.%s is %d: the proxy and its readiness probe target the merge port",
+		name, s.declared, field, mergePort)
+}
+
+// routeTarget returns the trimmed target of a "/prefix=target" route spec:
+// the text after its last "=". ok is false when the spec has no "=".
+func routeTarget(route string) (string, bool) {
+	idx := strings.LastIndex(route, "=")
+	if idx < 0 {
+		return "", false
+	}
+	return strings.TrimSpace(route[idx+1:]), true
 }
 
 // parseRoutePort extracts the port from a "/prefix=PORT" route spec.
 // Returns 0 when the spec doesn't carry a port we can resolve.
 func parseRoutePort(route string) int {
-	idx := strings.LastIndex(route, "=")
-	if idx < 0 {
+	target, ok := routeTarget(route)
+	if !ok {
 		return 0
 	}
-	port, err := strconv.Atoi(strings.TrimSpace(route[idx+1:]))
+	port, err := strconv.Atoi(target)
 	if err != nil || port <= 0 {
 		return 0
 	}
@@ -1002,16 +1109,18 @@ func parseRoutePort(route string) int {
 }
 
 // procWithPort returns the first process (excluding merge-port itself)
-// whose PORT env equals port. Candidates are visited in name order, so a
-// duplicated PORT always resolves to the same process. Skips merge-port to
-// avoid self-dependencies and returns "" when no candidate is found.
-func procWithPort(procs map[string]Process, port int) string {
-	want := fmt.Sprintf("%d", port)
+// served on port. Candidates are visited in name order, so a duplicated PORT
+// always resolves to the same process. Skips merge-port to avoid
+// self-dependencies and returns "" when no candidate is found.
+func procWithPort(procs map[string]Process, served map[string]servedPort, port int) string {
+	if port <= 0 {
+		return ""
+	}
 	for _, name := range SortedProcessNames(procs) {
 		if name == MergePortProcessName {
 			continue
 		}
-		if procs[name].Env["PORT"] == want {
+		if s, known := served[name]; known && s.port == port {
 			return name
 		}
 	}
@@ -1019,9 +1128,10 @@ func procWithPort(procs map[string]Process, port int) string {
 }
 
 // findServerProc mirrors findClientProc for the backend side. Used to wire
-// the merge-port → server dependency edge in simple mode.
-func findServerProc(procs map[string]Process, m *Merge) string {
-	if name := procWithPort(procs, m.Server); name != "" {
+// the merge-port → server dependency edge in simple mode, and to find the
+// source tree the api_prefixes auto-detection scans.
+func findServerProc(procs map[string]Process, served map[string]servedPort, m *Merge) string {
+	if name := procWithPort(procs, served, m.Server); name != "" {
 		return name
 	}
 	for _, name := range []string{"server", "backend", "api"} {
@@ -1052,20 +1162,14 @@ func injectTCPReadyIfMissing(procs map[string]Process, name string, port int) {
 // findClientProc finds the name of the client/frontend process. Candidates
 // are visited in name order, so a duplicated PORT always resolves to the same
 // process.
-func findClientProc(procs map[string]Process, m *Merge) string {
+func findClientProc(procs map[string]Process, served map[string]servedPort, m *Merge) string {
 	if m.ClientProcess != "" {
 		if _, ok := procs[m.ClientProcess]; ok {
 			return m.ClientProcess
 		}
 	}
-	portStr := fmt.Sprintf("%d", m.Client)
-	for _, name := range SortedProcessNames(procs) {
-		if name == MergePortProcessName {
-			continue
-		}
-		if procs[name].Env["PORT"] == portStr {
-			return name
-		}
+	if name := procWithPort(procs, served, m.Client); name != "" {
+		return name
 	}
 	for _, name := range []string{"client", "frontend", "web", "ui", "app"} {
 		if _, ok := procs[name]; ok {
@@ -1088,6 +1192,30 @@ func procDir(dir, configDir string) string {
 
 // ─── .env file parser ─────────────────────────────────────────────────────────
 
+// envFile is one process's parsed env_file, or the error reading it.
+type envFile struct {
+	vars map[string]string
+	err  error
+}
+
+// readEnvFiles parses the env_file of every process that declares one.
+// Relative paths resolve from the config directory.
+func readEnvFiles(procs map[string]Process, configDir string) map[string]envFile {
+	out := make(map[string]envFile)
+	for name, proc := range procs {
+		if proc.EnvFile == "" {
+			continue
+		}
+		path := proc.EnvFile
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(configDir, path)
+		}
+		vars, err := parseEnvFile(path)
+		out[name] = envFile{vars: vars, err: err}
+	}
+	return out
+}
+
 func parseEnvFile(path string) (map[string]string, error) {
 	result := make(map[string]string)
 	f, err := os.Open(path)
@@ -1098,11 +1226,20 @@ func parseEnvFile(path string) (map[string]string, error) {
 
 	scanner := bufio.NewScanner(f)
 	// A 64 KiB token limit silently truncated long env values (base64
-	// secrets, certificates). Raise it to 1 MiB and report the scanner's
-	// error, so an unreadable line is a located error instead of a truncated
-	// environment.
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// secrets, certificates). A line may be up to maxEnvFileLine bytes, and a
+	// longer one is a located error instead of a truncated environment. The
+	// buffer has room for the longest line plus a "\r\n" terminator, so the
+	// limit is the same for every line ending; the length check enforces it.
+	scanner.Buffer(make([]byte, 0, 64*1024), maxEnvFileLine+2)
+	tooLong := func(lineNo int) error {
+		return fmt.Errorf("cannot read env file %s: line %d is longer than 1 MiB (%d bytes)", path, lineNo, maxEnvFileLine)
+	}
+	lineNo := 0
 	for scanner.Scan() {
+		lineNo++
+		if len(scanner.Bytes()) > maxEnvFileLine {
+			return nil, tooLong(lineNo)
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -1123,6 +1260,9 @@ func parseEnvFile(path string) (map[string]string, error) {
 		result[key] = val
 	}
 	if err := scanner.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			return nil, tooLong(lineNo + 1)
+		}
 		return nil, fmt.Errorf("cannot read env file %s: %w", path, err)
 	}
 	return result, nil

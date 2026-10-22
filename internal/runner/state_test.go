@@ -465,8 +465,13 @@ func TestReadinessWiring_StaleIncarnationCannotLatchNextCycle(t *testing.T) {
 func TestWaitForDependency_UnsettledAgainEndsTheWait(t *testing.T) {
 	r := &Runner{Output: io.Discard}
 	depSt := &procState{readyCycle: newReadyCycle(), state: "running"}
-	// The cycle ends without a verdict and no further cycle follows.
-	depSt.publishAgain()
+	// The cycle ends without a verdict and no further cycle follows. No run
+	// loop path settles a cycle this way any more — a stop during the restart
+	// backoff publishes the stopped verdict — so the rule is a guard, and the
+	// cycle is settled directly.
+	depSt.mu.Lock()
+	depSt.settleLocked(readyAgain)
+	depSt.mu.Unlock()
 
 	res := r.waitForDependency(context.Background(), procInfo{name: "app"}, "db", depSt, nil)
 	if res.verdict != readyStopped {
