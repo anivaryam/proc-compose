@@ -776,14 +776,69 @@ func TestExistingConfigWarnsOnAlwaysRestartWithoutCapAndMissingTunnel(t *testing
 }
 
 func TestProcessPortFallsBackToReadyWhen(t *testing.T) {
-	port := processPort(config.Process{
+	processes := map[string]config.Process{"web": {
 		Env: map[string]string{"PORT": "not-a-number"},
 		ReadyWhen: &config.ReadyWhen{
 			TCP: "localhost:3000",
 		},
-	})
+	}}
+	port, _ := processPort(config.ServedPorts(processes), "web", processes["web"])
 	if port != 3000 {
 		t.Fatalf("port = %d, want 3000", port)
+	}
+}
+
+// TestDuplicatePortReadsThePortLikeLoad pins that the duplicate-port check
+// reads each process's port the way Load matches merge upstreams: a ports.http
+// port and a ${ports.*} reference count, not only a literal env.PORT. Two
+// named ports that merely prefer the same port are not a duplicate, since the
+// session moves one of them; a named port and a fixed PORT, or two processes
+// started on the same named port, are.
+func TestDuplicatePortReadsThePortLikeLoad(t *testing.T) {
+	cases := []struct {
+		name, processes string
+		want            bool
+	}{
+		{"a named port and a fixed PORT", `  api:
+    cmd: go run .
+    ports:
+      http: 3000
+  web:
+    cmd: npm run dev
+    env:
+      PORT: "3000"
+`, true},
+		{"a reference to another process's named port", `  api:
+    cmd: go run .
+    ports:
+      http: 3000
+  web:
+    cmd: npm run dev
+    env:
+      PORT: "${ports.api.http}"
+`, true},
+		{"two named ports preferring one port", `  api:
+    cmd: go run .
+    ports:
+      http: 3000
+  web:
+    cmd: npm run dev
+    ports:
+      http: 3000
+`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, "proc-compose.yml"), "processes:\n"+tc.processes)
+			report, err := Run(Options{Root: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := hasFinding(report, codeDuplicatePort); got != tc.want {
+				t.Fatalf("duplicate_port reported = %v, want %v: %+v", got, tc.want, report.Findings)
+			}
+		})
 	}
 }
 

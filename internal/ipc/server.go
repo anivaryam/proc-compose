@@ -28,6 +28,11 @@ const maxCommandFrameBytes = 1 << 16
 // (per-process shutdown_timeout plus the final sweep).
 const runnerReplyTimeout = 30 * time.Second
 
+// snapshotWriteTimeout bounds the write of the snapshot every connection
+// starts with. A client that has not read it by then is served without it,
+// or dropped if part of it went out.
+const snapshotWriteTimeout = 5 * time.Second
+
 // stderrSink is where this package's warnings go. It is guarded by
 // stderrMu so that a test can capture the warnings without swapping
 // os.Stderr underneath a server goroutine that may be writing to it.
@@ -69,6 +74,20 @@ type serverClient struct {
 	closeOnce sync.Once
 	sendMu    sync.Mutex // guards send-channel close vs concurrent sends
 	closed    bool       // set under sendMu when send has been closed
+
+	// snapshotDone is closed once the snapshot write has finished. framed is
+	// set before it is closed: false when the write was cut short and the
+	// connection dropped, so a command read meanwhile must not be acted on.
+	snapshotDone chan struct{}
+	framed       bool
+}
+
+// awaitSnapshot blocks until the snapshot write has finished, and reports
+// whether the connection is still served. The write is bounded by
+// snapshotWriteTimeout, so the wait is too.
+func (c *serverClient) awaitSnapshot() bool {
+	<-c.snapshotDone
+	return c.framed
 }
 
 // NewServer creates a Server for the given socket path.
@@ -214,7 +233,7 @@ func (s *Server) accept() {
 }
 
 func (s *Server) handle(conn net.Conn) {
-	c := &serverClient{conn: conn, send: make(chan []byte, 64)}
+	c := &serverClient{conn: conn, send: make(chan []byte, 64), snapshotDone: make(chan struct{})}
 
 	// Snapshot: register client and capture current state atomically.
 	s.mu.Lock()
@@ -222,41 +241,61 @@ func (s *Server) handle(conn net.Conn) {
 	snap := s.snapshot()
 	s.mu.Unlock()
 
-	// Send snapshot as first message.
+	// The snapshot is written while commands are read. A client may write
+	// its command before it reads the snapshot, and on a transport that does
+	// not buffer (a Windows named pipe) neither write completes until the
+	// other side reads: writing the snapshot before reading anything held
+	// both until the snapshot's deadline. Commands are still acted on only
+	// once the snapshot is out, so the client reads the snapshot first, then
+	// events and acknowledgments.
+	go s.serveWrites(c, snap)
+
+	// Read commands from the client (monitors send nothing; CLI commands do).
+	s.readCommands(c)
+
+	s.drop(c)
+}
+
+// serveWrites writes the snapshot, releases the commands waiting on it, and
+// then runs the write loop, unless the snapshot write dropped the connection.
+func (s *Server) serveWrites(c *serverClient, snap Event) {
+	c.framed = s.writeSnapshot(c, snap)
+	close(c.snapshotDone)
+	if c.framed {
+		c.writeLoop()
+	}
+}
+
+// writeSnapshot writes snap as the first frame of the connection, and reports
+// whether the stream is still well framed.
+func (s *Server) writeSnapshot(c *serverClient, snap Event) bool {
 	data, err := json.Marshal(snap)
 	if err != nil {
 		warnf("WARN: failed to marshal snapshot: %v\n", err)
-	} else {
-		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		n, werr := conn.Write(append(data, '\n'))
-		conn.SetWriteDeadline(time.Time{})
-		switch {
-		case werr == nil:
-		case n > 0:
-			// Part of the snapshot is on the wire: the client would read
-			// everything after it as the tail of that broken line. Drop the
-			// connection rather than serve a stream it cannot parse.
-			warnf("WARN: failed to write snapshot to client after %d of %d bytes, dropping the connection: %v\n", n, len(data)+1, werr)
-			s.drop(c)
-			conn.Close() // the write loop that would close it never started
-			return
-		default:
-			// Nothing was written, so the stream is still well framed and the
-			// client is served without its snapshot. A client that writes its
-			// command before reading gets here on a pipe that does not buffer
-			// (a Windows named pipe): the write waits out its deadline, and
-			// the command still deserves its acknowledgment.
-			warnf("WARN: failed to write snapshot to client, serving it without one: %v\n", werr)
-		}
+		return true
 	}
-
-	// Start write loop.
-	go c.writeLoop()
-
-	// Read commands from the client (monitors send nothing; CLI commands do).
-	s.readCommands(conn)
-
-	s.drop(c)
+	c.conn.SetWriteDeadline(time.Now().Add(snapshotWriteTimeout))
+	n, werr := c.conn.Write(append(data, '\n'))
+	c.conn.SetWriteDeadline(time.Time{})
+	switch {
+	case werr == nil:
+		return true
+	case n > 0:
+		// Part of the snapshot is on the wire: the client would read
+		// everything after it as the tail of that broken line. Drop the
+		// connection rather than serve a stream it cannot parse; closing it
+		// also ends the read of its commands.
+		warnf("WARN: failed to write snapshot to client after %d of %d bytes, dropping the connection: %v\n", n, len(data)+1, werr)
+		s.drop(c)
+		c.conn.Close() // the write loop that would close it never starts
+		return false
+	default:
+		// Nothing was written, so the stream is still well framed and the
+		// client is served without its snapshot: it did not read for the
+		// whole deadline, or it has gone away.
+		warnf("WARN: failed to write snapshot to client, serving it without one: %v\n", werr)
+		return true
+	}
 }
 
 // drop unregisters c and closes its send channel.
@@ -267,7 +306,7 @@ func (s *Server) drop(c *serverClient) {
 	c.shutdown()
 }
 
-// readCommands reads newline-delimited command frames from conn until the
+// readCommands reads newline-delimited command frames from c until the
 // stream ends.
 //
 // A frame over maxCommandFrameBytes is discarded up to its newline and
@@ -276,17 +315,28 @@ func (s *Server) drop(c *serverClient) {
 // with it. bufio.Scanner cannot do this — once a line outgrows its buffer it
 // latches bufio.ErrTooLong and stops for good — so this reads with
 // bufio.Reader, whose ReadSlice reports a full buffer and can carry on.
-func (s *Server) readCommands(conn net.Conn) {
-	r := bufio.NewReaderSize(conn, maxCommandFrameBytes)
+//
+// Each frame is read in full before it waits for the snapshot write, so a
+// client blocked writing its command is released, and only then acted on.
+// If the snapshot write dropped the connection, no command read meanwhile
+// reaches the runner.
+func (s *Server) readCommands(c *serverClient) {
+	r := bufio.NewReaderSize(c.conn, maxCommandFrameBytes)
 	for {
 		frame, err := r.ReadSlice('\n')
 		if errors.Is(err, bufio.ErrBufferFull) {
 			err = discardLine(r)
-			s.rejectOversizedFrame(conn)
+			if !c.awaitSnapshot() {
+				return
+			}
+			s.rejectOversizedFrame(c.conn)
 		} else if len(frame) > 0 {
 			var ev Event
 			if json.Unmarshal(frame, &ev) == nil && ev.Type == TypeCommand && ev.Cmd != nil {
-				s.handleCommand(conn, ev.Cmd)
+				if !c.awaitSnapshot() {
+					return
+				}
+				s.handleCommand(c.conn, ev.Cmd)
 			}
 		}
 		if err != nil {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -13,7 +14,9 @@ import (
 var (
 	reVar    = regexp.MustCompile(`\$[a-zA-Z_][a-zA-Z0-9_]*|\$\{[^}]+\}`)
 	reCmdSub = regexp.MustCompile(`\$\([^)]+\)`)
-	reSleep  = regexp.MustCompile(`(?i)\bsleep\s+(\d+)\b`)
+	// reSleep matches a command that is sh's sleep with one argument: a number
+	// of seconds, which may have a fraction, as sh's sleep accepts it.
+	reSleep = regexp.MustCompile(`(?i)^(\s*)sleep\s+(\d+\.?\d*|\.\d+)(\s*)$`)
 )
 
 // shDoubleQuoteEscapes undoes the backslash escapes sh honours inside a
@@ -182,14 +185,7 @@ func isPlainShellText(s string) bool {
 }
 
 func translateToCMD(cmd string) string {
-	result := reSleep.ReplaceAllStringFunc(cmd, func(match string) string {
-		parts := reSleep.FindStringSubmatch(match)
-		if len(parts) > 1 {
-			return "timeout /t " + parts[1]
-		}
-		return match
-	})
-	result = reVar.ReplaceAllStringFunc(result, func(match string) string {
+	result := reVar.ReplaceAllStringFunc(cmd, func(match string) string {
 		varName := match[1:]
 		if len(varName) > 0 && varName[0] == '{' {
 			varName = varName[1 : len(varName)-1]
@@ -200,5 +196,78 @@ func translateToCMD(cmd string) string {
 		subCmd := match[2 : len(match)-1]
 		return "%(" + subCmd + ")%"
 	})
-	return result
+	// Last, so that the $VAR translation leaves the $PID a fractional sleep
+	// hands PowerShell alone.
+	return translateSleep(result)
+}
+
+// translateSleep rewrites each command of script that is sh's sleep into one
+// that waits as long under cmd. The commands are the text between cmd's
+// operators &, | and the parentheses, outside double quotes and not escaped with
+// ^, so a sleep that is only text, as in echo sleep 5, is left alone. So is a
+// sleep with any other argument, or with more than one: cmd then runs it as
+// written, and fails unless a sleep program is on PATH, much as sh's sleep fails
+// on an argument it cannot read.
+func translateSleep(script string) string {
+	var b strings.Builder
+	start, quoted := 0, false
+	for i := 0; i < len(script); i++ {
+		switch c := script[i]; {
+		case c == '"':
+			quoted = !quoted
+		case quoted:
+			// Inside double quotes the operators and ^ are text.
+		case c == '^':
+			i++
+		case c == '&' || c == '|' || c == '(' || c == ')':
+			b.WriteString(sleepCommand(script[start:i]))
+			b.WriteByte(c)
+			start = i + 1
+		}
+	}
+	return b.String() + sleepCommand(script[start:])
+}
+
+// sleepCommand returns the cmd command that waits as long as command when
+// command is sh's sleep, and command unchanged otherwise.
+//
+// timeout /t cannot stand in for sleep: it refuses to run unless its input is a
+// console, and a managed process's input is not one. ping sends its echo
+// requests a second apart, so n+1 of them to the loopback address take n
+// seconds. cmd has no finer wait, so a fraction of a second runs PowerShell's
+// Start-Sleep, for this one command only. PowerShell takes a few hundred
+// milliseconds to start, so it sleeps for what is left of the time counted from
+// its own start.
+func sleepCommand(command string) string {
+	m := reSleep.FindStringSubmatch(command)
+	if m == nil {
+		return command
+	}
+	ms, ok := sleepMillis(m[2])
+	if !ok {
+		return command
+	}
+	wait := "ping -n " + strconv.FormatUint(ms/1000+1, 10) + " 127.0.0.1 >nul"
+	if ms%1000 != 0 {
+		wait = `powershell -NoProfile -NonInteractive -Command "Start-Sleep -Milliseconds ([Math]::Max(0, ` +
+			strconv.FormatUint(ms, 10) + ` - ((Get-Date) - (Get-Process -Id $PID).StartTime).TotalMilliseconds))"`
+	}
+	return m[1] + wait + m[3]
+}
+
+// sleepMillis returns seconds, a decimal number, in milliseconds, rounded up so
+// that the wait is never shorter than sh's. It reports false for a number too
+// large to count.
+func sleepMillis(seconds string) (uint64, bool) {
+	whole, fraction, _ := strings.Cut(seconds, ".")
+	fraction += "000"
+	// At most 63 bits, so that rounding up cannot overflow.
+	ms, err := strconv.ParseUint(whole+fraction[:3], 10, 63)
+	if err != nil {
+		return 0, false
+	}
+	if strings.Trim(fraction[3:], "0") != "" {
+		ms++
+	}
+	return ms, true
 }

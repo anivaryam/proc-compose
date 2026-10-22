@@ -116,7 +116,9 @@ combinations below. `precedence` names the rule that decided `status` and
 | `completed` | `interrupted` | 130 | `interruption` | The attempt was interrupted; this wins over any failure. Cleanup still ran. |
 
 A refusal before the session is acquired (exit 2: usage, invalid config,
-occupied session) creates no receipt; its `--json` response has
+occupied session, or `resource_unavailable` — a resource or a held port such
+as the merge port that another session or program has taken) creates no
+receipt; its `--json` response has
 `status: failed` and `precedence: pre_acquisition_failure`. Receipts written
 by earlier releases while an attempt ran say `status: failed` with
 `exit_code: 0` and an empty `precedence`; they are still read. A receipt

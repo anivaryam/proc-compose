@@ -576,25 +576,161 @@ func TestCommand_WaitFlushedWithoutAServer(t *testing.T) {
 
 // snapshotWriteFailure fails its first write — the snapshot — the way a
 // write that runs into its deadline does, reporting written bytes as sent.
-// Later writes go through.
+// When release is set, that write first waits for it to be closed. Later
+// writes go through.
 type snapshotWriteFailure struct {
 	net.Conn
 	written int
+	release chan struct{}
 	failed  atomic.Bool
 }
 
 func (c *snapshotWriteFailure) Write(b []byte) (int, error) {
 	if c.failed.CompareAndSwap(false, true) {
+		if c.release != nil {
+			<-c.release
+		}
 		return c.written, os.ErrDeadlineExceeded
 	}
 	return c.Conn.Write(b)
+}
+
+// TestServer_AnswersACommandWrittenBeforeTheSnapshotIsRead is the regression
+// for the Windows named-pipe stall. Every CLI command wrote its command
+// before reading the snapshot. The server wrote the snapshot before reading
+// anything, and a named pipe does not buffer, so the two writes waited on
+// each other until the snapshot's 5s deadline: restart and reload were
+// answered 5s late, and stop, whose send budget is 2s, could not send the
+// shutdown at all.
+//
+// The 1 MiB snapshot here is larger than the transports' buffers. A plain
+// command reproduces the stall on Windows; on a Unix socket, which buffers
+// it, the frame must outgrow the buffer too, which the oversized frame does.
+// Both are answered well within the snapshot's deadline, and the snapshot is
+// still the first frame the client reads.
+func TestServer_AnswersACommandWrittenBeforeTheSnapshotIsRead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		frame   []byte
+		wantAck string
+	}{
+		{"command", commandFrame(256), "ok"},
+		{"oversized-frame", commandFrame(16 * maxCommandFrameBytes), "error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer(testSocketPath(t, "pc-write-first-"+tc.name))
+			lastError := strings.Repeat("x", 1<<20)
+			s.SetState(ProcState{Name: "api", State: "failed", LastError: lastError})
+			if err := s.Listen(); err != nil {
+				t.Fatalf("Listen: %v", err)
+			}
+			defer s.Shutdown()
+			defer swapStderrSink(io.Discard)()
+
+			commands := make(chan Command, 1)
+			stopRunner := make(chan struct{})
+			defer close(stopRunner)
+			go func() {
+				select {
+				case cmd := <-s.cmdCh:
+					commands <- cmd
+					cmd.Reply <- CommandResult{Status: "ok"}
+				case <-stopRunner:
+				}
+			}()
+
+			c, err := Dial(s.socketPath)
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			defer c.Close()
+
+			// Well within the snapshot's deadline, which is what the stall
+			// waited out.
+			const bound = snapshotWriteTimeout / 2
+			start := time.Now()
+			if err := c.conn.SetWriteDeadline(start.Add(bound)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.conn.Write(tc.frame); err != nil {
+				t.Fatalf("writing the command before reading the snapshot: %v (the server was not reading while it wrote the snapshot)", err)
+			}
+			ev, err := c.RecvTimeout(bound)
+			if err != nil {
+				t.Fatalf("snapshot: %v", err)
+			}
+			if ev.Type != TypeSnapshot || len(ev.Processes) != 1 || ev.Processes[0].LastError != lastError {
+				t.Fatalf("first event = %q with %d processes, want the whole snapshot", ev.Type, len(ev.Processes))
+			}
+			ev, err = c.RecvTimeout(bound)
+			if err != nil {
+				t.Fatalf("ack: %v", err)
+			}
+			if ev.Type != TypeAck || ev.Ack != tc.wantAck {
+				t.Fatalf("event after the snapshot = %+v, want the %q acknowledgment", ev, tc.wantAck)
+			}
+			if elapsed := time.Since(start); elapsed > bound {
+				t.Fatalf("answered after %s, want within %s", elapsed, bound)
+			}
+			if tc.wantAck == "ok" {
+				select {
+				case cmd := <-commands:
+					if cmd.Action != "restart" {
+						t.Fatalf("runner received %+v, want the restart", cmd)
+					}
+				default:
+					t.Fatal("the command was acknowledged without reaching the runner")
+				}
+			}
+		})
+	}
+}
+
+// TestServer_IgnoresCommandsReadBeforeTheSnapshotWasCutShort pins the other
+// side of reading commands while the snapshot is written: a command read
+// before the snapshot write failed partway is not acted on. The connection is
+// dropped for the broken frame, so its acknowledgment could never arrive.
+func TestServer_IgnoresCommandsReadBeforeTheSnapshotWasCutShort(t *testing.T) {
+	s := NewServer("unused")
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+
+	restore := swapStderrSink(io.Discard)
+	defer restore()
+
+	release := make(chan struct{})
+	handled := make(chan struct{})
+	go func() {
+		s.handle(&snapshotWriteFailure{Conn: serverSide, written: 10, release: release})
+		close(handled)
+	}()
+
+	// net.Pipe does not buffer: the write completes only once the server has
+	// read the frame, while its snapshot write is still held.
+	if err := clientSide.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientSide.Write(commandFrame(64)); err != nil {
+		t.Fatalf("the server did not read the command while it wrote the snapshot: %v", err)
+	}
+	close(release)
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server kept serving a client whose snapshot was cut short")
+	}
+	select {
+	case cmd := <-s.cmdCh:
+		t.Fatalf("command %+v from a dropped connection reached the runner", cmd)
+	default:
+	}
 }
 
 // TestServer_DropsAClientWhoseSnapshotWasCutShort pins the snapshot half of
 // #31 when part of the snapshot was written. The write error used to be
 // discarded and the client served on, although everything after the broken
 // line would be read as its tail. The server now reports the failure,
-// unregisters the client and closes the connection without reading from it.
+// unregisters the client and closes the connection.
 func TestServer_DropsAClientWhoseSnapshotWasCutShort(t *testing.T) {
 	s := NewServer("unused")
 	clientSide, serverSide := net.Pipe()
@@ -634,10 +770,10 @@ func TestServer_DropsAClientWhoseSnapshotWasCutShort(t *testing.T) {
 }
 
 // TestServer_ServesAClientWhoseSnapshotWasNotWritten pins the other snapshot
-// failure: nothing was written, so the stream is still well framed. That is
-// what a Windows named pipe does to a client that writes its command before
-// reading — the snapshot write waits out its deadline — and that client must
-// still get its acknowledgment. The failure is reported instead of discarded.
+// failure: nothing was written, so the stream is still well framed. A client
+// that read nothing for the snapshot's whole deadline gets here, and its
+// command must still get its acknowledgment. The failure is reported instead
+// of discarded.
 func TestServer_ServesAClientWhoseSnapshotWasNotWritten(t *testing.T) {
 	s := NewServer("unused")
 	clientSide, serverSide := net.Pipe()

@@ -170,21 +170,23 @@ func managedMergeUpstreamPorts(cfg *config.Config) []mergePortRole {
 	return checks
 }
 
+// processPorts maps each port a managed service binds at a number the config
+// fixes to the services that bind it. A service's port is the PORT it is
+// started with, read the way Load matches merge upstreams
+// (config.ServedPorts); only a service can be an upstream. A PORT the session
+// assigns from a named port is left out: the session holds that port from
+// Acquire and never moves a merge upstream's, so a busy one refuses the start
+// there, for up and verify alike.
 func processPorts(processes map[string]config.Process) map[int][]string {
 	out := make(map[int][]string)
-	for name, proc := range processes {
-		if name == "merge-port" {
+	for name, served := range config.ServedPorts(processes) {
+		if name == config.MergePortProcessName || processes[name].EffectiveMode() != config.ProcessModeService {
 			continue
 		}
-		value := ""
-		if proc.Env != nil {
-			value = proc.Env["PORT"]
-		}
-		port, err := strconv.Atoi(strings.TrimSpace(value))
-		if err != nil || port <= 0 {
+		if served.Port <= 0 || len(served.Named) > 0 {
 			continue
 		}
-		out[port] = append(out[port], name)
+		out[served.Port] = append(out[served.Port], name)
 	}
 	return out
 }
@@ -470,6 +472,22 @@ func requestShutdown(socketPath string, force bool, deadline time.Time) stopResu
 	// unusable, so the caller must not keep reading it.
 	defer client.Close()
 
+	// Read the snapshot the daemon writes first before sending, under the
+	// same cap as the write. An older daemon reads nothing until it is out,
+	// and a Windows named pipe does not buffer, so a request sent first would
+	// wait for it past its budget. No daemon acts on a command before its
+	// snapshot is out, so one that sends none in time could not have been
+	// asked either.
+	readBy := remainingUntil(deadline, connectBudget)
+	if readBy <= 0 {
+		return stopResult{outcome: stopUnavailable,
+			detail: "no time left in the stop budget to read the daemon's state"}
+	}
+	if _, err := client.RecvTimeout(readBy); err != nil {
+		return stopResult{outcome: stopUnavailable,
+			detail: fmt.Sprintf("daemon did not send its state on connect (%v)", err)}
+	}
+
 	// The write shares the overall deadline. Without this a wedged daemon whose
 	// receive buffer is full would block the request past --timeout.
 	//
@@ -708,10 +726,12 @@ func remainingUntil(deadline time.Time, cap time.Duration) time.Duration {
 }
 
 // waitProcessGone polls until pid is no longer running or timeout elapses.
+// An exited process counts as gone even while a handle (stop's own, on
+// Windows) or a missing reap keeps it visible.
 func waitProcessGone(pid int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
-		if !daemon.IsAlive(pid) {
+		if !daemon.IsRunning(pid) {
 			return true
 		}
 		if !time.Now().Before(deadline) {

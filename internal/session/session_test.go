@@ -274,6 +274,210 @@ func TestAcquire_MergePortIsLeasedButNotAllocated(t *testing.T) {
 	}
 }
 
+// loadMergeConfig writes body as a config file and loads it, so the merge
+// wiring the session reads is the one Load generates.
+func loadMergeConfig(t *testing.T, body string) (*config.Config, string) {
+	t.Helper()
+	t.Setenv("PORT", "")
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg, path
+}
+
+// TestAcquire_MergePortIsHeldUntilTheProxyStarts pins that the merge port is
+// held bound from Acquire until the proxy is about to start, like a named
+// port, so no other program can take it in between: only the proxy's release
+// frees it, after which a separate process binds it, on the loopback and the
+// wildcard address. A reload that keeps the merge port does not try to bind
+// it again, so it resolves while the proxy holds the port.
+func TestAcquire_MergePortIsHeldUntilTheProxyStarts(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	port := freePortPair(t)
+	cfg, path := loadMergeConfig(t, fmt.Sprintf("merge:\n  client: 3000\n  server: 3001\n  port: %d\nprocesses:\n  api:\n    cmd: serve\n", port))
+	plan, err := Acquire(cfg, path, "merge-held", "held", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer plan.Close()
+	if bindable(port) {
+		t.Fatalf("merge port %d was bindable by another program after Acquire", port)
+	}
+	plan.ReleasePorts("api")
+	if bindable(port) {
+		t.Fatalf("merge port %d was released by a process other than the proxy", port)
+	}
+	plan.ReleasePorts(config.MergePortProcessName)
+
+	// The proxy, a separate process, binds the port once it is released.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSessionPortHelper$", "--", "--session-port-helper", strconv.Itoa(port))
+	input, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var bound [1]byte
+	_, readErr := io.ReadFull(output, bound[:])
+	input.Close()
+	waitErr := child.Wait()
+	if readErr != nil || bound[0] != 'R' || waitErr != nil {
+		t.Fatalf("the proxy could not bind the merge port %d after its release (reply %q, read %v, exit %v)", port, bound[0], readErr, waitErr)
+	}
+	wildcard, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+	if err != nil {
+		t.Fatalf("the merge port %d cannot be bound on the wildcard address after its release: %v", port, err)
+	}
+	wildcard.Close()
+
+	// Reload while the proxy listens: the merge port is not bound again.
+	// (On Windows a wildcard listener does not exclude a loopback bind, so
+	// the proxy listens on the loopback address here.)
+	proxy, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+	if _, err := plan.Resolve(cfg); err != nil {
+		t.Fatalf("a reload that keeps the merge port was refused while the proxy holds it: %v", err)
+	}
+	plan.ReleasePorts(config.MergePortProcessName)
+	if bindable(port) {
+		t.Fatalf("merge port %d became bindable while the proxy listens", port)
+	}
+}
+
+// TestAcquire_BusyMergePortRefusesTheStart pins that a merge port another
+// program has bound refuses the start at Acquire, naming the port, instead of
+// leaving the proxy to fail to bind. It is a resource *LeaseError, so verify
+// reports it as resource_unavailable rather than as an invalid config, and
+// nothing stays leased.
+func TestAcquire_BusyMergePortRefusesTheStart(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	foreign, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer foreign.Close()
+	port := foreign.Addr().(*net.TCPAddr).Port
+	cfg, path := loadMergeConfig(t, fmt.Sprintf("merge:\n  client: 3000\n  server: 3001\n  port: %d\nprocesses:\n  api:\n    cmd: serve\n", port))
+	plan, err := Acquire(cfg, path, "merge-busy", "busy", nil)
+	if err == nil {
+		plan.Close()
+		t.Fatalf("Acquire started with the merge port %d bound by another program", port)
+	}
+	var lease *LeaseError
+	if !errors.As(err, &lease) || lease.Instance() || !lease.Bound || lease.Label != "tcp:127.0.0.1:"+strconv.Itoa(port) {
+		t.Fatalf("error = %#v, want a bound resource *LeaseError for tcp:127.0.0.1:%d", err, port)
+	}
+	for _, want := range []string{fmt.Sprintf("merge.port %d", port), "in use by another program"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want it to contain %q", err, want)
+		}
+	}
+	// The refused start released its leases: once the port is free, a
+	// start succeeds.
+	foreign.Close()
+	retry, err := Acquire(cfg, path, "merge-busy", "busy", nil)
+	if err != nil {
+		t.Fatalf("Acquire after the merge port was freed: %v", err)
+	}
+	retry.Close()
+}
+
+// TestAcquire_MergeUpstreamPortIsNeverMoved pins that a named port a merge
+// upstream is started on is assigned its preferred port or refuses the start.
+// The proxy and the upstream's injected readiness probe target the merge
+// port, so moving the port would leave the upstream listening where nothing
+// looks while the probe and the proxy reach whatever holds the merge port. The
+// upstream's port is assigned before a port that merely prefers the same
+// number, which is the one moved.
+func TestAcquire_MergeUpstreamPortIsNeverMoved(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	client, server, mergePort := freePortPair(t), freePortPair(t), freePortPair(t)
+	cases := []struct {
+		name, process, upstream, portName string
+		processes                         string
+	}{
+		{"ports.http", "web", "web", "http", fmt.Sprintf("  web:\n    cmd: serve\n    ports:\n      http: %d\n", client)},
+		{"a reference to another process's port", "other", "site", "app", fmt.Sprintf(
+			"  site:\n    cmd: serve\n    env:\n      PORT: \"${ports.other.app}\"\n  other:\n    cmd: sleep 60\n    ports:\n      app: %d\n", client)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// "aaa" sorts first and prefers the upstream's port under a name
+			// the merge wiring does not match.
+			cfg, path := loadMergeConfig(t, fmt.Sprintf("merge:\n  client: %d\n  server: %d\n  port: %d\nprocesses:\n  aaa:\n    cmd: serve\n    ports:\n      debug: %d\n%s",
+				client, server, mergePort, client, tc.processes))
+			if rw := cfg.Processes[tc.upstream].ReadyWhen; rw == nil || rw.TCP != fmt.Sprintf("localhost:%d", client) {
+				t.Fatalf("%s ready_when = %+v, want the merge client port %d", tc.upstream, rw, client)
+			}
+			plan, err := Acquire(cfg, path, "upstream-free", "free", nil)
+			if err != nil {
+				t.Fatalf("Acquire: %v", err)
+			}
+			if got := plan.Project.Ports[tc.process][tc.portName]; got != client {
+				t.Fatalf("%s.%s = %d, want the merge client port %d", tc.process, tc.portName, got, client)
+			}
+			if got := plan.Config.Processes[tc.upstream].Env["PORT"]; got != strconv.Itoa(client) {
+				t.Fatalf("%s PORT = %q, want %d", tc.upstream, got, client)
+			}
+			if got := plan.Project.Ports["aaa"]["debug"]; got != client+1 {
+				t.Fatalf("aaa.debug = %d, want %d (moved off the upstream's port)", got, client+1)
+			}
+			plan.Close()
+
+			foreign, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(client))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer foreign.Close()
+			plan, err = Acquire(cfg, path, "upstream-busy", "busy", nil)
+			if err == nil {
+				moved := plan.Project.Ports[tc.process][tc.portName]
+				plan.Close()
+				t.Fatalf("Acquire moved the merge upstream's port %d to %d", client, moved)
+			}
+			var lease *LeaseError
+			if !errors.As(err, &lease) || lease.Instance() || !lease.Bound {
+				t.Fatalf("error = %#v, want a bound resource *LeaseError", err)
+			}
+			for _, want := range []string{tc.process + "." + tc.portName, strconv.Itoa(client), "never moved"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+
+	// An upstream port that is the merge port itself is a configuration
+	// error, not another owner: no *LeaseError, so verify does not report a
+	// resource as unavailable.
+	cfg, path := loadMergeConfig(t, fmt.Sprintf("merge:\n  client: %d\n  server: %d\n  port: %d\nprocesses:\n  web:\n    cmd: serve\n    ports:\n      http: %d\n",
+		mergePort, server, mergePort, mergePort))
+	plan, err := Acquire(cfg, path, "upstream-is-merge", "self", nil)
+	if err == nil {
+		plan.Close()
+		t.Fatal("Acquire assigned the merge port to an upstream too")
+	}
+	var lease *LeaseError
+	if errors.As(err, &lease) || !strings.Contains(err.Error(), "already held by this session") {
+		t.Fatalf("error = %#v, want a plain error saying the session already holds the port", err)
+	}
+}
+
 // TestAcquire_RefusesAnInvalidFilter pins that the filter is validated before
 // anything is leased: an unknown name and a teardown name are refused, no
 // lease is left behind, and a valid filter still resolves as before.

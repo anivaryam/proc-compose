@@ -596,32 +596,46 @@ known when the config is loaded — none is declared, `ports.http` is `0`
 (ephemeral), or a reference only the session resolves — is still probed at the
 merge port: the documented guess.
 
+A named port an upstream is started on — its `ports.http`, or the port its
+`PORT` references — is assigned exactly its preferred port, which is the merge
+port: the session never moves it, because the proxy and the injected readiness
+probe would still target the merge port while the upstream listened elsewhere.
+If that port is busy when the session starts, the start is refused and names
+the port (`web.http: port 5173 is a merge upstream's port, which is never moved:
+…`); `verify` reports it as `resource_unavailable`. Another named port that
+merely prefers the same number is assigned after it, so it is the one moved.
+
 The proxy is injected under the reserved process name `merge-port`. A config
 that defines a process with that name **and** a `merge:` section is refused
 (`reserved_process_name`); without a `merge:` section nothing generates a
 proxy, so the name is free.
 
-Before starting, proc-compose always checks that the merge-port proxy output port (`merge.port`, or `$PORT`/`8080`) is free. It also checks upstream ports owned by managed processes — ownership is determined by a process `env.PORT` matching `merge.client`, `merge.server`, or a `merge.routes` target port. Managed upstream ports must be free because proc-compose is about to start those processes. Upstream ports with no matching managed process are treated as external services and may already be listening; proc-compose does not reject those occupied external targets.
+Before starting, `up` checks that the merge-port proxy output port (`merge.port`, or `$PORT`/`8080`) is free. It also checks upstream ports owned by managed services — a service owns a port when the `PORT` it is started with, read as above, is a number written in the config (its `env.PORT` or its `env_file` `PORT`) that matches `merge.client`, `merge.server`, or a `merge.routes` target port. Managed upstream ports must be free because proc-compose is about to start those processes. A `PORT` the session assigns from a named port (`ports.http` or a `${ports.*}` reference) is not checked here: the session holds that port from the start and refuses a busy upstream port itself, as described above. A task or teardown process is never an upstream, so a `PORT` in its env does not make a port managed. Upstream ports with no matching managed process are treated as external services and may already be listening; proc-compose does not reject those occupied external targets.
 
-The merge port is **leased** for the session's lifetime, like a named port: a
+The merge port is **leased and held** for the session, like a named port: a
 second proc-compose session that declares the same merge port is refused at
-startup (`resource "tcp:127.0.0.1:8080" is owned by another session`) instead
-of failing later, when the proxy cannot bind. The lease is taken only when the
+startup (`resource "tcp:127.0.0.1:8080" is owned by another session`), and so
+is a merge port another program has bound (`merge.port 8080: resource
+"tcp:127.0.0.1:8080" is in use by another program: …`), instead of failing
+later, when the proxy cannot bind. The session keeps the port bound on
+`127.0.0.1` from the start until right before `merge-port` is first launched,
+so no other program can take it while the upstreams start; the remaining
+window is the proxy's launch itself, and on Windows the hold does not stop a
+program that binds the wildcard address. The port is taken only when the
 proxy is part of the selected process set: a filtered start that does not
-select `merge-port` never binds the port, so it does not hold the lease and
-does not refuse another session that would bind it. Unlike a named port, which
-the session keeps bound until its process is launched, the merge port is only
-leased: the lease excludes **other proc-compose sessions only** — a third-party
-program can still take the port between the check and the proxy's bind, and
-`up --silent` checks the port in the parent process before the daemon child
-takes the lease. `verify` runs no port check of its own, so the lease is what
-keeps it from colliding with another session; a collision there is reported as
-`resource_unavailable`. The merge port is never reallocated and never reported
-as a named port: a managed process that prefers the same port is moved to the
-next free port. A reload that changes `merge.port` is refused (`merge port
-changed; restart the session`), as a change to the resources or named ports
-is; a reload that removes the `merge:` section leaves the running proxy and its
-lease alone.
+select `merge-port` never binds the port, so it neither leases nor holds it
+and does not refuse another session that would bind it. `up` checks the port
+before the session takes it, so the session's own hold is never reported as in
+use; `up --silent` checks it in the parent process, before the daemon child
+takes it. `verify` runs no port check of its own: the lease and the hold are
+what keep it from colliding with another session or program, and a collision
+there is reported as `resource_unavailable`. The merge port is never
+reallocated and never reported as a named port: a managed process that prefers
+the same port is moved to the next free port. A reload that changes
+`merge.port` is refused (`merge port changed; restart the session`), as a
+change to the resources or named ports is; a reload that keeps it does not
+bind it again, and a reload that removes the `merge:` section leaves the
+running proxy and its lease alone.
 
 ### Client API URL auto-injection
 

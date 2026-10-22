@@ -841,6 +841,25 @@ func TestRun_PreAcquisitionFailuresAreStructuredWithoutReceipts(t *testing.T) {
 	}
 }
 
+// TestRun_BusyMergePortIsResourceUnavailable pins that a merge port another
+// program has bound is refused at acquisition, where the session holds it,
+// instead of surfacing as a startup timeout once the proxy cannot bind.
+func TestRun_BusyMergePortIsResourceUnavailable(t *testing.T) {
+	foreign, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer foreign.Close()
+	port := foreign.Addr().(*net.TCPAddr).Port
+	t.Setenv("PORT", "")
+	f := newFixture(t, fmt.Sprintf("merge:\n  client: 3000\n  server: 3001\n  port: %d\nprocesses:\n  api:\n    cmd: sleep 60\n", port))
+	result := Run(context.Background(), f.options(t, "mergebusy", "true"))
+	assertComplete(t, result)
+	if result.ExitCode != ExitUsage || result.Phase != PhaseAcquiring || len(result.Errors) == 0 || result.Errors[0].Code != CodeResourceUnavailable {
+		t.Fatalf("busy merge port = exit %d phase %s errors %+v, want resource_unavailable at acquisition", result.ExitCode, result.Phase, result.Errors)
+	}
+}
+
 func TestRun_OccupiedSessionIsRefusedWithoutMutation(t *testing.T) {
 	f := newFixture(t, serviceConfig)
 	opts := f.options(t, "busy", "true")

@@ -691,11 +691,17 @@ Flag-parsing errors remain plain text and exit 1.`,
 			}
 			defer client.Close()
 
+			// Read the snapshot the daemon writes first before sending. An
+			// older daemon reads nothing until it is out, and a Windows named
+			// pipe does not buffer, so a command sent first would wait for it.
+			if _, err := client.Recv(); err != nil {
+				return fmt.Errorf("no response from daemon: %w", err)
+			}
 			if err := client.Send(ipc.Command{Action: "restart", Process: args[0]}); err != nil {
 				return fmt.Errorf("failed to send restart command: %w", err)
 			}
 
-			// Read events until we get an ack (skip snapshot and any state/log events).
+			// Read events until we get an ack (skip any state/log events).
 			for {
 				ev, err := client.Recv()
 				if err != nil {
@@ -770,6 +776,10 @@ plain text and exit 1.`,
 			}
 			defer client.Close()
 
+			// Read the snapshot first, as restart does.
+			if _, err := client.Recv(); err != nil {
+				return fmt.Errorf("no response from daemon: %w", err)
+			}
 			if err := client.Send(ipc.Command{Action: "reload"}); err != nil {
 				return fmt.Errorf("failed to send reload command: %w", err)
 			}

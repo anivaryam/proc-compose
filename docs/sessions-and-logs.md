@@ -14,7 +14,10 @@ proc-compose --session feature stop
 
 Declare preferred named ports and use references wherever their resolved values
 are needed. A preferred value of `0` requests an ephemeral port; an occupied
-preferred port advances to the next available candidate. `http` ports export
+preferred port advances to the next available candidate, except the named port
+a [merge upstream](configuration.md#startup-ordering-and-readiness) is started
+on: the merge wiring targets its preferred port, so an occupied one refuses
+the start instead of moving. `http` ports export
 `PORT` when no explicit `PORT` environment entry exists. Endpoint references are
 resolved consistently in commands, environment values, and readiness URLs:
 
@@ -77,7 +80,9 @@ sessions. The session also keeps each assigned port bound on `127.0.0.1` from
 assignment until right before the first process that declares it or references
 it (`${ports.*}` or `${urls.*}` in its `cmd`, `env`, `dir` or probes) is
 launched, or until the session ends if no such process starts, so another
-program cannot take it while the stack starts. An unrelated program can still
+program cannot take it while the stack starts. The [merge
+port](configuration.md#startup-ordering-and-readiness) is held the same way
+until right before `merge-port` is launched. An unrelated program can still
 race the application's bind between that release and the bind itself, and on
 Windows the hold does not stop a program that binds the wildcard address; the
 bind must succeed and pass its configured readiness check. On Linux and Windows,

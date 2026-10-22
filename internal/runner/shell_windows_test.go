@@ -19,7 +19,8 @@ import (
 // TestShellExec: a configured command, the script cmd /c runs for it, and what
 // running that script prints on Windows — or, when file is set, the bytes it
 // writes to that file. A case with fails set is malformed, and cmd reports it on
-// stderr with a non-zero exit.
+// stderr with a non-zero exit. A case with wait set takes at least that long to
+// run, and at most sleepSlack longer.
 //
 // TestShellExec runs the commands with PORT=3000, DB_HOST=db and HOME=C:\home,
 // and with %ARGV% expanding to a program that prints each argument it receives
@@ -31,6 +32,7 @@ var shellCases = []struct {
 	out    string
 	file   string
 	fails  bool
+	wait   time.Duration
 }{
 	{name: "plain command uses cmd", cmd: "echo hello", script: "echo hello", out: "hello\r\n"},
 	{name: "cmd env syntax is native", cmd: "echo %PORT%", script: "echo %PORT%", out: "3000\r\n"},
@@ -83,7 +85,37 @@ var shellCases = []struct {
 	{name: "sh -c keeps single quotes around a dollar sign", cmd: `sh -c "echo '\$PORT'"`, script: "echo '%PORT%'", out: "'3000'\r\n"},
 	{name: "sh -c with mismatched outer quotes is untouched", cmd: `sh -c "echo 'x'`, script: `"echo 'x'`, fails: true},
 	{name: "sh -c with a single quote byte is untouched", cmd: `sh -c "`, script: `"`, fails: true},
+
+	// sleep is translated wherever cmd runs it as a command. timeout /t needs a
+	// console as its input, which a managed process does not have, so whole
+	// seconds are waited with ping and a fraction with PowerShell's Start-Sleep.
+	{name: "sleep waits whole seconds", cmd: "sleep 1", script: "ping -n 2 127.0.0.1 >nul", wait: time.Second},
+	{name: "sleep waits a fraction of a second", cmd: "sleep 1.5", script: fractionalSleep("1500"), wait: 1500 * time.Millisecond},
+	{name: "sleep with a zero fraction waits whole seconds", cmd: "sleep 1.0", script: "ping -n 2 127.0.0.1 >nul", wait: time.Second},
+	{name: "sleep rounds a fraction up to whole milliseconds", cmd: "sleep 0.0001", script: fractionalSleep("1")},
+	{name: "sleep before another command", cmd: "sleep 1 && echo done", script: "ping -n 2 127.0.0.1 >nul && echo done", out: "done\r\n", wait: time.Second},
+	{name: "sleep between commands in sh -c", cmd: `sh -c 'echo a && sleep .5 && echo b'`, script: "echo a && " + fractionalSleep("500") + " && echo b", out: "a \r\nb\r\n", wait: 500 * time.Millisecond},
+	{name: "sleep in parentheses", cmd: "(sleep 1) && echo done", script: "(ping -n 2 127.0.0.1 >nul) && echo done", out: "done\r\n", wait: time.Second},
+	{name: "sleep as text is not translated", cmd: "echo sleep 1", script: "echo sleep 1", out: "sleep 1\r\n"},
+	// cmd has no ; operator, so this is one command whose argument sleep cannot
+	// read. It reaches cmd as written and fails, as does a number sh's sleep
+	// refuses.
+	{name: "sleep before a semicolon is not translated", cmd: "sleep 1; echo hi", script: "sleep 1; echo hi", fails: true},
+	{name: "sleep with an invalid number is not translated", cmd: "sleep 1.2.3", script: "sleep 1.2.3", fails: true},
 }
+
+// fractionalSleep is the script a sleep of ms milliseconds that are not whole
+// seconds becomes.
+func fractionalSleep(ms string) string {
+	return `powershell -NoProfile -NonInteractive -Command "Start-Sleep -Milliseconds ([Math]::Max(0, ` + ms +
+		` - ((Get-Date) - (Get-Process -Id $PID).StartTime).TotalMilliseconds))"`
+}
+
+// sleepSlack is how much longer than its wait a shellCases sleep may take. ping
+// and PowerShell start and exit around the wait, which takes under a tenth of a
+// second on an idle machine, but PowerShell can take seconds to start on a
+// cold or loaded one, and the other cases run in parallel.
+const sleepSlack = 3 * time.Second
 
 func TestShellTranslation(t *testing.T) {
 	for _, tt := range shellCases {
@@ -119,7 +151,15 @@ func TestShellExec(t *testing.T) {
 			cmd.Env = env
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			start := time.Now()
 			err := cmd.Run()
+			took := time.Since(start)
+			if tt.wait > 0 {
+				t.Logf("%q took %v", tt.cmd, took)
+				if took < tt.wait || took > tt.wait+sleepSlack {
+					t.Errorf("%q took %v; want %v to %v", tt.cmd, took, tt.wait, tt.wait+sleepSlack)
+				}
+			}
 			if tt.fails {
 				if err == nil {
 					t.Errorf("%q succeeded; want a non-zero exit", tt.cmd)

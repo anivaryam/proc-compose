@@ -26,6 +26,17 @@ func IsAlive(pid int) bool {
 	return proc.Signal(syscall.Signal(0)) == nil
 }
 
+// IsRunning is IsAlive without the exited processes it counts: a zombie still
+// answers signal 0. Off Linux, where no process state can be read, it is
+// IsAlive.
+func IsRunning(pid int) bool {
+	if !IsAlive(pid) {
+		return false
+	}
+	info, err := ProcStat(pid)
+	return err != nil || !ExitedState(info.State)
+}
+
 // StopProcess sends SIGTERM to the given process for graceful shutdown.
 func StopProcess(proc *os.Process) error {
 	return proc.Signal(syscall.SIGTERM)

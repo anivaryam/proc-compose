@@ -30,6 +30,8 @@ Shell commands in configs run under `cmd /s /c "<command>"`, and the command rea
 
 POSIX syntax such as `$VAR`, `$(...)`, `trap`, `export`, and shell loops is not promised to be portable. Existing `$VAR` translation (`$VAR` and `${VAR}` become `%VAR%`) is best-effort compatibility only; `$(...)` becomes `%(...)%`, which `cmd` prints as written. Windows-native commands may need backslashes. POSIX examples elsewhere in these docs are Linux/macOS examples unless labelled otherwise. The `init --template minimal` on Windows generates a PowerShell-based template.
 
+`sleep N` is translated wherever `cmd` runs it as a command: at the start of the command, or after `&&`, `||`, `&`, `|` or a parenthesis, so `sleep 2 && npm start` waits two seconds and then starts `npm`. `timeout /t` cannot stand in for it, because `timeout` refuses to run unless its input is a console, and a managed process's input is not one. A whole number of seconds becomes `ping -n N+1 127.0.0.1 >nul`, which waits N seconds. A fraction, such as `sleep 0.5` or `sleep .5`, runs PowerShell's `Start-Sleep` for that one command; the wait is timed from PowerShell's own start, so it lasts the time asked, or PowerShell's start-up time when that is longer, and the rest of the command still runs under `cmd`. On an idle machine, either wait ends within about a tenth of a second of the time asked. `cmd` has no `;` operator, so `sleep 1; npm start` is not translated: write `sleep 1 && npm start`. A `sleep` with any other argument — a unit such as `5s`, a variable, or more than one number — is not translated either, and `cmd` reports that `sleep` is not recognized unless a `sleep` program is on `PATH`.
+
 An `sh -c "..."` command is accepted as a best-effort compatibility shim. Its script argument first loses the quoting `sh` would remove: a single-quoted script is taken literally, and in a double-quoted one `\"`, `\\`, `\$` and `` \` `` become `"`, `\`, `$` and `` ` ``. A script with no outer quotes, an unmatched quote, or text after its closing quote is passed on as written. The quoted strings inside the script are then requoted for `cmd`, and the `$VAR` translation applies:
 
 - A quoted string made only of letters, digits and `-_./:=+` loses its quotes, as `sh` would remove them: `sh -c "echo 'x'"` prints `x`, and `sh -c "echo \"hello\""` prints `hello`.
@@ -45,6 +47,7 @@ Where `cmd` cannot express the `sh` meaning, the output differs from Linux and m
 | `sh -c "echo '\$PORT'"` | `$PORT` | `'3000'` |
 | `echo a && echo b` | `a` and `b` | `a ` (with the space before `&&`) and `b` |
 | `echo $(date)` | the date | `%(date)%` |
+| `sleep 1; echo hi` | `hi`, a second later | an error: `'sleep' is not recognized` (`cmd` has no `;`; use `&&`) |
 
 ## Other Unix platforms (FreeBSD, OpenBSD, NetBSD)
 

@@ -24,17 +24,21 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why --attempt latest --j
   after `--` runs directly, with no shell; write `-- sh -c '...'` for shell
   syntax. Budgets: `--startup-timeout` (default 120s), `--check-timeout`
   (10m), `--cleanup-timeout` (30s).
-- Exit codes: 0 passed; 1 failed; 2 nothing started (usage, invalid config, or
-  a session that is already running); 130 interrupted. On exit 2 with
-  `session_occupied`, choose another `--session`. Never stop a session you did
-  not start.
+- Exit codes: 0 passed; 1 failed; 2 nothing started (usage, invalid config, a
+  session that is already running, or a resource or fixed port in use);
+  130 interrupted. On exit 2 with `session_occupied`, choose another
+  `--session`. On exit 2 with `resource_unavailable`, another session holds a
+  `resources` label, or another session or program holds the merge port or a
+  merge upstream's named port (never moved); stderr names it. Never stop a
+  session you did not start.
 - After successful flag parsing, `--json` normal/semantic results are one bounded
   object. Read `status` (`passed`/`failed`/`interrupted`), then
   `startup.status`, `check.status`/`check.exit_code`, `cleanup.status`, and
   `errors` (`{code,count}`: `startup_timeout`, `startup_failed`,
   `check_exit_nonzero`, `check_timeout`, `required_process_failed`,
   `environment_ineligible`, `environment_unverified`, `cleanup_unverified`,
-  `receipt_persistence_failed`, `session_occupied`, `invalid_configuration`).
+  `receipt_persistence_failed`, `session_occupied`, `resource_unavailable`,
+  `invalid_configuration`).
   `check.stdout`/`stderr` hold up to 4 KiB each; `stdout_sha256`/`stderr_sha256`
   digest that captured prefix only, and `output_truncated` marks a stream that
   was cut off.
@@ -171,9 +175,10 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why api --json
   `foreign_listener: reject`, or, under verify, the server belongs to another
   live session; `status --json` `readiness_owner` (Linux, Windows) says whose,
   with its `scope`.
-- `ports: {http: 0}` requests an ephemeral port and sets `PORT`. Reference ports
-  as `${ports.api.http}` / `${urls.api.http}`; `${session.dir}` is the session
-  runtime root. A port name carries no dot (the reference name is
+- `ports: {http: 0}` requests an ephemeral port and sets `PORT`. A busy
+  preferred port moves to the next free one, except a merge upstream's named
+  port, which refuses the start. Reference ports as `${ports.api.http}` /
+  `${urls.api.http}`; `${session.dir}` is the session runtime root. A port name carries no dot (the reference name is
   `process.port`); a dot in a process name is fine. `resources` labels take
   exclusive leases; they are trimmed when the config is loaded, so whitespace
   variants name one resource. Databases, build outputs, and hardcoded ports

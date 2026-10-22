@@ -65,15 +65,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   literal path, a doubled or trailing separator and, on Windows, `/` for `\`
   are one resource. Any other label, including a path behind a prefix such as
   `next-build:`, is compared as written.
-- The merge proxy's port is leased for the session's lifetime. A second
+- The merge proxy's port is leased and held for the session. A second
   proc-compose session that declares the same merge port is refused at startup
-  (`resource "tcp:127.0.0.1:<port>" is owned by another session`) instead of
-  failing later, when the proxy cannot bind. The lease excludes other
-  proc-compose sessions only; the merge port is never reallocated and is never
-  reported as a named port. The lease is taken only when the proxy is part of
-  the selected process set: a filtered start that does not select
+  (`resource "tcp:127.0.0.1:<port>" is owned by another session`), and so is a
+  merge port another program has bound (`merge.port <port>: resource
+  "tcp:127.0.0.1:<port>" is in use by another program`), instead of failing
+  later, when the proxy cannot bind; `verify` reports either as
+  `resource_unavailable` instead of timing out. The session keeps the port
+  bound on `127.0.0.1` until right before `merge-port` is launched, so no
+  other program can take it while the upstreams start; on Windows the hold
+  does not stop a program that binds the wildcard address. The merge port is
+  never reallocated and is never reported as a named port, and a reload that
+  keeps it does not bind it again. The port is taken only when the proxy is
+  part of the selected process set: a filtered start that does not select
   `merge-port` never binds the port, so it no longer refuses a second session
   that would have bound it.
+- A named port a merge upstream is started on — its `ports.http`, or the port
+  its `PORT` references — is no longer moved when its preferred port is busy.
+  The proxy and the injected readiness probe target the merge port, so a moved
+  upstream listened where nothing looked while the probe and the proxy reached
+  whatever held the merge port. The start is now refused, naming the port
+  (`web.http: port 5173 is a merge upstream's port, which is never moved: …`),
+  and `verify` reports it as `resource_unavailable`. A named port that merely
+  prefers the same number is assigned after it and is the one moved.
+- The merge preflight of `up` and the `doctor` duplicate-port check read a
+  process's port the way the config loader matches merge upstreams: its
+  `env.PORT`, else its `env_file` `PORT`, else its `ports.http` port, with a
+  `${ports.<process>.<port>}` reference resolved to its preferred port. The
+  preflight checks only a service's port written as a number in the config: a
+  port the session assigns is held and checked by the session itself, and a
+  task or teardown process whose env names a merge port no longer makes that
+  port a managed upstream that must be free. `doctor` now reports a named port
+  that collides with a fixed `PORT` or with another process started on the
+  same named port, and not two named ports that only prefer the same number,
+  which the session moves apart.
 - The session metadata is written atomically, so `sessions` and `status` no
   longer briefly omit a session that is starting. The atomic replace always
   writes the file with mode `0600`, so an existing metadata file that had a
@@ -311,6 +336,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   miss a session or keep stale metadata during a save. proc-compose's readers
   allow the replace and the replace uses POSIX rename semantics; a reader
   outside proc-compose that blocks it is waited out for up to about 130 ms.
+- On Windows, `restart` and `reload` are answered at once instead of after 5
+  seconds, and `stop` can ask the daemon to shut down again. A named pipe does
+  not buffer, so the daemon's state snapshot and the command a client sent
+  before reading it waited on each other until the snapshot's deadline, and
+  `stop` gave up sending and killed the daemon without a verdict. The daemon
+  now reads commands while it writes the snapshot and answers them after it,
+  and `restart`, `reload` and `stop` read the snapshot before they send, so
+  they also work with daemons started by an older version.
+- On Windows, `stop` no longer reports that a daemon which delivered a clean
+  verdict is "still running 10s after its verdict" and exits 1. `stop` holds a
+  handle to the daemon, and an exited process stays openable while any handle
+  to it is open, so the wait for the daemon to exit never saw it go. The wait
+  now counts an exited process as gone, on Windows and for a zombie on Linux.
+- On Windows, `sleep N` in a command now waits N seconds. It was translated to
+  `timeout /t N`, which exits at once with "ERROR: Input redirection is not
+  supported", because a managed process's input is not a console. A whole
+  number of seconds now waits with `ping`, and a fraction such as `sleep 0.5`
+  with PowerShell's `Start-Sleep`, for that command only. Only a `sleep` that
+  `cmd` runs as a command is translated, so `echo sleep 5` prints `sleep 5`
+  instead of `timeout /t 5`. `cmd` has no `;` operator, so `sleep 1; npm
+  start` is not translated: write `sleep 1 && npm start`.
 
 ### Changed
 

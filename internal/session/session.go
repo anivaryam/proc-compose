@@ -32,15 +32,17 @@ type Plan struct {
 	preferred map[string]map[string]int
 	resources []string
 	names     []string
-	mergePort int // the merge proxy port the plan leases; 0 when it leases none
+	mergePort int // the merge proxy port the plan leases and holds; 0 when it leases none
 
 	// portsMu guards held and uses: the runner releases ports from its launch
 	// goroutines while a reload may resolve.
 	portsMu sync.Mutex
-	// held keeps each allocated port bound, by port number, until the first
-	// process that uses it is about to start (ReleasePorts) or the plan closes.
+	// held keeps each allocated port, and the merge port, bound by port
+	// number until the first process that uses it is about to start
+	// (ReleasePorts) or the plan closes.
 	held map[int]net.Listener
-	// uses lists, per process, the allocated ports it declares or references.
+	// uses lists, per process, the held ports it declares or references; the
+	// merge proxy uses the merge port.
 	uses map[string][]int
 }
 
@@ -101,19 +103,33 @@ func Acquire(cfg *config.Config, configPath, hash, name string, filter []string)
 		p.Project.Resources = append(p.Project.Resources, resolved)
 	}
 	// The merge proxy listens on a fixed port baked into its command, so the
-	// port is leased rather than allocated: it is never moved and never
-	// recorded as a named port.
+	// port is leased and held at that number rather than allocated: it is
+	// never moved and never recorded as a named port, and a busy merge port
+	// refuses the start. It is held before the named ports are assigned, so a
+	// named port that prefers it is the one moved.
 	//
-	// The lease is taken only when the proxy is part of the selected process
+	// The port is taken only when the proxy is part of the selected process
 	// set. A filtered start that does not select the proxy never binds the
 	// port, so holding it would refuse a second session that would have been
 	// able to bind it.
 	if cfg.Merge != nil && cfg.Merge.Port > 0 && slices.Contains(p.names, config.MergePortProcessName) {
-		if err = p.lease(fmt.Sprintf("tcp:127.0.0.1:%d", cfg.Merge.Port)); err != nil {
-			return nil, err
+		if err = p.hold(cfg.Merge.Port); err != nil {
+			return nil, fmt.Errorf("merge.port %d: %w", cfg.Merge.Port, err)
 		}
 		p.mergePort = cfg.Merge.Port
 	}
+	// A named port a merge upstream is started on is assigned its preferred
+	// port or refuses the start: the proxy and the upstream's injected
+	// readiness probe target the merge port it was matched at, so a moved
+	// port would leave the upstream listening where nothing looks. These
+	// ports are assigned first, so a port that merely prefers the same number
+	// is the one moved.
+	upstreamPorts := config.MergeUpstreamPorts(cfg)
+	type endpoint struct {
+		process, portName string
+		pinned            bool
+	}
+	var pinned, movable []endpoint
 	for _, process := range p.names {
 		declared := cfg.Processes[process].Ports
 		p.preferred[process] = maps.Clone(declared)
@@ -123,19 +139,37 @@ func Acquire(cfg *config.Config, configPath, hash, name string, filter []string)
 		}
 		sort.Strings(portNames)
 		for _, portName := range portNames {
-			port, allocateErr := p.allocate(declared[portName])
-			if allocateErr != nil {
-				return nil, fmt.Errorf("%s.%s: %w", process, portName, allocateErr)
+			if slices.Contains(upstreamPorts, process+"."+portName) {
+				pinned = append(pinned, endpoint{process, portName, true})
+			} else {
+				movable = append(movable, endpoint{process, portName, false})
 			}
-			if p.Project.Ports[process] == nil {
-				p.Project.Ports[process] = make(map[string]int)
-				p.Project.URLs[process] = make(map[string]string)
-			}
-			url := fmt.Sprintf("http://127.0.0.1:%d", port)
-			p.Project.Ports[process][portName], p.Project.URLs[process][portName] = port, url
-			p.variables["ports."+process+"."+portName] = strconv.Itoa(port)
-			p.variables["urls."+process+"."+portName] = url
 		}
+	}
+	for _, e := range append(pinned, movable...) {
+		process, portName := e.process, e.portName
+		preferred := cfg.Processes[process].Ports[portName]
+		var port int
+		var allocateErr error
+		if e.pinned {
+			if allocateErr = p.hold(preferred); allocateErr != nil {
+				allocateErr = fmt.Errorf("port %d is a merge upstream's port, which is never moved: %w", preferred, allocateErr)
+			}
+			port = preferred
+		} else {
+			port, allocateErr = p.allocate(preferred)
+		}
+		if allocateErr != nil {
+			return nil, fmt.Errorf("%s.%s: %w", process, portName, allocateErr)
+		}
+		if p.Project.Ports[process] == nil {
+			p.Project.Ports[process] = make(map[string]int)
+			p.Project.URLs[process] = make(map[string]string)
+		}
+		url := fmt.Sprintf("http://127.0.0.1:%d", port)
+		p.Project.Ports[process][portName], p.Project.URLs[process][portName] = port, url
+		p.variables["ports."+process+"."+portName] = strconv.Itoa(port)
+		p.variables["urls."+process+"."+portName] = url
 	}
 	p.Config, err = p.Resolve(cfg)
 	if err != nil {
@@ -170,7 +204,11 @@ func (p *Plan) Resolve(cfg *config.Config) (*config.Config, error) {
 		}
 		// A process uses the ports it declares and every port its expanded
 		// fields reference: any of them may be the one that binds the port.
+		// The merge proxy binds the merge port.
 		used := slices.Collect(maps.Values(p.Project.Ports[name]))
+		if name == config.MergePortProcessName && p.mergePort != 0 {
+			used = append(used, p.mergePort)
+		}
 		expand := func(value string) (string, error) {
 			used = append(used, p.referencedPorts(value)...)
 			return p.expand(value)
@@ -303,9 +341,16 @@ func (p *Plan) expand(value string) (string, error) {
 type LeaseError struct {
 	Label string
 	Err   error
+	// Bound reports a port the session holds at its exact number (hold) that
+	// it leased but could not bind: a program outside proc-compose's leases
+	// is using it, rather than another session.
+	Bound bool
 }
 
 func (e *LeaseError) Error() string {
+	if e.Bound {
+		return fmt.Sprintf("resource %q is in use by another program: %v", e.Label, e.Err)
+	}
 	return fmt.Sprintf("resource %q is owned by another session: %v", e.Label, e.Err)
 }
 
@@ -408,8 +453,36 @@ func (p *Plan) allocate(preferred int) (int, error) {
 	return 0, fmt.Errorf("no available named port starting at %d", preferred)
 }
 
+// hold leases port and keeps it bound, like allocate, but at that exact
+// number: for a port baked into the merge wiring, which the session cannot
+// move. The lease is taken first, so another session's port is reported as
+// that session's. A port the session could lease but not bind is a Bound
+// *LeaseError. A port the plan already holds — the merge port named as an
+// upstream's port too — is a configuration error, not another owner.
+func (p *Plan) hold(port int) error {
+	label := fmt.Sprintf("tcp:127.0.0.1:%d", port)
+	p.portsMu.Lock()
+	_, own := p.held[port]
+	p.portsMu.Unlock()
+	if own {
+		return fmt.Errorf("port %d is already held by this session for another use", port)
+	}
+	if err := p.lease(label); err != nil {
+		return err
+	}
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return &LeaseError{Label: label, Err: err, Bound: true}
+	}
+	p.portsMu.Lock()
+	p.held[port] = listener
+	p.portsMu.Unlock()
+	return nil
+}
+
 // ReleasePorts closes the listeners that hold the allocated ports process name
-// declares or references, so that it can bind them. The runner calls it right
+// declares or references, and for the merge proxy the merge port, so that it
+// can bind them. The runner calls it right
 // before each launch (runner.Runner.BeforeStart), which narrows the window in
 // which another program can take a leased port to the launch itself. The
 // leases stay held. A port already released, a later launch and a name that

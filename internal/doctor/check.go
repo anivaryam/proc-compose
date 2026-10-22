@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -87,25 +88,35 @@ func checkExistingConfig(report *Report, root string) {
 		}
 	}
 
-	ports := map[int]string{}
+	type portUse struct {
+		name  string
+		named []string
+	}
+	ports := map[int]portUse{}
+	served := config.ServedPorts(cfg.Processes)
 	for _, name := range config.SortedProcessNames(cfg.Processes) {
 		proc := cfg.Processes[name]
-		port := processPort(proc)
+		port, named := processPort(served, name, proc)
 		// A teardown process runs after the stack stopped; a PORT in its env
 		// names a service to reach, not a port it binds.
 		if port == 0 || proc.Mode == config.ProcessModeTeardown {
 			continue
 		}
 		if other, ok := ports[port]; ok {
+			// Two different named ports that only prefer the same port do
+			// not collide: the session moves one of them.
+			if len(other.named) > 0 && len(named) > 0 && !slices.ContainsFunc(named, func(n string) bool { return slices.Contains(other.named, n) }) {
+				continue
+			}
 			report.Findings = append(report.Findings, Finding{
 				Severity:   SeverityWarning,
 				Code:       codeDuplicatePort,
-				Message:    fmt.Sprintf("processes %q and %q both use port %d", other, name, port),
+				Message:    fmt.Sprintf("processes %q and %q both use port %d", other.name, name, port),
 				Suggestion: "assign each process a unique PORT",
 			})
 			continue
 		}
-		ports[port] = name
+		ports[port] = portUse{name, named}
 	}
 
 	for _, name := range config.SortedProcessNames(cfg.Processes) {
@@ -268,21 +279,22 @@ func resolveConfigPath(configDir, path string) string {
 	return filepath.Join(configDir, path)
 }
 
-func processPort(proc config.Process) int {
-	if proc.Env != nil {
-		if value := proc.Env["PORT"]; value != "" {
-			port, err := strconv.Atoi(strings.Trim(value, "\"'"))
-			if err == nil {
-				return port
-			}
-		}
+// processPort returns the port process name uses, for the duplicate-port
+// check, and the named ports the session assigns it from (none for a port the
+// config fixes). It is the PORT the process is started with, read the way Load
+// matches merge upstreams (config.ServedPorts: env.PORT, else the env_file
+// PORT, else ports.http, a ${ports.*} reference resolved to its preferred
+// port), else the port its ready_when tcp probe targets.
+func processPort(served map[string]config.ServedPort, name string, proc config.Process) (int, []string) {
+	if s := served[name]; s.Port > 0 {
+		return s.Port, s.Named
 	}
 	if proc.ReadyWhen != nil && proc.ReadyWhen.TCP != "" {
 		parts := strings.Split(proc.ReadyWhen.TCP, ":")
 		port, err := strconv.Atoi(parts[len(parts)-1])
 		if err == nil {
-			return port
+			return port, nil
 		}
 	}
-	return 0
+	return 0, nil
 }

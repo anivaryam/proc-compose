@@ -294,8 +294,6 @@ func TestObserveLeaderExit_AlreadyExitedChildIsDetectedAtSetup(t *testing.T) {
 	spawn := writeScript(t, dir, "spawn.sh", spawnScript)
 	pidFile := filepath.Join(dir, "d.pid")
 	pg, cmd, descendant := startGroupWithSurvivor(t, spawn+" "+stubborn+" "+pidFile, pidFile)
-	// The stubborn descendant ignores signals, so the fixture's own cleanup only
-	// reaps the leader. Track it explicitly so this test cannot leak it.
 	trackProcessForCleanup(t, descendant, "already-exited-leader descendant")
 
 	// Wait for the leader to have exited but not been reaped. Nothing else can
@@ -368,9 +366,6 @@ func TestState_AbsenceIsDecidedByMembershipNotTheProbe(t *testing.T) {
 	stay := writeScript(t, dir, "stay.sh", stayScript)
 	descendantPIDFile := filepath.Join(dir, "d.pid")
 	pg, _ := startTrackedGroup(t, stay+" "+stubborn+" "+descendantPIDFile)
-	if pgid := groupPGID(pg); pgid > 1 {
-		groupForCleanup(t, pgid, "membership-controlled group")
-	}
 
 	if got := pg.State(); got != GroupOwned {
 		t.Fatalf("State() with a live group = %v, want %v", got, GroupOwned)
@@ -623,6 +618,61 @@ func groupForCleanup(t *testing.T, pgid int, what string) {
 			t.Logf("cleanup: cannot kill %s (pgid %d): %v", what, pgid, err)
 		}
 	})
+}
+
+// startTrackedGroup starts cmdStr in its own process group and returns the
+// concrete group plus the Cmd, so a test can drive the group's own mutex. The
+// Cmd's process is registered for cleanup immediately after creation, before any
+// assertion, so no path leaks it.
+//
+// Cleanup kills the whole group, not only the leader. The leader is the shell,
+// and a shell that forks the command instead of exec'ing it, as dash does, would
+// otherwise leave the command running, reparented to init. The group is killed
+// through groupForCleanup, not through pg, because a test may have withdrawn
+// pg's signalling authority; registered after the leader's cleanup, it runs
+// before the leader is reaped.
+func startTrackedGroup(t *testing.T, cmdStr string) (ProcessGroup, *exec.Cmd) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
+	pg := newProcessGroup()
+	pg.Setup(cmd)
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start: %v", err)
+	}
+	if err := pg.Track(cmd); err != nil {
+		cancel()
+		t.Fatalf("track: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			// Reap it. A zombie leader keeps its process-group ID allocated,
+			// which both leaks the fixture and makes the group probe keep
+			// succeeding for a group nothing is running in.
+			_, _ = cmd.Process.Wait()
+		}
+		cancel()
+		_ = pg.Close()
+	})
+	groupForCleanup(t, cmd.Process.Pid, "fixture group")
+	return pg, cmd
+}
+
+// startGroupWithSurvivor is startTrackedGroup for a command that leaves a
+// descendant running: it also returns the descendant's PID, and blocks until the
+// descendant has recorded it, so the caller never observes the group mid-fork.
+func startGroupWithSurvivor(t *testing.T, cmdStr, pidFile string) (ProcessGroup, *exec.Cmd, int) {
+	t.Helper()
+
+	pg, cmd := startTrackedGroup(t, cmdStr)
+	descendant, ok := waitForPIDFile(t, pidFile, 20*time.Second)
+	if !ok {
+		t.Fatal("descendant never recorded its PID; the fixture proves nothing")
+	}
+	return pg, cmd, descendant
 }
 
 // TestSingleReap_ResultIsReceivedExactlyOnce pins the fix for a run that hangs
@@ -2761,7 +2811,6 @@ func TestSurvivorsError_NamesTheEnumeratedMembers(t *testing.T) {
 	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
 	stay := writeScript(t, dir, "stay.sh", stayScript)
 	pg, _, descendant := startGroupWithSurvivor(t, stay+" "+stubborn+" "+pidFile, pidFile)
-	t.Cleanup(func() { _ = pg.Kill() })
 
 	state := pg.State()
 	if state != GroupOwned {
@@ -2816,7 +2865,6 @@ func TestSealObservation_NamesTheEnumeratedMembers(t *testing.T) {
 	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
 	stay := writeScript(t, dir, "stay.sh", stayScript)
 	pg, _, descendant := startGroupWithSurvivor(t, stay+" "+stubborn+" "+pidFile, pidFile)
-	t.Cleanup(func() { _ = pg.Kill() })
 
 	observation, err := pg.Seal()
 	if err != nil {

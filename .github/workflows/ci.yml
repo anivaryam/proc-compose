@@ -39,6 +39,21 @@ jobs:
       - name: Test
         run: go test ./... -race -count=1
 
+  test-386:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.9"
+
+      - name: Test (linux/386)
+        env:
+          GOARCH: "386"
+          CGO_ENABLED: "0"
+        run: go test ./internal/runner -count=1 -run 'TestWaitSiginfo|TestObserveLeaderExit'
+
   vulncheck:
     runs-on: ubuntu-latest
     steps:

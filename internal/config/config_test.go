@@ -2046,6 +2046,83 @@ processes:
 	}
 }
 
+// TestServedPorts_LoadedConfigAgreesWithTheMergeMatch pins the exported
+// served-port rule on a loaded config, whose env already holds its env_file:
+// the same PORT Load matches merge upstreams by, with the named ports the
+// session assigns it from. MergeUpstreamPorts lists the named ports of the
+// upstreams only — the ports the session must not move.
+func TestServedPorts_LoadedConfigAgreesWithTheMergeMatch(t *testing.T) {
+	t.Setenv("PORT", "")
+	processes := `processes:
+  web:
+    cmd: npm start
+    ports:
+      http: 3000
+  api:
+    cmd: go run .
+    env_file: .env
+  docs:
+    cmd: serve
+    env:
+      PORT: "${ports.store.app}"
+  store:
+    cmd: store
+    ports:
+      app: 4000
+  extra:
+    cmd: extra
+    ports:
+      http: 5000
+  eph:
+    cmd: eph
+    ports:
+      http: 0
+  fixed:
+    cmd: fixed
+    env:
+      PORT: "4100"
+`
+	load := func(merge string) *Config {
+		path := writeConfig(t, merge+processes)
+		if err := os.WriteFile(filepath.Join(filepath.Dir(path), ".env"), []byte("PORT=3001\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return cfg
+	}
+	cfg := load("merge:\n  client: 3000\n  server: 3001\n")
+	got := ServedPorts(cfg.Processes)
+	want := map[string]ServedPort{
+		"web":   {Port: 3000, Named: []string{"web.http"}},
+		"api":   {Port: 3001},
+		"docs":  {Port: 4000, Named: []string{"store.app"}},
+		"extra": {Port: 5000, Named: []string{"extra.http"}},
+		"fixed": {Port: 4100},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ServedPorts = %+v, want exactly %v", got, want)
+	}
+	for name, w := range want {
+		g, ok := got[name]
+		if !ok || g.Port != w.Port || !equalSlices(g.Named, w.Named) {
+			t.Fatalf("ServedPorts[%q] = %+v (present %v), want %+v", name, g, ok, w)
+		}
+	}
+	if got, want := MergeUpstreamPorts(cfg), []string{"web.http"}; !equalSlices(got, want) {
+		t.Fatalf("simple mode MergeUpstreamPorts = %v, want %v", got, want)
+	}
+	routes := load("merge:\n  routes: [\"/docs=4000\", \"/api=3001\", \"/ext=9999\"]\n")
+	if got, want := MergeUpstreamPorts(routes), []string{"store.app"}; !equalSlices(got, want) {
+		t.Fatalf("route mode MergeUpstreamPorts = %v, want %v", got, want)
+	}
+	if got := MergeUpstreamPorts(&Config{Processes: cfg.Processes}); got != nil {
+		t.Fatalf("MergeUpstreamPorts without a merge section = %v, want none", got)
+	}
+}
+
 // ─── #22: an unreadable env file is an error, not a truncation ───────────────
 
 // TestParseEnvFile_LargeValue pins that a value larger than the old 64 KiB

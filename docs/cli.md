@@ -117,6 +117,13 @@ newline included. The daemon discards a longer line and answers it with an
 `error` acknowledgment that names the limit. The connection stays open, so the
 commands sent after it on the same connection are still processed.
 
+Every connection starts with a snapshot of the daemon's state, followed by
+events and acknowledgments. The daemon reads commands while it writes the
+snapshot, so a client may send its command before reading it; the command is
+acted on and answered once the snapshot is out. `restart`, `reload` and `stop`
+read the snapshot before they send, so they also work promptly with older
+daemons, which read nothing until the snapshot is out.
+
 The PID file is JSON and is replaced atomically, so a reader never sees a
 partial file. On Linux and macOS it also records every process group the
 daemon launched and has not yet proven empty, together with the boot and
@@ -322,7 +329,8 @@ process, including descendants, and reports whether it verified that all of
 them exited. `stop` exits 0 only when the daemon verified this. When
 termination could not be verified, `stop` names what it could not confirm and
 exits non-zero. `--timeout` (default 10) bounds the wait for that verdict. If
-the daemon cannot be reached and has to be killed directly, the final kill
+the daemon cannot be reached (it does not accept the connection, or does not
+send its state when it does) and has to be killed directly, the final kill
 can add up to 5 seconds. A `stop` that never receives the verdict (it was
 interrupted, or its `--timeout` ran out first) cannot report it, so the daemon records the verdict
 in the session's event journal as `shutdown.verdict_undelivered`; read it with

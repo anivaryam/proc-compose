@@ -27,6 +27,22 @@ func IsAlive(pid int) bool {
 	return true
 }
 
+// IsRunning is IsAlive without the exited processes it counts: an exited
+// process stays openable while any handle to it is open (stop holds one from
+// os.FindProcess), so only a wait that times out at once proves it runs. A
+// failed wait is reported as running, so a live process is never taken for
+// gone.
+func IsRunning(pid int) bool {
+	const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+	h, err := syscall.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|syscall.SYNCHRONIZE, false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	defer syscall.CloseHandle(h)
+	event, err := syscall.WaitForSingleObject(h, 0)
+	return err != nil || event == syscall.WAIT_TIMEOUT
+}
+
 // StopProcess terminates the process tree using taskkill on Windows.
 // Windows lacks SIGTERM for console apps started with CREATE_NEW_PROCESS_GROUP;
 // taskkill /T /F is the closest reliable equivalent.

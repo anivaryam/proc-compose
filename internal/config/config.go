@@ -948,7 +948,7 @@ func rebaseURL(exampleVal, mergeBase string) string {
 //
 // Processes that already declare ready_when are left alone — the upstream
 // dependency edge is still added (the user's probe is what we wait on).
-func resolveUpstreamProcesses(procs map[string]Process, served map[string]servedPort, m *Merge) (map[string]int, error) {
+func resolveUpstreamProcesses(procs map[string]Process, served map[string]ServedPort, m *Merge) (map[string]int, error) {
 	out := make(map[string]int)
 	if len(m.Routes) > 0 {
 		for _, route := range m.Routes {
@@ -1003,11 +1003,27 @@ func checkClientProcess(procs map[string]Process, m *Merge) error {
 		"merge.client_process names %q, a %s process: only a service can be the merge client", m.ClientProcess, proc.EffectiveMode())
 }
 
-// servedPort is the PORT a process is started with, as far as Load can know
-// it.
-type servedPort struct {
-	port     int    // the port; 0 when the declared value is not a port number
+// ServedPort is the PORT a process is started with, as far as the config can
+// know it before the session assigns the named ports.
+type ServedPort struct {
+	// Port is the port; 0 when the declared PORT is not a port number.
+	Port int
+	// Named lists the named ports the session assigns the PORT from, as
+	// reference names ("web.http"): the process's own ports.http when it
+	// declares no PORT, else each ${ports.*} reference in its PORT. Port is
+	// then their preferred port. Named is empty for a PORT written as a
+	// number, which the session never assigns.
+	Named []string
+
 	declared string // how the PORT is declared, for messages
+}
+
+// ServedPorts returns the PORT each process of a loaded config is started
+// with, as far as the config can know it — the rule Load matches merge
+// upstreams by (see servedPorts). A loaded process's env already holds its
+// env_file.
+func ServedPorts(procs map[string]Process) map[string]ServedPort {
+	return servedPorts(procs, nil)
 }
 
 // servedPorts returns the PORT each process is started with, as far as Load
@@ -1017,8 +1033,8 @@ type servedPort struct {
 // Load cannot know its PORT: none is declared, the PORT is empty, the
 // ports.http port is ephemeral (0), or a reference cannot be resolved before
 // the session assigns the ports.
-func servedPorts(procs map[string]Process, envFiles map[string]envFile) map[string]servedPort {
-	out := make(map[string]servedPort, len(procs))
+func servedPorts(procs map[string]Process, envFiles map[string]envFile) map[string]ServedPort {
+	out := make(map[string]ServedPort, len(procs))
 	for name, proc := range procs {
 		value, declared := proc.Env["PORT"]
 		where := ""
@@ -1030,21 +1046,21 @@ func servedPorts(procs map[string]Process, envFiles map[string]envFile) map[stri
 			// An out-of-range preferred port is refused by the port check
 			// with its own diagnostic.
 			if preferred := proc.Ports["http"]; preferred >= 1 && preferred <= 65535 {
-				out[name] = servedPort{port: preferred, declared: fmt.Sprintf("is given PORT %d by ports.http", preferred)}
+				out[name] = ServedPort{Port: preferred, Named: []string{name + ".http"}, declared: fmt.Sprintf("is given PORT %d by ports.http", preferred)}
 			}
 			continue
 		}
-		resolved, ok := resolvePortReferences(procs, value)
+		resolved, named, ok := resolvePortReferences(procs, value)
 		resolved = strings.TrimSpace(resolved)
 		if !ok || resolved == "" {
 			continue
 		}
-		s := servedPort{declared: fmt.Sprintf("declares PORT %q%s", value, where)}
+		s := ServedPort{Named: named, declared: fmt.Sprintf("declares PORT %q%s", value, where)}
 		if resolved != strings.TrimSpace(value) {
 			s.declared = fmt.Sprintf("declares PORT %q (%s)%s", value, resolved, where)
 		}
 		if port, err := strconv.Atoi(resolved); err == nil && port > 0 {
-			s.port = port
+			s.Port = port
 		}
 		out[name] = s
 	}
@@ -1053,19 +1069,43 @@ func servedPorts(procs map[string]Process, envFiles map[string]envFile) map[stri
 
 // resolvePortReferences replaces each ${ports.<process>.<port>} reference in
 // value with that port's preferred port — the port the session assigns when
-// it is free. ok is false when value holds a reference Load cannot resolve:
-// an ephemeral (0) or undeclared port, or any other reference namespace.
-func resolvePortReferences(procs map[string]Process, value string) (string, bool) {
+// it is free — and returns the reference names it replaced ("web.http"). ok
+// is false when value holds a reference Load cannot resolve: an ephemeral (0)
+// or undeclared port, or any other reference namespace.
+func resolvePortReferences(procs map[string]Process, value string) (string, []string, bool) {
 	ok := true
+	var named []string
 	resolved := referenceRe.ReplaceAllStringFunc(value, func(ref string) string {
 		namespace, process, portName, split := splitReference(referenceRe.FindStringSubmatch(ref)[1])
 		if preferred := procs[process].Ports[portName]; split && namespace == "ports" && preferred >= 1 && preferred <= 65535 {
+			named = append(named, process+"."+portName)
 			return strconv.Itoa(preferred)
 		}
 		ok = false
 		return ref
 	})
-	return resolved, ok
+	return resolved, named, ok
+}
+
+// MergeUpstreamPorts returns the named ports a merge upstream of a loaded
+// config is started on, as reference names ("web.http"), sorted. The proxy
+// command and the readiness probe Load injects target the merge port the
+// upstream was matched at, which is the preferred port of each of these: the
+// session must assign them exactly that port, never move one.
+func MergeUpstreamPorts(cfg *Config) []string {
+	if cfg == nil || cfg.Merge == nil {
+		return nil
+	}
+	served := ServedPorts(cfg.Processes)
+	// Load refused a config whose upstream is served on another port, so
+	// the selection cannot fail here.
+	upstreams, _ := resolveUpstreamProcesses(serviceUpstreams(cfg.Processes), served, cfg.Merge)
+	var named []string
+	for name := range upstreams {
+		named = append(named, served[name].Named...)
+	}
+	slices.Sort(named)
+	return slices.Compact(named)
 }
 
 // checkUpstreamPort refuses an upstream that is started with a PORT other
@@ -1074,9 +1114,9 @@ func resolvePortReferences(procs map[string]Process, value string) (string, bool
 // port too. A process whose PORT Load cannot know is probed at the merge port
 // — the documented guess. The served port is compared numerically, so PORT:
 // "05173" is the merge port 5173.
-func checkUpstreamPort(field, name string, served map[string]servedPort, mergePort int) error {
+func checkUpstreamPort(field, name string, served map[string]ServedPort, mergePort int) error {
 	s, known := served[name]
-	if !known || s.port == mergePort {
+	if !known || s.Port == mergePort {
 		return nil
 	}
 	return invalid(CodeInvalidMerge, []any{"merge", field}, nil,
@@ -1112,7 +1152,7 @@ func parseRoutePort(route string) int {
 // served on port. Candidates are visited in name order, so a duplicated PORT
 // always resolves to the same process. Skips merge-port to avoid
 // self-dependencies and returns "" when no candidate is found.
-func procWithPort(procs map[string]Process, served map[string]servedPort, port int) string {
+func procWithPort(procs map[string]Process, served map[string]ServedPort, port int) string {
 	if port <= 0 {
 		return ""
 	}
@@ -1120,7 +1160,7 @@ func procWithPort(procs map[string]Process, served map[string]servedPort, port i
 		if name == MergePortProcessName {
 			continue
 		}
-		if s, known := served[name]; known && s.port == port {
+		if s, known := served[name]; known && s.Port == port {
 			return name
 		}
 	}
@@ -1130,7 +1170,7 @@ func procWithPort(procs map[string]Process, served map[string]servedPort, port i
 // findServerProc mirrors findClientProc for the backend side. Used to wire
 // the merge-port → server dependency edge in simple mode, and to find the
 // source tree the api_prefixes auto-detection scans.
-func findServerProc(procs map[string]Process, served map[string]servedPort, m *Merge) string {
+func findServerProc(procs map[string]Process, served map[string]ServedPort, m *Merge) string {
 	if name := procWithPort(procs, served, m.Server); name != "" {
 		return name
 	}
@@ -1162,7 +1202,7 @@ func injectTCPReadyIfMissing(procs map[string]Process, name string, port int) {
 // findClientProc finds the name of the client/frontend process. Candidates
 // are visited in name order, so a duplicated PORT always resolves to the same
 // process.
-func findClientProc(procs map[string]Process, served map[string]servedPort, m *Merge) string {
+func findClientProc(procs map[string]Process, served map[string]ServedPort, m *Merge) string {
 	if m.ClientProcess != "" {
 		if _, ok := procs[m.ClientProcess]; ok {
 			return m.ClientProcess

@@ -84,6 +84,9 @@ func TestStartProven_ZombieIsNotProven(t *testing.T) {
 	if !StartProven(rec) {
 		t.Fatalf("StartProven(%+v) = false for a running child", rec)
 	}
+	if !IsRunning(cmd.Process.Pid) {
+		t.Fatal("IsRunning = false for a running child")
+	}
 	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
@@ -107,6 +110,9 @@ func TestStartProven_ZombieIsNotProven(t *testing.T) {
 	}
 	if alive, _ := IsAliveFromPIDFile(path); !alive {
 		t.Fatal("IsAliveFromPIDFile changed: it no longer reports the zombie")
+	}
+	if IsRunning(cmd.Process.Pid) {
+		t.Fatal("IsRunning = true for an exited, unreaped child (zombie)")
 	}
 	_ = cmd.Wait()
 	reaped = true
