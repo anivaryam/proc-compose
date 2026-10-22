@@ -62,8 +62,8 @@ func TestDialTimeout_OverLongSocketPathReportsEINVAL(t *testing.T) {
 // TestDialTimeout_RefusedSocketReportsECONNREFUSED pins the cause for a
 // socket whose daemon is gone: the path exists but nothing listens.
 func TestDialTimeout_RefusedSocketReportsECONNREFUSED(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "gone.sock")
+	// t.TempDir's path is too long for a unix socket on macOS.
+	path := testSocketPath(t, "gone.sock")
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("listen: %v", err)

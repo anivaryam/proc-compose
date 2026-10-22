@@ -353,10 +353,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `timeout /t N`, which exits at once with "ERROR: Input redirection is not
   supported", because a managed process's input is not a console. A whole
   number of seconds now waits with `ping`, and a fraction such as `sleep 0.5`
-  with PowerShell's `Start-Sleep`, for that command only. Only a `sleep` that
-  `cmd` runs as a command is translated, so `echo sleep 5` prints `sleep 5`
-  instead of `timeout /t 5`. `cmd` has no `;` operator, so `sleep 1; npm
-  start` is not translated: write `sleep 1 && npm start`.
+  is rounded up to the next whole second, because `cmd` has no finer wait.
+  Only a `sleep` that `cmd` runs as a command is translated, so `echo sleep 5`
+  prints `sleep 5` instead of `timeout /t 5`. `cmd` has no `;` operator, so
+  `sleep 1; npm start` is not translated: write `sleep 1 && npm start`.
 
 ### Changed
 

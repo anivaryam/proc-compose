@@ -87,14 +87,15 @@ var shellCases = []struct {
 	{name: "sh -c with a single quote byte is untouched", cmd: `sh -c "`, script: `"`, fails: true},
 
 	// sleep is translated wherever cmd runs it as a command. timeout /t needs a
-	// console as its input, which a managed process does not have, so whole
-	// seconds are waited with ping and a fraction with PowerShell's Start-Sleep.
+	// console as its input, which a managed process does not have, so the wait is
+	// ping's, in whole seconds: a fraction is rounded up.
 	{name: "sleep waits whole seconds", cmd: "sleep 1", script: "ping -n 2 127.0.0.1 >nul", wait: time.Second},
-	{name: "sleep waits a fraction of a second", cmd: "sleep 1.5", script: fractionalSleep("1500"), wait: 1500 * time.Millisecond},
+	{name: "sleep rounds a fraction up to whole seconds", cmd: "sleep 1.5", script: "ping -n 3 127.0.0.1 >nul", wait: 2 * time.Second},
 	{name: "sleep with a zero fraction waits whole seconds", cmd: "sleep 1.0", script: "ping -n 2 127.0.0.1 >nul", wait: time.Second},
-	{name: "sleep rounds a fraction up to whole milliseconds", cmd: "sleep 0.0001", script: fractionalSleep("1")},
+	{name: "sleep rounds a tiny fraction up to a second", cmd: "sleep 0.0001", script: "ping -n 2 127.0.0.1 >nul", wait: time.Second},
+	{name: "sleep zero does not wait", cmd: "sleep 0", script: "ping -n 1 127.0.0.1 >nul"},
 	{name: "sleep before another command", cmd: "sleep 1 && echo done", script: "ping -n 2 127.0.0.1 >nul && echo done", out: "done\r\n", wait: time.Second},
-	{name: "sleep between commands in sh -c", cmd: `sh -c 'echo a && sleep .5 && echo b'`, script: "echo a && " + fractionalSleep("500") + " && echo b", out: "a \r\nb\r\n", wait: 500 * time.Millisecond},
+	{name: "sleep between commands in sh -c", cmd: `sh -c 'echo a && sleep .5 && echo b'`, script: "echo a && ping -n 2 127.0.0.1 >nul && echo b", out: "a \r\nb\r\n", wait: time.Second},
 	{name: "sleep in parentheses", cmd: "(sleep 1) && echo done", script: "(ping -n 2 127.0.0.1 >nul) && echo done", out: "done\r\n", wait: time.Second},
 	{name: "sleep as text is not translated", cmd: "echo sleep 1", script: "echo sleep 1", out: "sleep 1\r\n"},
 	// cmd has no ; operator, so this is one command whose argument sleep cannot
@@ -104,17 +105,10 @@ var shellCases = []struct {
 	{name: "sleep with an invalid number is not translated", cmd: "sleep 1.2.3", script: "sleep 1.2.3", fails: true},
 }
 
-// fractionalSleep is the script a sleep of ms milliseconds that are not whole
-// seconds becomes.
-func fractionalSleep(ms string) string {
-	return `powershell -NoProfile -NonInteractive -Command "Start-Sleep -Milliseconds ([Math]::Max(0, ` + ms +
-		` - ((Get-Date) - (Get-Process -Id $PID).StartTime).TotalMilliseconds))"`
-}
-
-// sleepSlack is how much longer than its wait a shellCases sleep may take. ping
-// and PowerShell start and exit around the wait, which takes under a tenth of a
-// second on an idle machine, but PowerShell can take seconds to start on a
-// cold or loaded one, and the other cases run in parallel.
+// sleepSlack is how much longer than its wait a shellCases sleep may take. cmd
+// and ping start and exit around the wait, which takes under a tenth of a
+// second on an idle machine, but a CI runner can be loaded, and the other cases
+// run in parallel.
 const sleepSlack = 3 * time.Second
 
 func TestShellTranslation(t *testing.T) {

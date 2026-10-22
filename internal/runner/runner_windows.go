@@ -196,8 +196,6 @@ func translateToCMD(cmd string) string {
 		subCmd := match[2 : len(match)-1]
 		return "%(" + subCmd + ")%"
 	})
-	// Last, so that the $VAR translation leaves the $PID a fractional sleep
-	// hands PowerShell alone.
 	return translateSleep(result)
 }
 
@@ -234,10 +232,10 @@ func translateSleep(script string) string {
 // timeout /t cannot stand in for sleep: it refuses to run unless its input is a
 // console, and a managed process's input is not one. ping sends its echo
 // requests a second apart, so n+1 of them to the loopback address take n
-// seconds. cmd has no finer wait, so a fraction of a second runs PowerShell's
-// Start-Sleep, for this one command only. PowerShell takes a few hundred
-// milliseconds to start, so it sleeps for what is left of the time counted from
-// its own start.
+// seconds. cmd has no finer wait, so a fraction of a second is rounded up to
+// the next whole second: the wait is never shorter than sh's. (PowerShell's
+// Start-Sleep is finer, but PowerShell can take seconds to start on a cold
+// machine, longer than the fraction it would wait.)
 func sleepCommand(command string) string {
 	m := reSleep.FindStringSubmatch(command)
 	if m == nil {
@@ -247,12 +245,8 @@ func sleepCommand(command string) string {
 	if !ok {
 		return command
 	}
-	wait := "ping -n " + strconv.FormatUint(ms/1000+1, 10) + " 127.0.0.1 >nul"
-	if ms%1000 != 0 {
-		wait = `powershell -NoProfile -NonInteractive -Command "Start-Sleep -Milliseconds ([Math]::Max(0, ` +
-			strconv.FormatUint(ms, 10) + ` - ((Get-Date) - (Get-Process -Id $PID).StartTime).TotalMilliseconds))"`
-	}
-	return m[1] + wait + m[3]
+	seconds := (ms + 999) / 1000
+	return m[1] + "ping -n " + strconv.FormatUint(seconds+1, 10) + " 127.0.0.1 >nul" + m[3]
 }
 
 // sleepMillis returns seconds, a decimal number, in milliseconds, rounded up so
