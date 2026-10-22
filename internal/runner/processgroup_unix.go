@@ -3,11 +3,12 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"sync"
-	"sync/atomic"
 	"syscall"
 
 	"github.com/anivaryam/proc-compose/internal/daemon"
@@ -24,12 +25,25 @@ type unixProcessGroup struct {
 	withdrawn bool
 	// trackErr records a containment failure reported by Track.
 	trackErr error
+	// probeErr records why the group's membership could not be read. It is
+	// the group's own reason: it is set when an enumeration fails and cleared
+	// when one succeeds, so a group whose state was established reports no
+	// reason.
+	probeErr error
+	// members records the live members of the group's last enumeration. It
+	// describes the observation that produced the current state: a failed
+	// enumeration clears it, so the verdict never names a stale enumeration.
+	members []string
 }
 
 func newProcessGroup() ProcessGroup { return &unixProcessGroup{} }
 
 func (pg *unixProcessGroup) Setup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Keep any attributes the caller set; only the process-group flag is added.
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
 	cmd.Cancel = func() error { return pg.Terminate() }
 	if cmd.WaitDelay == 0 {
 		cmd.WaitDelay = defaultShutdownGrace
@@ -53,13 +67,21 @@ func (pg *unixProcessGroup) Track(cmd *exec.Cmd) error {
 // — while the leader is still unreaped and the identifier cannot have been
 // reassigned — or is refused afterwards. pid 0 and -1 would mean "my process
 // group" and "every process we may signal", so they are never sent.
+//
+// ESRCH is reported as os.ErrProcessDone: the group is gone, so there is
+// nothing left to signal. EPERM is a different condition — members exist but
+// are not ours to signal — and stays distinct.
 func (pg *unixProcessGroup) signal(sig syscall.Signal) error {
 	pg.mu.Lock()
 	defer pg.mu.Unlock()
 	if pg.withdrawn || pg.pgid <= 1 {
 		return os.ErrProcessDone
 	}
-	return syscall.Kill(-pg.pgid, sig)
+	err := syscall.Kill(-pg.pgid, sig)
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
+	}
+	return err
 }
 
 func (pg *unixProcessGroup) Terminate() error { return pg.signal(syscall.SIGTERM) }
@@ -78,19 +100,25 @@ func (pg *unixProcessGroup) Withdraw() {
 func (pg *unixProcessGroup) Seal() (SealObservation, error) {
 	pg.Withdraw()
 	state := pg.State()
-	observation := SealObservation{State: state, Identity: pg.Identify()}
+	observation := SealObservation{
+		State:    state,
+		Identity: pg.Identify(),
+		Members:  pg.memberPIDs(),
+		Reason:   pg.failureReason(),
+	}
 	return observation, pg.Close()
 }
 
 func (pg *unixProcessGroup) State() GroupState {
 	pg.mu.Lock()
 	pgid := pg.pgid
+	trackErr := pg.trackErr
 	pg.mu.Unlock()
 
 	if pgid <= 1 {
 		return GroupEmpty
 	}
-	if pg.trackErr != nil {
+	if trackErr != nil {
 		return GroupUnavailable
 	}
 	// Absence is established by enumerating the group and finding nothing running,
@@ -103,18 +131,18 @@ func (pg *unixProcessGroup) State() GroupState {
 	// would read EPERM as proof of termination. The probe is therefore only ever
 	// allowed to ADD a conclusion: a success proves something is there, and a
 	// failure contributes nothing.
-	members, known := processGroupMembers(pgid)
+	pids, known := enumerateGroupMembers(pgid)
 	if !known {
 		// Membership could not be read, so nothing can be established either way.
 		// Fall back to the probe: a live group is still evidence of one.
+		pg.recordObservation(nil, fmt.Errorf("process group membership could not be enumerated"))
 		if groupKill(-pgid, 0) == nil {
 			return GroupOwned
 		}
-		probeErr := fmt.Errorf("process group membership could not be enumerated")
-		groupProbeFailure.Store(&probeErr)
 		return GroupUnavailable
 	}
-	if members > 0 {
+	pg.recordObservation(pids, nil)
+	if len(pids) > 0 {
 		return GroupOwned
 	}
 	// No member is running. A group whose only remaining members are terminated
@@ -123,19 +151,45 @@ func (pg *unixProcessGroup) State() GroupState {
 	return GroupEmpty
 }
 
-// groupProbeFailure records why the last existence probe could not be answered,
-// so State can explain an unverifiable verdict. It is written before State returns
-// and read immediately after, under no lock, because a group is only probed by the
-// goroutine that owns its teardown.
-var groupProbeFailure atomic.Pointer[error]
-
-// lastProbeFailure returns the probe error that produced the most recent
-// GroupUnavailable, or nil.
-func lastProbeFailure() error {
-	if p := groupProbeFailure.Load(); p != nil {
-		return *p
+// recordObservation stores the members of one enumeration and the reason it
+// could not be made.
+//
+// The record describes the observation that produced the current state: a
+// failed enumeration clears the members, so the verdict reports that the
+// members could not be enumerated instead of naming a stale list, and a
+// successful enumeration clears the reason, so a group whose state was
+// established reports no reason at all.
+func (pg *unixProcessGroup) recordObservation(pids []int, err error) {
+	pg.mu.Lock()
+	defer pg.mu.Unlock()
+	pg.probeErr = err
+	if err != nil {
+		pg.members = nil
+		return
 	}
-	return nil
+	pg.members = make([]string, 0, len(pids))
+	for _, pid := range pids {
+		pg.members = append(pg.members, identifyPID(pid))
+	}
+}
+
+// memberPIDs returns the live members of the group's last enumeration, or nil
+// when that enumeration failed.
+func (pg *unixProcessGroup) memberPIDs() []string {
+	pg.mu.Lock()
+	defer pg.mu.Unlock()
+	return slices.Clone(pg.members)
+}
+
+// failureReason returns why the group's containment could not be established,
+// or "" when the group has no reason of its own.
+func (pg *unixProcessGroup) failureReason() string {
+	pg.mu.Lock()
+	defer pg.mu.Unlock()
+	if pg.probeErr == nil {
+		return ""
+	}
+	return pg.probeErr.Error()
 }
 
 // Identify returns the group's process-group ID for operator-facing messages.
@@ -156,16 +210,12 @@ func (pg *unixProcessGroup) Close() error {
 	return nil
 }
 
-// groupTrackFailure records why Track could not establish containment.
-var groupTrackFailure atomic.Pointer[error]
-
-// lastTrackFailure returns the most recent Track error, or nil.
-func lastTrackFailure() error {
-	if p := groupTrackFailure.Load(); p != nil {
-		return *p
-	}
-	return nil
-}
+// enumerateGroupMembers lists the live members of a process group.
+//
+// It is indirected so a test can force an enumeration failure and observe
+// what the runner then reports. The platform implementations provide the real
+// walk.
+var enumerateGroupMembers = groupMemberPIDs
 
 // groupKill is the existence probe a group's state is derived from. It is
 // indirected so the probe can be exercised without arranging a real unsignalable

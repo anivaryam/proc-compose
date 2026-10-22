@@ -10,7 +10,12 @@ import (
 	"time"
 )
 
-// Includes worst-case JSON escaping and the legacy IPC line alias.
+// MaxEventBytes bounds one outbound event: it includes worst-case JSON
+// escaping and the legacy IPC line alias.
+//
+// It is an outbound allowance, not an inbound-frame contract. The server's
+// inbound command-frame cap is maxCommandFrameBytes (64 KiB), deliberately
+// far smaller: the daemon only accepts restart, reload and shutdown commands.
 const MaxEventBytes = 16 << 20
 
 // TeardownPrefix starts every line of a shutdown verdict that reports a
@@ -276,16 +281,25 @@ type Command struct {
 	Force   bool               `json:"force,omitempty"`   // "shutdown": kill managed processes instead of asking them to exit
 	Reply   chan CommandResult `json:"-"`
 	// flushed is closed by the server once the acknowledgment carrying Reply
-	// has been written to the client. A "shutdown" handler waits on it so the
-	// daemon does not start tearing its IPC server down while the caller is
-	// still reading the verdict — which is the only place that reports what
-	// could not be terminated. Like Reply it never goes on the wire.
+	// has been written to the client — that is, once the write attempt has
+	// completed, whatever its result. A failed write is reported by the
+	// server on stderr; the barrier is released anyway, because a peer that
+	// has gone away must not wedge the daemon. A "shutdown" handler waits on
+	// it so the daemon does not start tearing its IPC server down while the
+	// caller is still reading the verdict — which is the only place that
+	// reports what could not be terminated. Like Reply it never goes on the
+	// wire.
 	flushed chan struct{}
 }
 
 // WaitFlushed blocks until the acknowledgment carrying this command's Reply
 // has been written to the client, or until timeout elapses. It returns
 // immediately for a command that did not come from a Server.
+//
+// The barrier is released after the write attempt completes, not after a
+// successful write: the server reports a failed ack write on stderr and
+// releases the barrier regardless, so a peer that has gone away cannot wedge
+// the daemon.
 //
 // Use it only for a verdict that must survive the server going away. A
 // "shutdown" verdict qualifies: it is the caller's only report of which

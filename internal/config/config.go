@@ -4,6 +4,7 @@ package config
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/url"
@@ -127,6 +128,23 @@ type Config struct {
 
 var processNameRe = regexp.MustCompile(`^[A-Za-z0-9][-A-Za-z0-9._]*[A-Za-z0-9]$|^[A-Za-z0-9]$`)
 
+// portNameRe is the port-name rule: a process name without the dot. An
+// endpoint reference name is the process name and the port name joined by a
+// dot, and both the session expander and config plan split that name at the
+// last dot — so a dot in a port name lets two different endpoints claim one
+// reference name. Forbidding the dot makes the mapping injective, so the
+// plan and the session agree by construction.
+var portNameRe = regexp.MustCompile(`^[A-Za-z0-9][-A-Za-z0-9_]*[A-Za-z0-9]$|^[A-Za-z0-9]$`)
+
+// MergePortProcessName is the name of the proxy process the merge section
+// generates. It is reserved: a user process with this name would be
+// overwritten by the generated one.
+//
+// It is exported so the session can tell whether the proxy is part of the
+// selected process set, which is what decides whether the merge port is
+// leased.
+const MergePortProcessName = "merge-port"
+
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -154,6 +172,14 @@ func Load(path string) (*Config, error) {
 	normalizeProcessDirs(cfg.Processes, configDir)
 
 	if cfg.Merge != nil {
+		// The merge section generates a proxy process under a reserved name.
+		// A user process with that name would be silently overwritten, so
+		// the config is refused instead.
+		if _, exists := cfg.Processes[MergePortProcessName]; exists {
+			return nil, invalid(CodeReservedProcessName, []any{"processes", MergePortProcessName}, nil,
+				"process name %q is reserved for the proxy the merge section generates; rename the process", MergePortProcessName)
+		}
+
 		// Auto-detect api_prefixes by scanning server source when none are configured.
 		if len(cfg.Merge.ApiPrefixes) == 0 && len(cfg.Merge.Routes) == 0 {
 			serverDir := findProcDir(cfg.Processes, cfg.Merge.Server, []string{"server", "backend", "api"}, configDir)
@@ -166,6 +192,14 @@ func Load(path string) (*Config, error) {
 
 		cmd, err := buildMergeCmd(cfg.Merge)
 		if err != nil {
+			// A field-scoped failure (an out-of-range merge port) carries its
+			// own path, so the diagnostic names the offending field instead
+			// of the whole merge section. The other merge failures are about
+			// the section as a whole.
+			var verr *ValidationError
+			if errors.As(err, &verr) {
+				return nil, verr
+			}
 			return nil, invalid(CodeInvalidMerge, []any{"merge"}, err, "%s", err)
 		}
 		if cfg.Processes == nil {
@@ -177,7 +211,10 @@ func Load(path string) (*Config, error) {
 		// its backends are accepting connections. Without this, merge-port
 		// boots in parallel with the client/server and any traffic that
 		// arrives before the backends bind their ports gets a 502.
-		upstreams := resolveUpstreamProcesses(cfg.Processes, cfg.Merge)
+		upstreams, err := resolveUpstreamProcesses(cfg.Processes, cfg.Merge)
+		if err != nil {
+			return nil, err
+		}
 		for name, port := range upstreams {
 			injectTCPReadyIfMissing(cfg.Processes, name, port)
 		}
@@ -198,7 +235,7 @@ func Load(path string) (*Config, error) {
 		}
 		sort.Strings(depNames)
 		mergeProc.DependsOn = depNames
-		cfg.Processes["merge-port"] = mergeProc
+		cfg.Processes[MergePortProcessName] = mergeProc
 
 		// Auto-inject the merge-port URL into the client process env so users
 		// don't need to edit .env or remove hardcoded fallback ports.
@@ -209,16 +246,17 @@ func Load(path string) (*Config, error) {
 	}
 
 	// Validate in name order so the first reported error is deterministic.
-	for _, name := range sortedProcessNames(cfg.Processes) {
+	for _, name := range SortedProcessNames(cfg.Processes) {
 		proc := cfg.Processes[name]
 		at := func(field ...any) []any { return append([]any{"processes", name}, field...) }
-		portNames := make([]string, 0, len(proc.Ports))
-		for portName := range proc.Ports {
-			portNames = append(portNames, portName)
-		}
-		sort.Strings(portNames)
+		portNames := SortedProcessNames(proc.Ports)
 		for _, portName := range portNames {
-			if preferred := proc.Ports[portName]; !processNameRe.MatchString(portName) || preferred < 0 || preferred > 65535 {
+			// The port-name rule runs before the collision safety net: a
+			// dotted port name is a name error, not a collision.
+			if !portNameRe.MatchString(portName) {
+				return nil, invalid(CodeInvalidPort, at("ports", portName), nil, "process %q: invalid port name %q (`.` is not allowed in port names)", name, portName)
+			}
+			if preferred := proc.Ports[portName]; preferred < 0 || preferred > 65535 {
 				return nil, invalid(CodeInvalidPort, at("ports", portName), nil, "process %q: invalid named port %q (%d)", name, portName, preferred)
 			}
 		}
@@ -277,6 +315,9 @@ func Load(path string) (*Config, error) {
 		if proc.ShutdownTimeout < 0 {
 			return nil, invalid(CodeInvalidValue, at("shutdown_timeout"), nil, "process %q: shutdown_timeout must be >= 0", name)
 		}
+		if proc.ReadyTimeout < -1 {
+			return nil, invalid(CodeInvalidValue, at("ready_timeout"), nil, "process %q: ready_timeout must be >= -1 (-1 = no limit)", name)
+		}
 		if proc.ReadyWhen != nil {
 			if err := validateProbe(name, at("ready_when"), proc.ReadyWhen, true); err != nil {
 				return nil, err
@@ -312,8 +353,16 @@ func Load(path string) (*Config, error) {
 		cfg.Processes[name] = proc
 	}
 
+	// Safety net: two endpoints whose reference names collide would make one
+	// of them unreachable. The dot-free port-name rule above makes this
+	// unreachable through Load; the check stays so the two representations
+	// stay injective if that rule is ever relaxed.
+	if err := checkReferenceCollisions(cfg.Processes); err != nil {
+		return nil, err
+	}
+
 	// Validate depends_on references after all processes (including merge-port) are registered.
-	for _, name := range sortedProcessNames(cfg.Processes) {
+	for _, name := range SortedProcessNames(cfg.Processes) {
 		for i, dep := range cfg.Processes[name].DependsOn {
 			if dep == name {
 				return nil, invalid(CodeSelfDependency, []any{"processes", name, "depends_on", i}, nil, "process %q cannot depend on itself", name)
@@ -331,12 +380,31 @@ func Load(path string) (*Config, error) {
 	if err := detectCycles(cfg.Processes); err != nil {
 		return nil, err
 	}
+	// Resource labels are normalised once, here: the trimmed label is the
+	// lease identity, the duplicate check and Project.Resources all use it.
+	// Two independent checks: an exactly repeated label is still a
+	// configuration error, while a label that differs only in surrounding
+	// whitespace names the same resource and is skipped (first wins).
 	seenResources := make(map[string]bool)
+	seenTrimmed := make(map[string]bool)
+	normalized := make([]string, 0, len(cfg.Resources))
 	for i, resource := range cfg.Resources {
-		if strings.TrimSpace(resource) == "" || len(resource) > 256 || strings.ContainsAny(resource, "\r\n\x00") || seenResources[resource] {
+		if seenResources[resource] {
 			return nil, invalid(CodeInvalidResource, []any{"resources", i}, nil, "invalid or duplicate resource label %q", resource)
 		}
 		seenResources[resource] = true
+		trimmed := strings.TrimSpace(resource)
+		if trimmed == "" || len(trimmed) > 256 || strings.ContainsAny(trimmed, "\r\n\x00") {
+			return nil, invalid(CodeInvalidResource, []any{"resources", i}, nil, "invalid or duplicate resource label %q", resource)
+		}
+		if seenTrimmed[trimmed] {
+			continue
+		}
+		seenTrimmed[trimmed] = true
+		normalized = append(normalized, trimmed)
+	}
+	if len(cfg.Resources) > 0 {
+		cfg.Resources = normalized
 	}
 
 	return &cfg, nil
@@ -451,9 +519,17 @@ func validateForeignListener(name string, at func(...any) []any, proc Process) e
 	return nil
 }
 
+// HasRuntimeTemplate reports whether a process dir still holds a runtime
+// template placeholder. The session expands ${session.*} and ${config.*}
+// when it starts, so such a dir cannot be resolved statically by anything
+// that only reads the config (the doctor, for example).
+func HasRuntimeTemplate(dir string) bool {
+	return strings.Contains(dir, "${session.") || strings.Contains(dir, "${config.")
+}
+
 func normalizeProcessDirs(processes map[string]Process, configDir string) {
 	for name, proc := range processes {
-		if proc.Dir == "" || strings.Contains(proc.Dir, "${session.") || strings.Contains(proc.Dir, "${config.") {
+		if proc.Dir == "" || HasRuntimeTemplate(proc.Dir) {
 			continue
 		}
 		if filepath.IsAbs(proc.Dir) {
@@ -611,6 +687,12 @@ func buildMergeCmd(m *Merge) (string, error) {
 		if m.Server == 0 {
 			return "", fmt.Errorf("merge.server port is required")
 		}
+		if err := checkPortRange("client", m.Client); err != nil {
+			return "", err
+		}
+		if err := checkPortRange("server", m.Server); err != nil {
+			return "", err
+		}
 		parts = append(parts, fmt.Sprintf("--client %d", m.Client))
 		parts = append(parts, fmt.Sprintf("--server %d", m.Server))
 		for _, p := range m.ApiPrefixes {
@@ -628,9 +710,26 @@ func buildMergeCmd(m *Merge) (string, error) {
 			m.Port = 8080
 		}
 	}
+	// The range check runs after the $PORT fallback: 0 means unset and is
+	// resolved to a real port before the port is judged.
+	if err := checkPortRange("port", m.Port); err != nil {
+		return "", err
+	}
 	parts = append(parts, fmt.Sprintf("--port %d", m.Port))
 
 	return strings.Join(parts, " "), nil
+}
+
+// checkPortRange refuses a port outside 1-65535. Zero means unset and must be
+// resolved before the check. The error carries the precise merge field path,
+// so the diagnostic names the offending field instead of the whole merge
+// section; the code stays invalid_merge.
+func checkPortRange(field string, port int) error {
+	if port < 1 || port > 65535 {
+		return invalid(CodeInvalidMerge, []any{"merge", field}, nil,
+			"merge.%s port %d is out of range (1-65535)", field, port)
+	}
+	return nil
 }
 
 // ─── Route auto-detection ─────────────────────────────────────────────────────
@@ -798,7 +897,8 @@ func rebaseURL(exampleVal, mergeBase string) string {
 // matches port, falling back to the first process whose name is in names.
 func findProcDir(procs map[string]Process, port int, names []string, configDir string) string {
 	portStr := fmt.Sprintf("%d", port)
-	for _, proc := range procs {
+	for _, name := range SortedProcessNames(procs) {
+		proc := procs[name]
 		if proc.Env["PORT"] == portStr {
 			return procDir(proc.Dir, configDir)
 		}
@@ -815,33 +915,76 @@ func findProcDir(procs map[string]Process, port int, names []string, configDir s
 // process that merge-port will proxy traffic to. Used by Load() to wire
 // readiness probes onto upstreams and depends_on onto merge-port itself.
 //
+// Only services can be upstreams: a task or teardown process is not waited
+// for, and the merge wiring must not write a ready_when probe into it.
+//
 // Simple mode: client + server (looked up by PORT env match, then by name,
 // honouring merge.client_process). Route mode: every process whose PORT
 // matches a "/prefix=PORT" target.
 //
 // Processes that already declare ready_when are left alone — the upstream
 // dependency edge is still added (the user's probe is what we wait on).
-func resolveUpstreamProcesses(procs map[string]Process, m *Merge) map[string]int {
+func resolveUpstreamProcesses(procs map[string]Process, m *Merge) (map[string]int, error) {
 	out := make(map[string]int)
+	candidates := serviceUpstreams(procs)
 	if len(m.Routes) > 0 {
 		for _, route := range m.Routes {
 			port := parseRoutePort(route)
 			if port == 0 {
 				continue
 			}
-			if name := procWithPort(procs, port); name != "" {
+			if name := procWithPort(candidates, port); name != "" {
 				out[name] = port
 			}
 		}
-		return out
+		return out, nil
 	}
-	if name := findClientProc(procs, m); name != "" && m.Client > 0 {
+	if name := findClientProc(candidates, m); name != "" && m.Client > 0 {
+		if err := checkUpstreamPort("client", name, candidates[name], m.Client); err != nil {
+			return nil, err
+		}
 		out[name] = m.Client
 	}
-	if name := findServerProc(procs, m); name != "" && m.Server > 0 {
+	if name := findServerProc(candidates, m); name != "" && m.Server > 0 {
+		if err := checkUpstreamPort("server", name, candidates[name], m.Server); err != nil {
+			return nil, err
+		}
 		out[name] = m.Server
 	}
+	return out, nil
+}
+
+// serviceUpstreams returns the processes that may act as merge upstreams.
+// The filter runs first: a non-service candidate is never selected, so it
+// gets neither a readiness probe nor a dependency edge.
+func serviceUpstreams(procs map[string]Process) map[string]Process {
+	out := make(map[string]Process, len(procs))
+	for name, proc := range procs {
+		if proc.EffectiveMode() == ProcessModeService {
+			out[name] = proc
+		}
+	}
 	return out
+}
+
+// checkUpstreamPort refuses an upstream that declares a PORT other than the
+// merge port it was selected for: the injected readiness probe would target a
+// port the process does not serve, and the proxy points at the merge port too.
+// A process that declares no PORT is probed at the merge port — the documented
+// guess. The declared port is compared numerically, so PORT: "05173" is the
+// merge port 5173.
+func checkUpstreamPort(field, name string, proc Process, mergePort int) error {
+	declared, ok := proc.Env["PORT"]
+	if !ok || strings.TrimSpace(declared) == "" {
+		return nil
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(declared))
+	if err != nil || value != mergePort {
+		return invalid(CodeInvalidMerge, []any{"merge", field}, nil,
+			"process %q declares PORT %q but merge.%s is %d: the proxy and its readiness probe target the merge port",
+			name, declared, field, mergePort)
+	}
+	return nil
 }
 
 // parseRoutePort extracts the port from a "/prefix=PORT" route spec.
@@ -859,15 +1002,16 @@ func parseRoutePort(route string) int {
 }
 
 // procWithPort returns the first process (excluding merge-port itself)
-// whose PORT env equals port. Skips merge-port to avoid self-dependencies
-// and returns "" when no candidate is found.
+// whose PORT env equals port. Candidates are visited in name order, so a
+// duplicated PORT always resolves to the same process. Skips merge-port to
+// avoid self-dependencies and returns "" when no candidate is found.
 func procWithPort(procs map[string]Process, port int) string {
 	want := fmt.Sprintf("%d", port)
-	for name, proc := range procs {
-		if name == "merge-port" {
+	for _, name := range SortedProcessNames(procs) {
+		if name == MergePortProcessName {
 			continue
 		}
-		if proc.Env["PORT"] == want {
+		if procs[name].Env["PORT"] == want {
 			return name
 		}
 	}
@@ -905,7 +1049,9 @@ func injectTCPReadyIfMissing(procs map[string]Process, name string, port int) {
 	procs[name] = p
 }
 
-// findClientProc finds the name of the client/frontend process.
+// findClientProc finds the name of the client/frontend process. Candidates
+// are visited in name order, so a duplicated PORT always resolves to the same
+// process.
 func findClientProc(procs map[string]Process, m *Merge) string {
 	if m.ClientProcess != "" {
 		if _, ok := procs[m.ClientProcess]; ok {
@@ -913,11 +1059,11 @@ func findClientProc(procs map[string]Process, m *Merge) string {
 		}
 	}
 	portStr := fmt.Sprintf("%d", m.Client)
-	for name, proc := range procs {
-		if name == "merge-port" {
+	for _, name := range SortedProcessNames(procs) {
+		if name == MergePortProcessName {
 			continue
 		}
-		if proc.Env["PORT"] == portStr {
+		if procs[name].Env["PORT"] == portStr {
 			return name
 		}
 	}
@@ -951,6 +1097,11 @@ func parseEnvFile(path string) (map[string]string, error) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	// A 64 KiB token limit silently truncated long env values (base64
+	// secrets, certificates). Raise it to 1 MiB and report the scanner's
+	// error, so an unreadable line is a located error instead of a truncated
+	// environment.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -971,5 +1122,36 @@ func parseEnvFile(path string) (map[string]string, error) {
 		}
 		result[key] = val
 	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("cannot read env file %s: %w", path, err)
+	}
 	return result, nil
+}
+
+// checkReferenceCollisions reports two endpoints whose ${ports.*} / ${urls.*}
+// reference names would be identical. A reference name is the process name
+// and the port name joined by a dot, so a dot in either part lets two
+// different endpoints claim one name. The dot-free port-name rule makes this
+// unreachable through Load; the check is the safety net that keeps the two
+// representations injective if that rule is ever relaxed.
+func checkReferenceCollisions(procs map[string]Process) error {
+	var collisions []string
+	for _, namespace := range []string{"ports", "urls"} {
+		seen := make(map[string]string)
+		for _, name := range SortedProcessNames(procs) {
+			for _, portName := range SortedProcessNames(procs[name].Ports) {
+				ref := namespace + "." + name + "." + portName
+				endpoint := fmt.Sprintf("process %q port %q", name, portName)
+				if other, ok := seen[ref]; ok {
+					collisions = append(collisions, fmt.Sprintf("%s is claimed by both %s and %s", ref, other, endpoint))
+					continue
+				}
+				seen[ref] = endpoint
+			}
+		}
+	}
+	if len(collisions) > 0 {
+		return invalid(CodeInvalidPort, nil, nil, "endpoint reference names collide: %s", strings.Join(collisions, "; "))
+	}
+	return nil
 }

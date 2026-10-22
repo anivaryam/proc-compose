@@ -30,6 +30,16 @@ const (
 	StateIndeterminate = "indeterminate"
 )
 
+// knownState reports whether state is one of the four attempt states a
+// receipt may carry.
+func knownState(state string) bool {
+	switch state {
+	case StateActive, StateCompleted, StateAbandoned, StateIndeterminate:
+		return true
+	}
+	return false
+}
+
 // Overall and phase statuses.
 const (
 	StatusPassed      = "passed"
@@ -41,6 +51,17 @@ const (
 	StatusNotNeeded   = "not_needed"
 	StatusNotConfig   = "not_configured"
 )
+
+// knownOverallStatus reports whether status is one of the overall attempt
+// statuses. The phase statuses below are not attempt verdicts: an attempt's
+// `status` field carries the overall one.
+func knownOverallStatus(status string) bool {
+	switch status {
+	case StatusPassed, StatusFailed, StatusInterrupted, StatusNotRun:
+		return true
+	}
+	return false
+}
 
 // Phases.
 const (

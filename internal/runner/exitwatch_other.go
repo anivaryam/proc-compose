@@ -9,10 +9,13 @@ import "errors"
 //
 // proc-compose ships, tests and documents Linux, macOS and Windows only: the
 // platform matrix in docs/platforms.md, the release build matrix and the CI test matrix cover
-// exactly those three. Nothing here is a released behaviour for another platform,
-// so the caller falls back to detecting exit by reaping — which is what
-// proc-compose has always done — rather than terminating process groups it cannot
-// prove it owns.
+// exactly those three.
+//
+// An observation failure is fatal here, not a fallback. The caller withdraws
+// signalling authority, kills the leader it owns by its own handle, and
+// returns an error: there is no reap-based detection of the exit to fall back
+// to, and terminating a process group the runner cannot prove it owns would
+// be unsound. Every launch therefore fails on these platforms.
 var errObservationUnsupported = errors.New("exit observation without reaping is not supported on this platform")
 
 // newPlatformExitObserver reports that this platform cannot observe the command
@@ -20,10 +23,11 @@ var errObservationUnsupported = errors.New("exit observation without reaping is 
 //
 // proc-compose ships, tests and documents Linux, macOS and Windows only: the
 // platform matrix in docs/platforms.md, the release build matrix and the CI test matrix cover
-// exactly those three. Nothing here is a released behaviour for another
-// platform, so the caller falls back to detecting exit by reaping — which is
-// what proc-compose has always done — rather than terminating process groups it
-// cannot prove it owns.
+// exactly those three.
+//
+// The error is fatal for the launch: the caller has no reap-based fallback, so
+// every command fails here. docs/platforms.md records these platforms as
+// unsupported.
 func observeLeaderExitPlatform(pid int) (exitObserver, error) {
 	return nil, errObservationUnsupported
 }

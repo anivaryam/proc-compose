@@ -40,7 +40,7 @@ const szomb = 5
 // the table as a zombie; treating those as live would turn a successful shutdown
 // into a reported failure.
 func groupMembers(pgid int) (int, bool) {
-	pids, ok := groupMemberPIDs(pgid)
+	pids, ok := enumerateGroupMembers(pgid)
 	return len(pids), ok
 }
 

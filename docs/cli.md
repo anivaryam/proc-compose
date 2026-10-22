@@ -185,6 +185,14 @@ Keys:
 | `G`             | Jump to live tail                     |
 | `g`             | Jump to top of log buffer             |
 
+The highlighted row follows the process it names. When the health-sorted order
+changes — a process fails, restarts, or appears — the cursor stays on the same
+process, and `Enter` filters the logs of the highlighted process.
+
+If keyboard input ends (stdin is closed or unreadable), the monitor restores
+the terminal and exits, printing `keyboard input closed — exiting monitor` on
+stderr. It does not keep redrawing without a usable keyboard.
+
 `NO_COLOR=1` (or `--no-color` on `up`) disables colour output in both the runner and the monitor.
 
 Completed task rows stay visible as `✓ completed` with readiness `done`.
@@ -199,6 +207,20 @@ proc-compose up --survive --name myapp --install
 
 This writes a unit to `~/.config/systemd/user/proc-compose-<name>.service` and enables it.
 The service starts `proc-compose up --silent` in daemon mode, which manages all processes.
+
+The generated unit refers to your project paths as written: a path containing a
+space is quoted, and a path containing `%` is escaped so systemd keeps it
+literal. A path containing a newline, a NUL byte, a quote, a backslash or `$`
+is refused — systemd would rewrite it instead of running it.
+
+`ExecStart=` and `Environment=` are quoted; `WorkingDirectory=` is **not**,
+because systemd does not strip quotes there. A project path must therefore not
+begin or end with whitespace: a path with surrounding whitespace is used
+verbatim and the unit starts in the wrong directory.
+
+A unit that was installed by an earlier version keeps the file it was written
+with. Re-run `proc-compose up --survive --install` to regenerate it with the
+corrected quoting and escaping.
 
 To manually install without enabling immediately:
 
@@ -391,7 +413,7 @@ proc-compose doctor --write  # create proc-compose.yml when none exists
 proc-compose doctor --json   # emit machine-readable report
 ```
 
-`doctor` helps first-time setup and existing config debugging. Without a config file, it scans common Node, Go, and Python project layouts, then prints suggested processes, ports, readiness probes, and YAML. It understands npm/yarn/pnpm/bun package runners, common frontend dev servers (Next.js, Vite, SvelteKit, Astro), Go `cmd/**/main.go` binaries, and Python Django/Flask/Uvicorn/Hypercorn entrypoints. With an existing config, it checks paths, env files, port conflicts, readiness gaps, restart loops, merge-port setup, and likely missing binaries.
+`doctor` helps first-time setup and existing config debugging. Without a config file, it scans common Node, Go, and Python project layouts, then prints suggested processes, ports, readiness probes, and YAML. It understands npm/yarn/pnpm/bun package runners, common frontend dev servers (Next.js, Vite, SvelteKit, Astro), Go `cmd/**/main.go` binaries, and Python Django/Flask/Uvicorn/Hypercorn entrypoints. With an existing config, it checks paths, env files, port conflicts, readiness gaps, restart loops, merge-port setup, and likely missing binaries. It also checks the config it suggests, so a suggestion that needs `merge-port` reports the missing binary even when no config exists yet; that finding names the suggested config so it can be told apart from a finding about the config on disk.
 
 `--write` is safe by default: it only creates `proc-compose.yml` when neither `proc-compose.yml` nor `proc-compose.yaml` exists.
 
@@ -436,6 +458,14 @@ When running with `--log-file`, use `--max-log-size` to automatically rotate log
 ```sh
 proc-compose up --silent --log-file app.log --max-log-size 52428800  # 50 MB
 ```
+
+A rotation that fails keeps the bytes already written: the live file is
+renamed aside before anything else happens, so a failed rename never
+truncates the log. The write that triggered the failed rotation reports the
+failure. For the **event journal**, the run's result then carries an
+`event journal: …` error and the command exits non-zero. For the `--log-file`
+writer, the write error is not carried into the run's result: the failure is
+reported on the daemon's stderr only, and the command still exits zero.
 
 ### Use a different config file
 

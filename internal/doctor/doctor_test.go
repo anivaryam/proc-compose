@@ -742,6 +742,15 @@ processes:
 	if !hasFinding(report, codeMissingMergePort) {
 		t.Fatalf("expected missing_merge_port finding, got %+v", report.Findings)
 	}
+	// The finding about the config on disk keeps an empty detail; the
+	// suggested config carries its own detail.
+	found := findingsByCode(report, codeMissingMergePort)
+	if len(found) != 1 {
+		t.Fatalf("expected exactly one missing_merge_port finding, got %+v", found)
+	}
+	if found[0].Detail != "" {
+		t.Fatalf("existing-config finding detail = %q, want empty", found[0].Detail)
+	}
 }
 
 func TestExistingConfigWarnsOnAlwaysRestartWithoutCapAndMissingTunnel(t *testing.T) {
@@ -848,6 +857,286 @@ func hasFinding(report *Report, code string) bool {
 		}
 	}
 	return false
+}
+
+// findingsByCode returns the findings with the given code, in report order.
+func findingsByCode(report *Report, code string) []Finding {
+	var found []Finding
+	for _, finding := range report.Findings {
+		if finding.Code == code {
+			found = append(found, finding)
+		}
+	}
+	return found
+}
+
+// findingSignature renders the findings of a report as a comparable string so
+// two runs can be compared for determinism.
+func findingSignature(report *Report) string {
+	parts := make([]string, 0, len(report.Findings))
+	for _, finding := range report.Findings {
+		parts = append(parts, finding.Code+"|"+finding.Message+"|"+finding.Detail)
+	}
+	return strings.Join(parts, "\n")
+}
+
+// stubMergePortInPath replaces the merge-port PATH probe for one test.
+func stubMergePortInPath(t *testing.T, present bool) {
+	t.Helper()
+	old := mergePortInPath
+	mergePortInPath = func() bool { return present }
+	t.Cleanup(func() { mergePortInPath = old })
+}
+
+// writeMergeProject writes a project with one frontend and one backend so the
+// doctor's suggestion carries a merge: section.
+func writeMergeProject(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "web", "package.json"), `{"scripts":{"dev":"vite"},"devDependencies":{"vite":"latest"}}`)
+	writeFile(t, filepath.Join(dir, "api", "package.json"), `{"scripts":{"dev":"node server.js"}}`)
+	writeFile(t, filepath.Join(dir, "api", ".env.example"), "PORT=3001\n")
+	return dir
+}
+
+// TestExistingConfigSkipsMissingDirForRuntimeTemplate: a dir that still
+// holds a runtime template is expanded when the session starts, so the doctor
+// must not assert that it does not exist.
+func TestExistingConfigSkipsMissingDirForRuntimeTemplate(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `processes:
+  api:
+    cmd: go run .
+    dir: ${config.dir}
+  web:
+    cmd: npm run dev
+    dir: ${session.dir}
+`)
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found := findingsByCode(report, codeMissingDir); len(found) != 0 {
+		t.Fatalf("expected no missing_dir finding for runtime templates, got %+v", found)
+	}
+}
+
+// TestSuggestedConfigReportsMissingMergePort: the config the doctor suggests
+// is what the user is told to run, so a missing merge-port binary in it is
+// reported even when no config exists.
+func TestSuggestedConfigReportsMissingMergePort(t *testing.T) {
+	dir := writeMergeProject(t)
+	stubMergePortInPath(t, false)
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := findingsByCode(report, codeMissingMergePort)
+	if len(found) != 1 {
+		t.Fatalf("expected exactly one missing_merge_port finding, got %+v", report.Findings)
+	}
+	if found[0].Detail != "suggested config" {
+		t.Fatalf("finding detail = %q, want %q", found[0].Detail, "suggested config")
+	}
+	if !strings.Contains(found[0].Message, "suggested config") {
+		t.Fatalf("finding message = %q, want it to name the suggested config", found[0].Message)
+	}
+}
+
+// TestSuggestedConfigHasNoMergePortFindingWhenBinaryIsOnPath: the check
+// reports a missing binary, not the mere presence of a merge: section.
+func TestSuggestedConfigHasNoMergePortFindingWhenBinaryIsOnPath(t *testing.T) {
+	dir := writeMergeProject(t)
+	stubMergePortInPath(t, true)
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found := findingsByCode(report, codeMissingMergePort); len(found) != 0 {
+		t.Fatalf("expected no missing_merge_port finding, got %+v", found)
+	}
+}
+
+// TestMergePortFindingsAreDeduplicatedPerSubject: an existing config and the
+// suggested config are two subjects, so each may carry its own finding, but
+// neither may carry more than one.
+func TestMergePortFindingsAreDeduplicatedPerSubject(t *testing.T) {
+	dir := writeMergeProject(t)
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `merge:
+  client: 5173
+  server: 3001
+
+processes:
+  web:
+    cmd: npm run dev
+  api:
+    cmd: go run .
+`)
+	stubMergePortInPath(t, false)
+
+	report, err := Run(Options{Root: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := findingsByCode(report, codeMissingMergePort)
+	if len(found) != 2 {
+		t.Fatalf("expected one finding per subject, got %+v", found)
+	}
+	byDetail := map[string]int{}
+	for _, finding := range found {
+		byDetail[finding.Detail]++
+	}
+	if byDetail[""] != 1 || byDetail["suggested config"] != 1 {
+		t.Fatalf("expected one finding per subject detail, got %+v", byDetail)
+	}
+}
+
+// TestUnparseableSuggestedConfigIsIgnored: a suggestion that does not parse
+// must not produce a finding, an invalid_config finding, or an error.
+func TestUnparseableSuggestedConfigIsIgnored(t *testing.T) {
+	report := &Report{Findings: []Finding{}, SuggestedYAML: "processes: [\n"}
+
+	checkSuggestedConfig(report)
+
+	if len(report.Findings) != 0 {
+		t.Fatalf("expected no findings for an unparseable suggestion, got %+v", report.Findings)
+	}
+}
+
+// TestDoctorFindingsAreDeterministic: the doctor output is a diagnostic
+// artifact consumed by humans and CI, so repeated runs must agree.
+func TestDoctorFindingsAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `processes:
+  alpha:
+    cmd: echo alpha
+    dir: ./missing-alpha
+    env:
+      PORT: "3000"
+  bravo:
+    cmd: echo bravo
+    dir: ./missing-bravo
+    env:
+      PORT: "3000"
+  charlie:
+    cmd: echo charlie
+    env_file: ./missing-charlie.env
+`)
+
+	var first string
+	for i := 0; i < 40; i++ {
+		report, err := Run(Options{Root: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		signature := findingSignature(report)
+		if i == 0 {
+			first = signature
+			continue
+		}
+		if signature != first {
+			t.Fatalf("run %d produced a different finding sequence:\n%s\nfirst:\n%s", i, signature, first)
+		}
+	}
+}
+
+// TestMissingEnvFileFindingsAreDeterministic: precheckEnvFiles is the only
+// producer of missing_env_file findings, so its order must be stable too.
+func TestMissingEnvFileFindingsAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `processes:
+  alpha:
+    cmd: echo alpha
+    env_file: ./missing-alpha.env
+  bravo:
+    cmd: echo bravo
+    env_file: ./missing-bravo.env
+  charlie:
+    cmd: echo charlie
+    env_file: ./missing-charlie.env
+`)
+
+	var first string
+	for i := 0; i < 40; i++ {
+		report, err := Run(Options{Root: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := findingsByCode(report, codeMissingEnvFile)
+		var order []string
+		for _, finding := range found {
+			order = append(order, finding.Message)
+		}
+		signature := strings.Join(order, "\n")
+		if i == 0 {
+			first = signature
+			continue
+		}
+		if signature != first {
+			t.Fatalf("run %d produced a different missing_env_file order:\n%s\nfirst:\n%s", i, signature, first)
+		}
+	}
+	if first == "" {
+		t.Fatal("expected missing_env_file findings")
+	}
+}
+
+// TestDuplicatePortFindingsUseLexicographicallyFirstProcesses: the set and
+// count of duplicate-port findings does not change with a deterministic
+// iteration order, but the reported pair does — it is now the two
+// lexicographically-first processes.
+//
+// The fixture lists its processes in reverse-sorted order deliberately. The
+// doctor reads the config into a map, and Go randomises a map's iteration
+// order; the pre-fix code ranged over that map, so the process that owned the
+// port — and with it the reported pair — depended on the iteration order. A
+// map built from a reverse-sorted document is only ever iterated in rotations
+// of that document order, and no rotation yields the sorted pair sequence, so
+// the pre-fix code fails this test on every run instead of only when the
+// random order happens to differ.
+//
+// The check is repeated as well: every run must yield the same finding
+// sequence, so a report that is not reproducible fails the test too.
+func TestDuplicatePortFindingsUseLexicographicallyFirstProcesses(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "proc-compose.yml"), `processes:
+  charlie:
+    cmd: echo charlie
+    env:
+      PORT: "3000"
+  bravo:
+    cmd: echo bravo
+    env:
+      PORT: "3000"
+  alpha:
+    cmd: echo alpha
+    env:
+      PORT: "3000"
+`)
+
+	want := []string{
+		`processes "alpha" and "bravo" both use port 3000`,
+		`processes "alpha" and "charlie" both use port 3000`,
+	}
+	const runs = 40
+	for run := 0; run < runs; run++ {
+		report, err := Run(Options{Root: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := findingsByCode(report, codeDuplicatePort)
+		if len(found) != 2 {
+			t.Fatalf("run %d: expected 2 duplicate_port findings, got %+v", run, found)
+		}
+		for i, message := range want {
+			if found[i].Message != message {
+				t.Fatalf("run %d: finding %d message = %q, want %q", run, i, found[i].Message, message)
+			}
+		}
+	}
 }
 
 func TestServiceDependencyWithoutReadinessWarns(t *testing.T) {

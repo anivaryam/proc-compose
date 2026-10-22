@@ -100,6 +100,23 @@ func ProcStat(pid int) (ProcInfo, error) {
 	return ProcInfo{State: rest[0][0], PGID: pgid, StartTime: start}, nil
 }
 
+// syncDirectory flushes a directory's entries so the ones created inside it —
+// such as the rename that installs an atomically written file — survive a
+// machine-level failure. Not every filesystem supports flushing a directory;
+// the caller discards the error, so an unsupported platform only loses the
+// extra durability, never the write.
+//
+// A slow directory flush is possible too (NFS and FUSE mounts): swallowing
+// errors does not bound that latency.
+func syncDirectory(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 // HostIdentity returns the current boot id and the pid and time namespaces of
 // this process. Values that cannot be read, and every value off Linux, are
 // empty.

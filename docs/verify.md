@@ -91,12 +91,53 @@ proc-compose config schema                 # versioned JSON Schema for proc-comp
 Receipts and journals live in the runtime directory and may disappear at
 logout or reboot. `why --attempt` reads only events stamped with that attempt
 and reports missing or rotated history explicitly; it shows temporal order, not
-causes. `sessions` only reads metadata (set `PROC_COMPOSE_OWNER` to label who
+causes. A record that carries no attempt id is scoped to its run instead
+(`boundary: run_id`, limitation `attempt_boundary_unavailable`).
+`sessions` only reads metadata (set `PROC_COMPOSE_OWNER` to label who
 started a session); retained environments are the ones started with
 `up --silent`, and are stopped with the command it prints. `compare` runs the
 same check against two worktrees with separate sessions and reports outcome
 differences; it neither isolates external data nor attributes differences to
 the code change.
+
+A receipt is a complete attempt record: `state` is one of `active`,
+`completed`, `abandoned`, or `indeterminate`, and `status` is one of the
+overall statuses `passed`, `failed`, `interrupted`, or `not_run`. A file that
+does not satisfy that contract is refused like an unreadable one: `attempts`
+skips it, and it is preserved rather than pruned. While an attempt runs, its
+receipt says `state: active` with `status: not_run` — an attempt that has not
+finished has no verdict yet; the terminal receipt carries the real one.
+
+## Comparisons
+
+`compare` runs the same check against two worktrees, one attempt per side per
+repetition, alternating which side goes first. The verdict is
+`outcomes_equal`:
+
+- `true` — every repetition pair agreed: repetition *i* of the baseline
+  against repetition *i* of the candidate.
+- `false` — a difference was proven.
+- `null` — no verdict could be proven. The reason is named in `limitations`:
+  `nondeterministic_within_side` when one side's own repetitions disagree, and
+  `output_truncated` when a compared output was truncated.
+
+`status` stays `comparable` and the exit status stays 0 for all three; only
+the verdict is withheld. `differences` and `sides[*].attempts[]` remain the
+observations either way.
+
+Each stream of the check's output is captured up to 4 KiB, so `stdout_sha256`
+and `stderr_sha256` digest the captured prefix only, and `output_truncated`
+marks a stream that was cut off. A comparison that compared a truncated output
+has no verdict: the digests cannot show what followed the cap.
+
+`sides[*].median_check_ms` is the median of that side's check durations: the
+middle value for an odd number of samples, and the average of the two middle
+values for an even number, rounded half up.
+
+The check receives `PROC_COMPOSE_COMPARE_SIDE` (`baseline` or `candidate`)
+and `PROC_COMPOSE_COMPARE_REPETITION` (1-based) so it can select explicitly
+isolated data. The tool sets both, and they win over a variable of the same
+name supplied by the caller.
 
 ## Environment reports
 

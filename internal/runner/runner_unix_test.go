@@ -5,7 +5,9 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -23,6 +25,7 @@ import (
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"golang.org/x/sys/unix"
 )
 
 // TestProcessGroup_LeaderExitKeepsSignallingAuthority is the ownership
@@ -2133,4 +2136,530 @@ func fmtExitCode(code *int) string {
 		return "<nil>"
 	}
 	return strconv.Itoa(*code)
+}
+
+// ── termination signalling: membership versus authority ──────────────────────
+
+// fixedStateGroup is a ProcessGroup double that reports a fixed state and
+// records the signals it received.
+//
+// When emptyAfterKill is set it reports an empty group once it has been killed,
+// which models a group that really did drain; that keeps the tests that drive
+// the whole escalation short, because the settle window after a kill is two
+// seconds long.
+type fixedStateGroup struct {
+	state          GroupState
+	emptyAfterKill bool
+
+	mu         sync.Mutex
+	terminated int
+	killed     int
+}
+
+func (g *fixedStateGroup) Setup(*exec.Cmd)       {}
+func (g *fixedStateGroup) Track(*exec.Cmd) error { return nil }
+
+func (g *fixedStateGroup) Terminate() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.terminated++
+	return nil
+}
+
+func (g *fixedStateGroup) Kill() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.killed++
+	return nil
+}
+
+func (g *fixedStateGroup) State() GroupState {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.emptyAfterKill && g.killed > 0 {
+		return GroupEmpty
+	}
+	return g.state
+}
+
+func (g *fixedStateGroup) Identify() string { return "fixed" }
+func (g *fixedStateGroup) Withdraw()        {}
+
+func (g *fixedStateGroup) Seal() (SealObservation, error) {
+	return SealObservation{State: g.State(), Identity: "fixed"}, nil
+}
+
+func (g *fixedStateGroup) Close() error { return nil }
+
+func (g *fixedStateGroup) counts() (terminated, killed int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.terminated, g.killed
+}
+
+// TestTerminateGroup_UnknownGroupIsSignalled pins that a group whose
+// membership cannot be enumerated is still signalled.
+//
+// The runner has already established signalling authority when it gets here,
+// so declining to signal because the membership is unknown would leave the
+// tree running in exactly the situation where the runner cannot prove it is
+// gone.
+func TestTerminateGroup_UnknownGroupIsSignalled(t *testing.T) {
+	pg := &fixedStateGroup{state: GroupUnavailable, emptyAfterKill: true}
+	terminateGroup(pg, 50*time.Millisecond)
+	terminated, killed := pg.counts()
+	if terminated != 1 {
+		t.Fatalf("Terminate calls on an unknown group = %d, want 1", terminated)
+	}
+	if killed != 1 {
+		t.Fatalf("Kill calls on an unknown group = %d, want the escalation to run", killed)
+	}
+}
+
+// TestTerminateGroup_EmptyGroupIsNotSignalled pins the other half of the rule:
+// an empty group has nothing left to stop, so it is neither signalled nor
+// waited for.
+func TestTerminateGroup_EmptyGroupIsNotSignalled(t *testing.T) {
+	pg := &fixedStateGroup{state: GroupEmpty}
+	start := time.Now()
+	terminateGroup(pg, 5*time.Second)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("an empty group spent %s of the grace window", elapsed)
+	}
+	terminated, killed := pg.counts()
+	if terminated != 0 || killed != 0 {
+		t.Fatalf("signals sent to an empty group: terminate=%d kill=%d, want none", terminated, killed)
+	}
+}
+
+// TestWaitWhileLive_UnknownGroupIsNotDrained pins that "unknown" is not
+// "drained": a group whose membership cannot be enumerated is polled until the
+// budget is spent, so the escalation that follows the wait still runs.
+func TestWaitWhileLive_UnknownGroupIsNotDrained(t *testing.T) {
+	pg := &fixedStateGroup{state: GroupUnavailable}
+	start := time.Now()
+	drained := waitWhileLive(pg, 50*time.Millisecond)
+	elapsed := time.Since(start)
+	if drained {
+		t.Fatal("waitWhileLive reported an unknown group as drained")
+	}
+	if elapsed < 50*time.Millisecond {
+		t.Fatalf("waitWhileLive returned after %s, want it to spend the budget", elapsed)
+	}
+}
+
+// TestWaitWhileLive_EmptyGroupDrainsImmediately pins that an empty group ends
+// the wait at once, so a successful command with no descendants pays no
+// teardown budget.
+func TestWaitWhileLive_EmptyGroupDrainsImmediately(t *testing.T) {
+	pg := &fixedStateGroup{state: GroupEmpty}
+	start := time.Now()
+	if !waitWhileLive(pg, 5*time.Second) {
+		t.Fatal("waitWhileLive did not report an empty group as drained")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("an empty group spent %s of the budget", elapsed)
+	}
+}
+
+// TestSignal_DeadGroupReportsProcessDone pins the ProcessGroup contract: a
+// group that is gone reports os.ErrProcessDone, not the raw ESRCH.
+//
+// The contract is in processgroup.go: Terminate and Kill "return
+// os.ErrProcessDone when the group can no longer be signalled". A caller
+// cannot tell "nothing left to signal" from "the signal failed" unless the
+// two are the same value.
+func TestSignal_DeadGroupReportsProcessDone(t *testing.T) {
+	pg := &unixProcessGroup{pgid: deadProcessGroupID(t)}
+	err := pg.Terminate()
+	if !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Terminate on a dead group = %v, want os.ErrProcessDone", err)
+	}
+	if err := pg.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("Kill on a dead group = %v, want os.ErrProcessDone", err)
+	}
+}
+
+// deadProcessGroupID returns a process-group ID that provably does not exist,
+// so a signal to it is answered with ESRCH rather than reaching a process.
+//
+// It starts a short-lived child, waits for it to be collected, and then uses
+// its identifier: the identifier is free again, and a group led by it does not
+// exist.
+func deadProcessGroupID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start probe: %v", err)
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("wait for probe: %v", err)
+	}
+	return pid
+}
+
+// ── Setup: the caller's attributes ───────────────────────────────────────────
+
+// TestSetup_KeepsCallerSysProcAttr pins that Setup adds the process-group flag
+// to the caller's attributes instead of replacing them.
+//
+// The Windows implementation already preserves them, and the contract is the
+// same on both platforms: a caller that sets credentials, a chroot or a
+// parent-death signal must not silently lose them.
+func TestSetup_KeepsCallerSysProcAttr(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Chroot: "/tmp"}
+	pg := newProcessGroup()
+	pg.Setup(cmd)
+	if cmd.SysProcAttr == nil {
+		t.Fatal("Setup dropped the caller's SysProcAttr")
+	}
+	if cmd.SysProcAttr.Chroot != "/tmp" {
+		t.Fatalf("caller's SysProcAttr.Chroot = %q, want it preserved", cmd.SysProcAttr.Chroot)
+	}
+	if !cmd.SysProcAttr.Setpgid {
+		t.Fatal("Setup did not set Setpgid")
+	}
+}
+
+// TestSetup_SetsSetpgidWithoutCallerStruct pins the other half: a command
+// that brought no attributes of its own still ends up in its own group.
+func TestSetup_SetsSetpgidWithoutCallerStruct(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 0")
+	pg := newProcessGroup()
+	pg.Setup(cmd)
+	if cmd.SysProcAttr == nil {
+		t.Fatal("Setup left SysProcAttr nil")
+	}
+	if !cmd.SysProcAttr.Setpgid {
+		t.Fatal("Setup did not set Setpgid")
+	}
+}
+
+// ── setsid(2) and the managed process group ─────────────────────────────────
+
+// setsidHelperSentinel marks the helper invocation of TestRunnerSetsidHelper.
+const setsidHelperSentinel = "__PROC_COMPOSE_SETSID_HELPER__"
+
+// setsidHelperArgs builds the argument list that re-invokes this test binary
+// in setsid-helper mode.
+//
+// The helper calls setsid(2) itself. The setsid(1) utility cannot stand in for
+// it: it forks when its caller is already a process-group leader, so it would
+// never report the restriction this test is about.
+func setsidHelperArgs(args ...string) []string {
+	return []string{
+		"-test.run=^TestRunnerSetsidHelper$",
+		"--",
+		setsidHelperSentinel,
+		encodeHelperArgs(args...),
+	}
+}
+
+// setsidHelperPayload returns the decoded helper payload, and whether this
+// process is the helper at all.
+func setsidHelperPayload() (string, bool) {
+	for i, a := range os.Args {
+		if a != setsidHelperSentinel {
+			continue
+		}
+		if i+1 >= len(os.Args) {
+			return "", false
+		}
+		decoded, err := base64.RawURLEncoding.DecodeString(os.Args[i+1])
+		if err != nil {
+			return "", false
+		}
+		return string(decoded), true
+	}
+	return "", false
+}
+
+// TestRunnerSetsidHelper is the child program of the setsid tests. It exists
+// as a test so the test binary can re-invoke itself.
+func TestRunnerSetsidHelper(t *testing.T) {
+	payload, ok := setsidHelperPayload()
+	if !ok {
+		return
+	}
+	mode := "setsid"
+	if parts := strings.Split(payload, "\x00"); len(parts) > 0 && parts[0] != "" {
+		mode = parts[0]
+	}
+	switch mode {
+	case "setsid":
+		os.Exit(runSetsidHelper())
+	case "setsid-descendant":
+		os.Exit(runSetsidDescendantHelper())
+	}
+	os.Exit(2)
+}
+
+// runSetsidHelper calls setsid(2) in this process and reports the outcome.
+func runSetsidHelper() int {
+	if _, err := unix.Setsid(); err != nil {
+		name := "unknown"
+		if errors.Is(err, syscall.EPERM) {
+			name = "EPERM"
+		}
+		fmt.Fprintf(os.Stderr, "setsid failed: %s: %v\n", name, err)
+		return 3
+	}
+	fmt.Println("setsid ok")
+	return 0
+}
+
+// runSetsidDescendantHelper starts a child that calls setsid(2) and reports
+// the child's exit code.
+//
+// The child is a descendant, not the group leader, so its setsid(2) call is
+// allowed — that is the case the restriction does not cover.
+func runSetsidDescendantHelper() int {
+	child := exec.Command(os.Args[0], setsidHelperArgs("setsid")...)
+	out, err := child.CombinedOutput()
+	fmt.Printf("%s", out)
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			fmt.Printf("descendant exit: %d\n", exitErr.ExitCode())
+			return 0
+		}
+		fmt.Printf("descendant failed: %v\n", err)
+		return 4
+	}
+	fmt.Println("descendant exit: 0")
+	return 0
+}
+
+// TestSetsid_LeaderSideCallIsRefusedUnderProcessGroupSetup pins the
+// documented restriction: a managed command is the leader of its own process
+// group, and POSIX forbids a process-group leader from calling setsid(2).
+//
+// It pins the two cases the restriction does not cover as well: the same child
+// succeeds when it is not put in a group of its own, and a descendant — which
+// is not the leader — may call setsid(2) freely.
+func TestSetsid_LeaderSideCallIsRefusedUnderProcessGroupSetup(t *testing.T) {
+	out, code := runSetsidChild(t, false)
+	if code != 0 || !strings.Contains(out, "setsid ok") {
+		t.Fatalf("setsid without a process group = %q (exit %d), want it to succeed", out, code)
+	}
+
+	out, code = runSetsidChild(t, true)
+	if code != 3 || !strings.Contains(out, "EPERM") {
+		t.Fatalf("setsid as a group leader = %q (exit %d), want EPERM", out, code)
+	}
+
+	out, code = runSetsidChild(t, true, "setsid-descendant")
+	if code != 0 || !strings.Contains(out, "descendant exit: 0") {
+		t.Fatalf("setsid in a descendant = %q (exit %d), want it to succeed", out, code)
+	}
+
+	// The setsid(1) utility is not affected by the restriction: it forks when
+	// its caller is already a group leader, so `cmd: setsid server` still
+	// works.
+	if path, err := exec.LookPath("setsid"); err == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cmd := exec.CommandContext(ctx, path, "true")
+		newProcessGroup().Setup(cmd)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("setsid(1) as a group leader = %q (%v), want it to succeed", out, err)
+		}
+	}
+}
+
+// runSetsidChild runs the setsid helper and reports its combined output and
+// exit code. When grouped is set the child leads its own process group, the
+// way the runner launches a managed command.
+func runSetsidChild(t *testing.T, grouped bool, args ...string) (string, int) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], setsidHelperArgs(args...)...)
+	if grouped {
+		newProcessGroup().Setup(cmd)
+	}
+	out, err := cmd.CombinedOutput()
+	code := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("run setsid helper: %v", err)
+		}
+		code = exitErr.ExitCode()
+	}
+	return string(out), code
+}
+
+// ── group members and group-specific reasons ────────────────────────────────
+//
+// The shutdown verdict is the operator's only account of what could not be
+// terminated, so it has to name the members it found and explain a failure
+// with the reason of the group it is reporting on.
+
+// stubGroupEnumeration replaces the platform's membership enumeration and
+// returns the function that restores it.
+func stubGroupEnumeration(t *testing.T, fn func(pgid int) ([]int, bool)) func() {
+	t.Helper()
+	previous := enumerateGroupMembers
+	enumerateGroupMembers = fn
+	return func() { enumerateGroupMembers = previous }
+}
+
+// stubGroupKill replaces the existence probe and returns the function that
+// restores it.
+func stubGroupKill(t *testing.T, fn func(pid int, sig syscall.Signal) error) func() {
+	t.Helper()
+	previous := groupKill
+	groupKill = fn
+	return func() { groupKill = previous }
+}
+
+// TestSurvivorsError_NamesTheEnumeratedMembers pins that the verdict names the
+// members the runner enumerated: a group whose members could be read must not
+// be reported as "could not be enumerated".
+//
+// The fixture has a descendant that stays in the group, so the member list
+// holds a PID that is not the group's identifier: only an enumerated member
+// list can name it.
+func TestSurvivorsError_NamesTheEnumeratedMembers(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "descendant.pid")
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	stay := writeScript(t, dir, "stay.sh", stayScript)
+	pg, _, descendant := startGroupWithSurvivor(t, stay+" "+stubborn+" "+pidFile, pidFile)
+	t.Cleanup(func() { _ = pg.Kill() })
+
+	state := pg.State()
+	if state != GroupOwned {
+		t.Fatalf("State() = %v, want %v for a group with live members", state, GroupOwned)
+	}
+	err := survivorsError(groupResult("svc", pg, state))
+	if err == nil {
+		t.Fatal("survivorsError() on an owned group = nil, want an error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, strconv.Itoa(descendant)) {
+		t.Fatalf("verdict = %q, want it to name the live member %d", msg, descendant)
+	}
+	if strings.Contains(msg, "could not be enumerated") {
+		t.Fatalf("verdict = %q, want the enumerated member named instead", msg)
+	}
+}
+
+// TestSurvivorsError_UnenumerableMembersKeepTheWording pins the other case:
+// when the enumeration fails but the kill probe succeeds, the members really
+// could not be enumerated, so the wording says so and no member list is
+// rendered.
+func TestSurvivorsError_UnenumerableMembersKeepTheWording(t *testing.T) {
+	pg, _ := startTrackedGroup(t, helperCmd("sleep", "120s"))
+	restoreEnumeration := stubGroupEnumeration(t, func(int) ([]int, bool) { return nil, false })
+	defer restoreEnumeration()
+	restoreKill := stubGroupKill(t, func(int, syscall.Signal) error { return nil })
+	defer restoreKill()
+
+	state := pg.State()
+	if state != GroupOwned {
+		t.Fatalf("State() = %v, want %v when only the kill probe succeeded", state, GroupOwned)
+	}
+	err := survivorsError(groupResult("svc", pg, state))
+	if err == nil {
+		t.Fatal("survivorsError() on an owned group = nil, want an error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "could not be enumerated") {
+		t.Fatalf("verdict = %q, want it to say the members could not be enumerated", msg)
+	}
+	if strings.Contains(msg, "still running") {
+		t.Fatalf("verdict = %q, want no member list when the members are unknown", msg)
+	}
+}
+
+// TestSealObservation_NamesTheEnumeratedMembers pins that the sealed path
+// carries the members too: the sweep's verdict names the PIDs it found.
+func TestSealObservation_NamesTheEnumeratedMembers(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "descendant.pid")
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	stay := writeScript(t, dir, "stay.sh", stayScript)
+	pg, _, descendant := startGroupWithSurvivor(t, stay+" "+stubborn+" "+pidFile, pidFile)
+	t.Cleanup(func() { _ = pg.Kill() })
+
+	observation, err := pg.Seal()
+	if err != nil {
+		t.Fatalf("Seal() = %v", err)
+	}
+	found := false
+	for _, member := range observation.Members {
+		if member == strconv.Itoa(descendant) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("seal observation members = %v, want the live member %d", observation.Members, descendant)
+	}
+	verdict := survivorsError(sealedGroupResult("svc", observation))
+	if verdict == nil {
+		t.Fatal("survivorsError() on a sealed group with a live member = nil, want an error")
+	}
+	if !strings.Contains(verdict.Error(), strconv.Itoa(descendant)) {
+		t.Fatalf("verdict = %q, want it to name the live member %d", verdict, descendant)
+	}
+}
+
+// TestSurvivorsError_ReasonBelongsToTheGroupItCameFrom pins that a reason
+// belongs to the group that produced it: a group that has no reason of its own
+// reports none, even when another group's membership could not be enumerated.
+func TestSurvivorsError_ReasonBelongsToTheGroupItCameFrom(t *testing.T) {
+	pgA, _ := startTrackedGroup(t, helperCmd("sleep", "120s"))
+	restoreEnumeration := stubGroupEnumeration(t, func(int) ([]int, bool) { return nil, false })
+	restoreKill := stubGroupKill(t, func(int, syscall.Signal) error { return syscall.ESRCH })
+	if state := pgA.State(); state != GroupUnavailable {
+		restoreEnumeration()
+		restoreKill()
+		t.Fatalf("State() = %v, want %v when neither the enumeration nor the probe answered", state, GroupUnavailable)
+	}
+	reason := unavailableReason(pgA)
+	if reason == "" {
+		restoreEnumeration()
+		restoreKill()
+		t.Fatal("group A has no reason of its own, want the enumeration failure")
+	}
+	restoreEnumeration()
+	restoreKill()
+
+	// Group B is a group with no reason of its own: it never failed a
+	// probe, so its verdict must not explain itself with A's reason.
+	pgB := &uncontainedProcessGroup{}
+	err := survivorsError(groupResult("b", pgB, pgB.State()))
+	if err == nil {
+		t.Fatal("survivorsError() on an unavailable group = nil, want an error")
+	}
+	if strings.Contains(err.Error(), reason) {
+		t.Fatalf("group B's verdict carries group A's reason: %v", err)
+	}
+}
+
+// TestSurvivorsError_EstablishedGroupReportsNoReason pins that a group whose
+// state was established successfully reports no reason: the failure of
+// another group's enumeration must not survive on a healthy group.
+func TestSurvivorsError_EstablishedGroupReportsNoReason(t *testing.T) {
+	restoreEnumeration := stubGroupEnumeration(t, func(int) ([]int, bool) { return nil, false })
+	restoreKill := stubGroupKill(t, func(int, syscall.Signal) error { return syscall.ESRCH })
+	failing, _ := startTrackedGroup(t, helperCmd("sleep", "120s"))
+	_ = failing.State()
+	restoreEnumeration()
+	restoreKill()
+
+	healthy, _ := startTrackedGroup(t, helperCmd("sleep", "120s"))
+	if state := healthy.State(); state != GroupOwned {
+		t.Fatalf("State() = %v, want %v for a group with a live member", state, GroupOwned)
+	}
+	if reason := unavailableReason(healthy); reason != "" {
+		t.Fatalf("a group whose state was established reports the reason %q, want none", reason)
+	}
+	if reason := unavailableReason(&uncontainedProcessGroup{}); reason != "" {
+		t.Fatalf("a group with no reason of its own reports %q, want none", reason)
+	}
 }

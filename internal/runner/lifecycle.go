@@ -31,6 +31,71 @@ type processRunResult struct {
 // Returns failure metadata when the process ended in the "failed" state.
 var errCleanupHandoff = errors.New("runner cleanup handoff")
 
+// dependencyVerdict is what waiting for a dependency concluded.
+type dependencyVerdict struct {
+	// verdict is readySatisfied when the dependency became ready,
+	// readyTerminal when its lifecycle is over, and readyStopped when the
+	// run is stopping and no verdict will come.
+	verdict readyOutcome
+	// quiesced reports that the cleanup handoff ended the wait.
+	quiesced bool
+}
+
+// waitForDependency blocks until the dependency publishes a readiness verdict.
+//
+// The wait is a loop, because a cycle that ends without a verdict is not the
+// end of the wait: the dependency's incarnation ended and another one follows,
+// so the next cycle carries the readiness.
+//
+// The loop always ends. A cycle that settles with readyAgain and is still the
+// current cycle means no further verdict will come, so the dependent ends in a
+// terminal state instead of waiting forever; the cancellation and the cleanup
+// handoff end it as well.
+func (r *Runner) waitForDependency(ctx context.Context, p procInfo, dep string, depSt *procState, handoff <-chan struct{}) dependencyVerdict {
+	for {
+		cycle := depSt.currentReadyCycle()
+		select {
+		case <-handoff:
+			return dependencyVerdict{quiesced: true}
+		case <-ctx.Done():
+			// The dependency's disposition decides. A dependency whose
+			// lifecycle is over fails the dependent; a shutdown-caused
+			// cancellation does not, because the stack was stopped on
+			// purpose.
+			if depSt.disposition() == readyTerminal {
+				return dependencyVerdict{verdict: readyTerminal}
+			}
+			return dependencyVerdict{verdict: readyStopped}
+		case <-cycle.ch:
+			switch verdict := depSt.outcomeOf(cycle); verdict {
+			case readySatisfied, readyTerminal, readyStopped:
+				return dependencyVerdict{verdict: verdict}
+			case readyAgain:
+				// The cycle ended without a verdict. Re-read the current
+				// cycle: if the cycle that just settled is still the current
+				// one, no further verdict will come and the dependent must
+				// not wait for one.
+				if depSt.currentReadyCycle() == cycle {
+					return dependencyVerdict{verdict: readyStopped}
+				}
+				continue
+			default:
+				continue
+			}
+		}
+	}
+}
+
+// nextBackoff is the one restart backoff step: it doubles the current wait and
+// clamps it to the documented ceiling of 30 seconds.
+//
+// The reachable sequence is 1, 2, 4, 8, 16, 30, 30 seconds: the clamp is
+// applied to the doubled value, so the ceiling is reached exactly and never
+// exceeded.
+func nextBackoff(cur time.Duration) time.Duration {
+	return min(2*cur, 30*time.Second)
+}
+
 func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store *stateStore, handoff <-chan struct{}) processRunResult {
 	st := store.get(p.name)
 	backoff := time.Second
@@ -42,40 +107,27 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 			continue // validated at config load; defensive guard
 		}
 		r.processLog(p, "info", "dependency.wait", fmt.Sprintf("waiting for %s...", dep))
-		select {
-		case <-handoff:
+		wait := r.waitForDependency(ctx, p, dep, depSt, handoff)
+		if wait.quiesced {
 			return processRunResult{quiesced: true}
-		case <-ctx.Done():
-			depSt.mu.Lock()
-			depFailed := depSt.readyClosed && !depSt.readyOK
-			depSt.mu.Unlock()
-			if depFailed {
-				msg := fmt.Sprintf("dependency %q failed", dep)
-				r.processLog(p, "error", "dependency.failed", msg)
-				st.mu.Lock()
-				st.state = "failed"
-				st.lastError = msg
-				st.mu.Unlock()
-				r.broadcastState(p, st)
-				st.markReady(false)
-				return processRunResult{failed: true}
-			}
+		}
+		switch wait.verdict {
+		case readySatisfied:
+			// The dependency is ready: continue with the next one.
+		case readyTerminal:
+			msg := fmt.Sprintf("dependency %q failed", dep)
+			r.processLog(p, "error", "dependency.failed", msg)
+			st.failProcess(msg)
+			r.broadcastState(p, st)
+			return processRunResult{failed: true}
+		case readyStopped:
+			// The stack is stopping, so no readiness verdict will come. The
+			// dependent ends in the terminal state "exited" — the value the
+			// sibling path uses — and no dependency failure is reported.
+			st.stopProcess(fmt.Sprintf("stopped while waiting for dependency %q", dep))
+			r.broadcastState(p, st)
+			r.processLog(p, "info", "process.stopped", "stopped")
 			return processRunResult{}
-		case <-depSt.readyChannel():
-			depSt.mu.Lock()
-			depOK := depSt.readyOK
-			depSt.mu.Unlock()
-			if !depOK {
-				msg := fmt.Sprintf("dependency %q failed", dep)
-				r.processLog(p, "error", "dependency.failed", msg)
-				st.mu.Lock()
-				st.state = "failed"
-				st.lastError = msg
-				st.mu.Unlock()
-				r.broadcastState(p, st)
-				st.markReady(false)
-				return processRunResult{failed: true}
-			}
 		}
 	}
 
@@ -102,6 +154,9 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		st.probeFailed = false
 		st.readinessOwner, st.healthOwner = nil, nil
 		st.health, st.healthFailures, st.healthError = "", 0, ""
+		// A new incarnation can run again, so the lifecycle is no longer
+		// over: the previous verdict belongs to the incarnation that ended.
+		st.readyDisposition = readyUnset
 		if p.proc.HealthWhen != nil {
 			st.health = healthUnknown
 		}
@@ -141,6 +196,10 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		if errors.Is(err, errCleanupHandoff) {
 			procCancel()
 			probes.Wait()
+			// No readiness verdict is published here: the cleanup handoff
+			// ends every wait itself — a dependent waiting on this process
+			// is released by the same handoff signal — so publishing a
+			// verdict would only race that release.
 			return processRunResult{quiesced: true}
 		}
 		procCancel() // clean up the restartCh goroutine
@@ -150,15 +209,13 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		if time.Since(startTime) > backoff {
 			backoff = time.Second
 		}
-		// Ensure readyCh is closed so depends_on waiters never deadlock.
-		// No-op if markReady was already called by a successful probe.
-		st.markReady(false)
+		// The readiness verdict is published by the branch that decides what
+		// became of this incarnation. Settling it here would report "the
+		// dependency failed" for an incarnation that is about to be restarted.
 
 		// Check if parent context was cancelled (SIGTERM/SIGINT shutdown).
 		if ctx.Err() != nil || r.stopping.Load() {
-			st.mu.Lock()
-			st.state = "exited"
-			st.mu.Unlock()
+			st.stopProcess("")
 			r.broadcastState(p, st)
 			r.processLog(p, "info", "process.stopped", "stopped")
 			return processRunResult{}
@@ -200,12 +257,11 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		}
 
 		if err == nil {
-			st.mu.Lock()
-			st.state = "exited"
-			st.mu.Unlock()
-			r.broadcastState(p, st)
-
 			if p.proc.Restart == "always" {
+				st.mu.Lock()
+				st.state = "exited"
+				st.mu.Unlock()
+				r.broadcastState(p, st)
 				st.mu.Lock()
 				next := st.restarts + 1
 				st.mu.Unlock()
@@ -224,8 +280,14 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 				if waitForCleanupHandoff(backoff, handoff) {
 					return processRunResult{quiesced: true}
 				}
+				backoff = nextBackoff(backoff)
 				continue
 			}
+			// The lifecycle is over and the process will not run again, so a
+			// dependent must fail rather than wait for a readiness that will
+			// never come.
+			st.endProcess()
+			r.broadcastState(p, st)
 			r.processLog(p, "info", "process.exited", "exited")
 			return processRunResult{}
 		}
@@ -238,9 +300,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		st.mu.Unlock()
 
 		if p.proc.Restart == "never" {
-			st.mu.Lock()
-			st.state = "failed"
-			st.mu.Unlock()
+			st.failProcess("")
 			r.broadcastState(p, st)
 			return processRunResult{failed: true}
 		}
@@ -264,6 +324,10 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 
 		select {
 		case <-ctx.Done():
+			// The cycle ends without a verdict and no further cycle follows:
+			// a dependent that re-reads the current cycle sees the same
+			// cycle and ends its wait instead of waiting forever.
+			st.publishAgain()
 			return processRunResult{}
 		case <-st.restartCh:
 			// Restart requested during backoff — skip the wait. Readiness
@@ -273,9 +337,7 @@ func (r *Runner) runProcess(ctx context.Context, p procInfo, maxName int, store 
 		case <-time.After(backoff):
 		}
 
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
+		backoff = nextBackoff(backoff)
 	}
 }
 
@@ -298,9 +360,7 @@ func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st
 	st.mu.Unlock()
 
 	if ctx.Err() != nil {
-		st.mu.Lock()
-		st.state = "exited"
-		st.mu.Unlock()
+		st.stopProcess("")
 		r.broadcastState(p, st)
 		r.processLog(p, "info", "process.stopped", "stopped")
 		return processRunResult{}
@@ -318,11 +378,7 @@ func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st
 
 	msg := fmt.Sprintf("task failed: %v", err)
 	r.processLog(p, "error", "task.failed", msg)
-	st.mu.Lock()
-	st.state = "failed"
-	st.lastError = msg
-	st.mu.Unlock()
-	st.markReady(false)
+	st.failProcess(msg)
 	r.broadcastState(p, st)
 	return processRunResult{failed: true, failFast: true}
 }
@@ -330,8 +386,9 @@ func (r *Runner) runTaskProcess(ctx context.Context, p procInfo, maxName int, st
 // buildReadinessCallbacks builds onStart and onLine hooks bound to the
 // current run iteration's context. Each ready_when probe wires its own pair.
 // progressFn is called periodically during probe to show waiting progress.
-// A cmd probe runs under handoff and is counted in probes, which the caller
-// joins before the incarnation ends.
+// Every probe goroutine — the cmd probe, the http and tcp probes and the log
+// readiness timeout — is counted in probes, which the caller joins before the
+// incarnation ends, so none of their events may outlive it.
 func (r *Runner) buildReadinessCallbacks(
 	p procInfo,
 	maxName int,
@@ -357,7 +414,9 @@ func (r *Runner) buildReadinessCallbacks(
 	case p.proc.ReadyWhen.HTTP != "":
 		probeURL := p.proc.ReadyWhen.HTTP
 		onStart = func() {
+			probes.Add(1)
 			go func() {
+				defer probes.Done()
 				check := r.newOwnerCheck(p, st, gen, "http")
 				ok, rejected := probeHTTP(procCtx, probeURL, readyTimeout, func(msg string) {
 					r.processLog(p, "debug", "readiness.progress", msg)
@@ -370,7 +429,9 @@ func (r *Runner) buildReadinessCallbacks(
 	case p.proc.ReadyWhen.TCP != "":
 		probeAddr := p.proc.ReadyWhen.TCP
 		onStart = func() {
+			probes.Add(1)
 			go func() {
+				defer probes.Done()
 				check := r.newOwnerCheck(p, st, gen, "tcp")
 				ok, rejected := probeTCP(procCtx, probeAddr, readyTimeout, func(msg string) {
 					r.processLog(p, "debug", "readiness.progress", msg)
@@ -393,7 +454,9 @@ func (r *Runner) buildReadinessCallbacks(
 		}
 	case logRe != nil:
 		if readyTimeout > 0 {
+			probes.Add(1)
 			go func() {
+				defer probes.Done()
 				select {
 				case <-procCtx.Done():
 				case <-time.After(readyTimeout):
@@ -540,6 +603,16 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 	// cannot be handed to an unrelated group. Reaping is therefore deferred to
 	// the very end, after every signal the runner intends to send.
 	//
+	// Releases the log reader if something outside the group still holds the
+	// pipe after the group has been killed.
+	//
+	// It is defined before the observation below because that observation's
+	// failure path must close both pipes too: os/exec closes only the parent's
+	// copies of the child's pipe ends, so the read ends are the runner's to
+	// close. The readers are never started on that path, so closing them there
+	// cannot take a pipe away from anything that still needs it.
+	closeStdout := sync.OnceFunc(func() { _ = stdout.Close(); _ = stderr.Close() })
+
 	// Setup must not block: a long-running service would otherwise delay its own
 	// start. The observer is built once and reports whether the leader has
 	// already exited.
@@ -562,21 +635,19 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 		if handoff != nil {
 			select {
 			case <-reap.done:
+				closeStdout()
 			case <-handoff:
-				_ = stdout.Close()
-				_ = stderr.Close()
+				closeStdout()
 				return errCleanupHandoff
 			}
 		} else {
 			_ = reap.recv()
+			closeStdout()
 		}
 		return fmt.Errorf("observe leader exit: %w", obsErr)
 	}
 
-	// Releases the log reader if something outside the group still holds the
-	// pipe after the group has been killed.
 	var escaped atomic.Bool
-	closeStdout := sync.OnceFunc(func() { _ = stdout.Close(); _ = stderr.Close() })
 
 	if onStart != nil {
 		onStart()
@@ -815,17 +886,29 @@ func (r *Runner) exec(ctx context.Context, p procInfo, maxName int, st *procStat
 }
 
 // groupResult describes a group for an operator-facing report.
+//
+// The members and the reason come from the group itself: they describe the
+// observation that produced the state, and a group that cannot enumerate its
+// membership or has no reason of its own contributes neither.
 func groupResult(name string, pg ProcessGroup, state GroupState) []GroupResult {
 	return []GroupResult{{
 		Name:     name,
 		PGID:     groupPGID(pg),
 		Identity: pg.Identify(),
 		State:    state,
+		Members:  groupMembersOf(pg),
+		Reason:   unavailableReason(pg),
 	}}
 }
 
 func sealedGroupResult(name string, observation SealObservation) []GroupResult {
-	return []GroupResult{{Name: name, Identity: observation.Identity, State: observation.State}}
+	return []GroupResult{{
+		Name:     name,
+		Identity: observation.Identity,
+		State:    observation.State,
+		Members:  observation.Members,
+		Reason:   observation.Reason,
+	}}
 }
 
 // ── process-group registry ───────────────────────────────────────────────────
@@ -1116,6 +1199,44 @@ func (r *Runner) sweepGroups(runCtx context.Context) {
 	r.sealGroups()
 }
 
+// sweepDrain bounds how long the sweep waits for a forced kill to take effect
+// before it seals the group anyway.
+//
+// It is deliberately short. The sweep runs inside the caller's shutdown
+// budget — the cleanup handoff's, in the path this drain exists for — and the
+// group is sealed, and therefore made unsignalable, whether or not the kill
+// has been observed by then. A group that is still alive after the drain is
+// reported as a survivor.
+const sweepDrain = 250 * time.Millisecond
+
+// terminateSealedGroup force-kills a group that still has live members, so the
+// sweep never seals a live group.
+//
+// The kill has to happen here, while the group is still ours to signal: Seal
+// withdraws signalling authority and releases the group's identity, so a group
+// sealed while it is still alive is never signalled again. The escalation is
+// skipped, not refused.
+//
+// The gate is the same one the graceful escalation uses: an empty group is not
+// signalled, because there is nothing left in it to stop. A group whose
+// membership cannot be enumerated IS signalled — whether a signal is permitted
+// comes from signalling authority, not from membership, and the authority is
+// still held while the sweep runs.
+//
+// The kill is immediate (SIGKILL) because the budget the sweep runs under is
+// already spent, and the drain that follows it is short. A group that survives
+// the drain is reported as a survivor by the caller.
+//
+// The caller must not hold a runner lock: the kill reaches processes outside
+// the runner.
+func terminateSealedGroup(pg ProcessGroup) {
+	if pg.State() == GroupEmpty {
+		return
+	}
+	_ = pg.Kill()
+	waitWhileLive(pg, sweepDrain)
+}
+
 // sealGroups closes admission, takes every tracked group, seals it, and
 // reports the ones that are not empty. sweepGroups runs it at shutdown; the
 // teardown phase runs it again for the groups its processes registered.
@@ -1135,6 +1256,11 @@ func (r *Runner) sealGroups() {
 
 	for _, name := range names {
 		pg := groups[name]
+		// Force-kill the group while the authority to signal it is still held.
+		// Sealing a group that is still alive would withdraw that authority and
+		// release the group's identity, and the tree would then never be
+		// signalled again.
+		terminateSealedGroup(pg)
 		// Seal remaining authority before Run returns. On Windows, this preserves
 		// the final membership observation before kill-on-close invalidates it.
 		observation, sealErr := pg.Seal()
@@ -1324,10 +1450,7 @@ func resolveReadyTimeout(seconds int) time.Duration {
 func (r *Runner) giveUp(p procInfo, maxName int, st *procState) bool {
 	msg := fmt.Sprintf("max restarts (%d) reached, giving up", p.proc.MaxRestarts)
 	r.processLog(p, "error", "process.restart_limit", msg)
-	st.mu.Lock()
-	st.state = "failed"
-	st.lastError = msg
-	st.mu.Unlock()
+	st.failProcess(msg)
 	r.broadcastState(p, st)
 	return true
 }

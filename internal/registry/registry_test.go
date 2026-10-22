@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/anivaryam/proc-compose/internal/daemon"
@@ -114,6 +115,29 @@ func TestDiscover_ReadsMetadataRecordAndLiveness(t *testing.T) {
 	}
 	if runtime.GOOS != "darwin" && self.StartedAt == 0 {
 		t.Fatalf("no start time recorded on %s", runtime.GOOS)
+	}
+}
+
+// TestDiscover_SkipsMetadataThatIsNoSession pins that a metadata file which
+// does not describe a session is skipped: a corrupt or foreign document never
+// registers a phantom session.
+func TestDiscover_SkipsMetadataThatIsNoSession(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	for name, body := range map[string]string{
+		"pc-null.meta.json":    "null",
+		"pc-empty.meta.json":   "{}",
+		"pc-garbage.meta.json": "{",
+	} {
+		if err := os.WriteFile(paths.Metadata(strings.TrimSuffix(strings.TrimPrefix(name, "pc-"), ".meta.json")), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sessions, err := Discover()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("Discover = %d sessions, want 0: %+v", len(sessions), sessions)
 	}
 }
 

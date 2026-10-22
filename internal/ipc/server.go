@@ -3,7 +3,9 @@ package ipc
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -11,6 +13,28 @@ import (
 )
 
 const maxHistory = 500
+
+// maxCommandFrameBytes is the largest inbound command frame the server
+// accepts. A longer frame is dropped: the scanner fails with
+// bufio.ErrTooLong and the connection is torn down. It is deliberately far
+// below MaxEventBytes, which bounds the events the daemon sends out, not the
+// commands it accepts.
+const maxCommandFrameBytes = 1 << 16
+
+// stderrSink is where this package's warnings go. It is guarded by
+// stderrMu so that a test can capture the warnings without swapping
+// os.Stderr underneath a server goroutine that may be writing to it.
+var (
+	stderrMu   sync.Mutex
+	stderrSink io.Writer = os.Stderr
+)
+
+// warnf writes one warning line to the package's stderr sink.
+func warnf(format string, args ...any) {
+	stderrMu.Lock()
+	defer stderrMu.Unlock()
+	fmt.Fprintf(stderrSink, format, args...)
+}
 
 // Server is a Unix-socket IPC server that broadcasts events to all connected
 // monitors. It is safe for concurrent use.
@@ -119,7 +143,7 @@ func (s *Server) SetProject(project *Project) {
 func (s *Server) BroadcastLog(entry LogEntry) {
 	ev, err := json.Marshal(Event{Type: TypeLog, Log: &entry})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARN: failed to marshal log event: %v\n", err)
+		warnf("WARN: failed to marshal log event: %v\n", err)
 		return
 	}
 	ev = append(ev, '\n')
@@ -137,7 +161,7 @@ func (s *Server) BroadcastLog(entry LogEntry) {
 func (s *Server) BroadcastTunnelURL(url string) {
 	ev, err := json.Marshal(Event{Type: TypeTunnel, TunnelURL: url})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARN: failed to marshal tunnel URL event: %v\n", err)
+		warnf("WARN: failed to marshal tunnel URL event: %v\n", err)
 		return
 	}
 	ev = append(ev, '\n')
@@ -154,7 +178,7 @@ func (s *Server) BroadcastTunnelURL(url string) {
 func (s *Server) BroadcastState(st ProcState) {
 	ev, err := json.Marshal(Event{Type: TypeState, Proc: &st})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARN: failed to marshal state event: %v\n", err)
+		warnf("WARN: failed to marshal state event: %v\n", err)
 		return
 	}
 	ev = append(ev, '\n')
@@ -189,7 +213,7 @@ func (s *Server) handle(conn net.Conn) {
 	// Send snapshot as first message.
 	data, err := json.Marshal(snap)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARN: failed to marshal snapshot: %v\n", err)
+		warnf("WARN: failed to marshal snapshot: %v\n", err)
 	} else {
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		conn.Write(append(data, '\n'))
@@ -201,7 +225,7 @@ func (s *Server) handle(conn net.Conn) {
 
 	// Read commands from the client (monitors send nothing; CLI commands do).
 	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 1<<16), 1<<16)
+	scanner.Buffer(make([]byte, maxCommandFrameBytes), maxCommandFrameBytes)
 	for scanner.Scan() {
 		var ev Event
 		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
@@ -210,6 +234,12 @@ func (s *Server) handle(conn net.Conn) {
 		if ev.Type == TypeCommand && ev.Cmd != nil {
 			s.handleCommand(conn, ev.Cmd)
 		}
+	}
+	// A frame over the cap is dropped and the connection is torn down, so the
+	// daemon has to say so: without this the oversized frame is
+	// indistinguishable from a client that simply disconnected.
+	if err := scanner.Err(); err != nil && errors.Is(err, bufio.ErrTooLong) {
+		warnf("WARN: command frame too long from peer %s: %v (inbound frame limit is %d bytes)\n", peerAddr(conn), err, maxCommandFrameBytes)
 	}
 
 	// Clean up.
@@ -220,10 +250,11 @@ func (s *Server) handle(conn net.Conn) {
 }
 
 // handleCommand forwards one command to the runner and writes its
-// acknowledgment. cmd.flushed is closed once that ack is on the wire so a
-// handler that must not be orphaned by a server shutdown (the "shutdown"
-// command, whose verdict is the only report of what could not be terminated)
-// can wait for its own answer to be delivered.
+// acknowledgment. cmd.flushed is closed once the write attempt for that ack
+// has completed, whatever its result, so a handler that must not be orphaned
+// by a server shutdown (the "shutdown" command, whose verdict is the only
+// report of what could not be terminated) can wait for its own answer to be
+// delivered — or for the delivery to have failed.
 func (s *Server) handleCommand(conn net.Conn, in *Command) {
 	// Attach a buffered reply channel so the runner can hand back a real
 	// verdict (ok / partial / error) instead of the client having to assume
@@ -258,12 +289,26 @@ func (s *Server) handleCommand(conn net.Conn, in *Command) {
 
 	data, err := json.Marshal(ack)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARN: failed to marshal ack: %v\n", err)
+		warnf("WARN: failed to marshal ack: %v\n", err)
 		return
 	}
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	conn.Write(append(data, '\n'))
+	_, err = conn.Write(append(data, '\n'))
 	conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		// The verdict could not be delivered. The barrier is still released:
+		// a peer that has gone away must not wedge the daemon. The failure is
+		// reported here because the client cannot be told.
+		warnf("WARN: failed to write ack to client: %v\n", err)
+	}
+}
+
+// peerAddr names the other end of conn for a diagnostic.
+func peerAddr(conn net.Conn) string {
+	if addr := conn.RemoteAddr(); addr != nil {
+		return addr.String()
+	}
+	return "unknown"
 }
 
 func (c *serverClient) writeLoop() {

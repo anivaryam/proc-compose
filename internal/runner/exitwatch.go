@@ -28,9 +28,14 @@ const (
 	exitOwnershipLost
 
 	// exitUnsupported means this platform cannot observe the leader's exit
-	// without reaping it. The runner falls back to detecting exit by reaping,
-	// which ends signalling authority, so a natural exit is reported rather
-	// than torn down.
+	// without reaping it.
+	//
+	// The value is unreachable on the supported platforms. Linux and macOS
+	// observe the exit without reaping it, Windows needs no observation at
+	// all, and on a platform that cannot observe it the launch fails with an
+	// error: an observation failure is fatal, not a fallback to a
+	// reap-based detection. The branch is kept so the contract stays
+	// explicit.
 	exitUnsupported
 )
 
@@ -88,13 +93,20 @@ const memberPollInterval = 100 * time.Millisecond
 
 // waitWhileLive polls until the group has no live members left or the budget is
 // spent, reporting whether it drained.
+//
+// A group whose membership cannot be enumerated has not been proven empty, so
+// it is polled until the budget is spent, exactly like a group that is still
+// owned: treating "unknown" as "drained" would skip the escalation that
+// follows this wait. Only an empty group ends the wait immediately.
 func waitWhileLive(pg ProcessGroup, budget time.Duration) bool {
 	deadline := time.Now().Add(budget)
-	for pg.State() == GroupOwned {
+	for {
+		if pg.State() == GroupEmpty {
+			return true
+		}
 		if !time.Now().Before(deadline) {
 			return false
 		}
 		time.Sleep(memberPollInterval)
 	}
-	return true
 }

@@ -1511,6 +1511,105 @@ func TestLoad_ModeTeardown(t *testing.T) {
 	}
 }
 
+// TestSelectedNames_UnknownFilterSelectsNothing pins the canonical closure's
+// treatment of a filter that names no configured process: the selection is
+// empty, so an unknown name is never started as if it were a process. The
+// teardown exclusion is pinned by TestLoad_ModeTeardown.
+func TestSelectedNames_UnknownFilterSelectsNothing(t *testing.T) {
+	cfg := loadFromString(t, `processes:
+  api:
+    cmd: api
+`)
+	if got := SelectedNames(cfg, []string{"nope"}); len(got) != 0 {
+		t.Fatalf("SelectedNames = %v, want an empty selection", got)
+	}
+	if got := SelectedNames(cfg, []string{"api", "nope"}); !equalSlices(got, []string{"api"}) {
+		t.Fatalf("SelectedNames = %v, want only the known process", got)
+	}
+}
+
+// TestLoad_NormalisesResourceLabels pins that a resource label is normalised
+// once, at load time: the trimmed label is the identity the lease, the
+// duplicate check and Project.Resources all use. A label that differs only in
+// surrounding whitespace names the same resource, so the first occurrence
+// wins and no error is raised; an exactly repeated label is still refused.
+func TestLoad_NormalisesResourceLabels(t *testing.T) {
+	t.Run("whitespace variants name one resource", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: x\nresources: [db, \" db \", \"  db  \"]\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if want := []string{"db"}; !equalSlices(cfg.Resources, want) {
+			t.Fatalf("resources = %q, want %q", cfg.Resources, want)
+		}
+	})
+	t.Run("the trimmed label is kept", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: x\nresources: [\" db \", cache]\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if want := []string{"db", "cache"}; !equalSlices(cfg.Resources, want) {
+			t.Fatalf("resources = %q, want %q", cfg.Resources, want)
+		}
+	})
+	t.Run("an exactly repeated label is still refused", func(t *testing.T) {
+		_, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: x\nresources: [db, db]\n"))
+		var verr *ValidationError
+		if !errors.As(err, &verr) || verr.Code != CodeInvalidResource || FormatPath(verr.Path) != "resources[1]" {
+			t.Fatalf("err = %v, want %s at resources[1]", err, CodeInvalidResource)
+		}
+	})
+	t.Run("a whitespace-only label is still refused", func(t *testing.T) {
+		_, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: x\nresources: [\"  \"]\n"))
+		var verr *ValidationError
+		if !errors.As(err, &verr) || verr.Code != CodeInvalidResource || FormatPath(verr.Path) != "resources[0]" {
+			t.Fatalf("err = %v, want %s at resources[0]", err, CodeInvalidResource)
+		}
+	})
+	t.Run("the length limit counts the trimmed label", func(t *testing.T) {
+		long := strings.Repeat("a", 257)
+		_, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: x\nresources: [\""+long+"\"]\n"))
+		var verr *ValidationError
+		if !errors.As(err, &verr) || verr.Code != CodeInvalidResource || FormatPath(verr.Path) != "resources[0]" {
+			t.Fatalf("a 257-character label: err = %v, want %s at resources[0]", err, CodeInvalidResource)
+		}
+		// The same label padded with whitespace is 257 bytes raw but 256
+		// characters trimmed: the limit counts the trimmed label, so it is
+		// accepted and normalised.
+		cfg, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: x\nresources: [\""+strings.Repeat("a", 256)+" \"]\n"))
+		if err != nil {
+			t.Fatalf("a padded 257-byte label: %v", err)
+		}
+		if want := []string{strings.Repeat("a", 256)}; !equalSlices(cfg.Resources, want) {
+			t.Fatalf("resources = %q, want one 256-character label", cfg.Resources)
+		}
+		cfg, err = Load(writeConfig(t, "processes:\n  api:\n    cmd: x\nresources: [\""+strings.Repeat("a", 256)+"\"]\n"))
+		if err != nil {
+			t.Fatalf("a 256-character label: %v", err)
+		}
+		if want := []string{strings.Repeat("a", 256)}; !equalSlices(cfg.Resources, want) {
+			t.Fatalf("resources = %q, want one 256-character label", cfg.Resources)
+		}
+	})
+	t.Run("the character check runs on the trimmed label", func(t *testing.T) {
+		// An inner carriage return is part of the label: refused.
+		_, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: x\nresources: [\"a\\rb\"]\n"))
+		var verr *ValidationError
+		if !errors.As(err, &verr) || verr.Code != CodeInvalidResource || FormatPath(verr.Path) != "resources[0]" {
+			t.Fatalf("an inner carriage return: err = %v, want %s at resources[0]", err, CodeInvalidResource)
+		}
+		// A trailing one is surrounding whitespace: trimmed away, so the
+		// label is the same resource as "db".
+		cfg, err := Load(writeConfig(t, "processes:\n  api:\n    cmd: x\nresources: [\"db\\r\"]\n"))
+		if err != nil {
+			t.Fatalf("a trailing carriage return: %v", err)
+		}
+		if want := []string{"db"}; !equalSlices(cfg.Resources, want) {
+			t.Fatalf("resources = %q, want %q", cfg.Resources, want)
+		}
+	})
+}
+
 func equalSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -1521,4 +1620,436 @@ func equalSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// ─── #18: a merge upstream must be a service ──────────────────────────────────
+
+// TestLoad_MergeUpstreamMustBeService pins that only a service can be a merge
+// upstream. A task or teardown process is never selected, so the merge wiring
+// writes neither a readiness probe into it nor a dependency edge to it.
+func TestLoad_MergeUpstreamMustBeService(t *testing.T) {
+	t.Run("a task matched by PORT is not an upstream", func(t *testing.T) {
+		t.Setenv("PORT", "")
+		cfg := loadFromString(t, `merge:
+  client: 5173
+  server: 3001
+
+processes:
+  api:
+    mode: task
+    cmd: seed
+    env:
+      PORT: "3001"
+`)
+		if rw := cfg.Processes["api"].ReadyWhen; rw != nil {
+			t.Fatalf("api ready_when = %+v, want none", rw)
+		}
+		if contains(cfg.Processes["merge-port"].DependsOn, "api") {
+			t.Fatalf("merge-port depends_on = %v, want no task upstream", cfg.Processes["merge-port"].DependsOn)
+		}
+	})
+	t.Run("a task matched by name is not an upstream", func(t *testing.T) {
+		t.Setenv("PORT", "")
+		cfg := loadFromString(t, `merge:
+  client: 3000
+  server: 3001
+
+processes:
+  web:
+    mode: task
+    cmd: build
+`)
+		if rw := cfg.Processes["web"].ReadyWhen; rw != nil {
+			t.Fatalf("web ready_when = %+v, want none", rw)
+		}
+		if contains(cfg.Processes["merge-port"].DependsOn, "web") {
+			t.Fatalf("merge-port depends_on = %v, want no task upstream", cfg.Processes["merge-port"].DependsOn)
+		}
+	})
+	t.Run("a teardown process is not an upstream", func(t *testing.T) {
+		t.Setenv("PORT", "")
+		cfg := loadFromString(t, `merge:
+  client: 5173
+  server: 3001
+
+processes:
+  server:
+    mode: teardown
+    cmd: cleanup
+    env:
+      PORT: "3001"
+`)
+		if rw := cfg.Processes["server"].ReadyWhen; rw != nil {
+			t.Fatalf("server ready_when = %+v, want none", rw)
+		}
+		if contains(cfg.Processes["merge-port"].DependsOn, "server") {
+			t.Fatalf("merge-port depends_on = %v, want no teardown upstream", cfg.Processes["merge-port"].DependsOn)
+		}
+	})
+}
+
+// ─── #19: the generated proxy's name is reserved ──────────────────────────────
+
+// TestLoad_RejectsReservedMergePortProcessName pins that a user process named
+// like the generated proxy is refused instead of being overwritten.
+func TestLoad_RejectsReservedMergePortProcessName(t *testing.T) {
+	t.Setenv("PORT", "")
+	_, err := Load(writeConfig(t, "merge:\n  client: 5173\n  server: 3001\nprocesses:\n  merge-port:\n    cmd: my-own-proxy --serve\n"))
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != CodeReservedProcessName || FormatPath(verr.Path) != "processes.merge-port" {
+		t.Fatalf("err = %v, want %s at processes.merge-port", err, CodeReservedProcessName)
+	}
+	// Without a merge section no proxy is generated, so the name is free.
+	cfg, err := Load(writeConfig(t, "processes:\n  merge-port:\n    cmd: my-own-proxy --serve\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Processes["merge-port"].Cmd; got != "my-own-proxy --serve" {
+		t.Fatalf("merge-port cmd = %q, want the user's own command", got)
+	}
+}
+
+// ─── #20: the merge upstream selection is deterministic ───────────────────────
+
+// TestLoad_MergeUpstreamSelectionIsDeterministic pins that a duplicated PORT
+// always resolves to the same upstream: the candidates are visited in name
+// order, so the probe, the dependency edge and the proxy command line are the
+// same on every load.
+func TestLoad_MergeUpstreamSelectionIsDeterministic(t *testing.T) {
+	t.Setenv("PORT", "")
+	dir := t.TempDir()
+	for _, name := range []string{"alpha", "beta"} {
+		if err := os.MkdirAll(filepath.Join(dir, name), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name, "app.js"), []byte("app.use('/"+name+"', h)\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	yaml := `merge:
+  client: 3000
+  server: 3001
+
+processes:
+  alpha:
+    cmd: npm run dev
+    dir: ./alpha
+    env:
+      PORT: "3001"
+  beta:
+    cmd: npm run dev
+    dir: ./beta
+    env:
+      PORT: "3001"
+`
+	path := filepath.Join(dir, "proc-compose.yml")
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var first *Config
+	for i := 0; i < 50; i++ {
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if first == nil {
+			first = cfg
+			continue
+		}
+		if got, want := cfg.Processes["merge-port"].Cmd, first.Processes["merge-port"].Cmd; got != want {
+			t.Fatalf("load %d: merge-port cmd = %q, want %q", i, got, want)
+		}
+		if got, want := cfg.Processes["merge-port"].DependsOn, first.Processes["merge-port"].DependsOn; !equalSlices(got, want) {
+			t.Fatalf("load %d: merge-port depends_on = %v, want %v", i, got, want)
+		}
+	}
+	// The lexicographically first candidate wins, and the route scan follows
+	// the same selection.
+	if want := []string{"alpha"}; !equalSlices(first.Processes["merge-port"].DependsOn, want) {
+		t.Fatalf("merge-port depends_on = %v, want %v", first.Processes["merge-port"].DependsOn, want)
+	}
+	if rw := first.Processes["alpha"].ReadyWhen; rw == nil || rw.TCP != "localhost:3001" {
+		t.Fatalf("alpha ready_when = %v, want localhost:3001", rw)
+	}
+	if rw := first.Processes["beta"].ReadyWhen; rw != nil {
+		t.Fatalf("beta ready_when = %+v, want none", rw)
+	}
+	if cmd := first.Processes["merge-port"].Cmd; !strings.Contains(cmd, "--api-prefix /alpha") {
+		t.Fatalf("merge-port cmd = %q, want the alpha route prefix", cmd)
+	}
+}
+
+// ─── #21: an upstream must serve the merge port ───────────────────────────────
+
+// TestLoad_RefusesUpstreamWithADifferentPort pins that a merge port is never
+// probed on a port the selected process does not serve: the config is refused
+// with a located diagnostic on all three selection paths.
+func TestLoad_RefusesUpstreamWithADifferentPort(t *testing.T) {
+	t.Setenv("PORT", "")
+	cases := []struct {
+		name string
+		yaml string
+		path string
+	}{
+		{
+			name: "client name fallback",
+			yaml: "merge:\n  client: 3000\n  server: 3001\n\nprocesses:\n  web:\n    cmd: npm start\n    env:\n      PORT: \"5173\"\n",
+			path: "merge.client",
+		},
+		{
+			name: "server name fallback",
+			yaml: "merge:\n  client: 3000\n  server: 3001\n\nprocesses:\n  server:\n    cmd: go run .\n    env:\n      PORT: \"4000\"\n",
+			path: "merge.server",
+		},
+		{
+			name: "explicit client_process override",
+			yaml: "merge:\n  client: 3000\n  server: 3001\n  client_process: webapp\n\nprocesses:\n  webapp:\n    cmd: npm start\n    env:\n      PORT: \"5173\"\n",
+			path: "merge.client",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.yaml))
+			var verr *ValidationError
+			if !errors.As(err, &verr) || verr.Code != CodeInvalidMerge || FormatPath(verr.Path) != tc.path {
+				t.Fatalf("err = %v, want %s at %s", err, CodeInvalidMerge, tc.path)
+			}
+		})
+	}
+}
+
+// TestLoad_NameMatchedUpstreamWithoutAPortIsProbedAtTheMergePort pins the
+// documented guess: a candidate that declares no PORT is still probed at the
+// merge port and still gets the dependency edge.
+func TestLoad_NameMatchedUpstreamWithoutAPortIsProbedAtTheMergePort(t *testing.T) {
+	t.Setenv("PORT", "")
+	cfg := loadFromString(t, `merge:
+  client: 3000
+  server: 3001
+
+processes:
+  web:
+    cmd: npm start
+`)
+	rw := cfg.Processes["web"].ReadyWhen
+	if rw == nil || rw.TCP != "localhost:3000" {
+		t.Fatalf("web ready_when = %v, want localhost:3000", rw)
+	}
+	if !contains(cfg.Processes["merge-port"].DependsOn, "web") {
+		t.Fatalf("merge-port depends_on = %v, want web", cfg.Processes["merge-port"].DependsOn)
+	}
+}
+
+// TestLoad_UpstreamPortIsComparedNumerically pins that the declared PORT is
+// compared as a number: PORT: "05173" is the merge port 5173, not a mismatch.
+func TestLoad_UpstreamPortIsComparedNumerically(t *testing.T) {
+	t.Setenv("PORT", "")
+	cfg := loadFromString(t, `merge:
+  client: 5173
+  server: 3001
+
+processes:
+  client:
+    cmd: npm start
+    env:
+      PORT: "05173"
+`)
+	rw := cfg.Processes["client"].ReadyWhen
+	if rw == nil || rw.TCP != "localhost:5173" {
+		t.Fatalf("client ready_when = %v, want localhost:5173", rw)
+	}
+}
+
+// ─── #22: an unreadable env file is an error, not a truncation ───────────────
+
+// TestParseEnvFile_LargeValue pins that a value larger than the old 64 KiB
+// token limit is parsed in full.
+func TestParseEnvFile_LargeValue(t *testing.T) {
+	dir := t.TempDir()
+	value := strings.Repeat("x", 70000)
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("BIG="+value+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := parseEnvFile(path)
+	if err != nil {
+		t.Fatalf("parseEnvFile: %v", err)
+	}
+	if len(got["BIG"]) != len(value) {
+		t.Fatalf("BIG has %d bytes, want %d (truncated)", len(got["BIG"]), len(value))
+	}
+}
+
+// TestLoad_EnvFileRejectsAnOversizedLine pins that a line of 1 MiB or more is
+// a located error naming the file, instead of a silently truncated
+// environment.
+func TestLoad_EnvFileRejectsAnOversizedLine(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	if err := os.WriteFile(envPath, []byte("BIG="+strings.Repeat("x", 1024*1024)+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "proc-compose.yml")
+	if err := os.WriteFile(path, []byte("processes:\n  api:\n    cmd: x\n    env_file: .env\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != CodeEnvFile {
+		t.Fatalf("err = %v, want %s", err, CodeEnvFile)
+	}
+	if !strings.Contains(err.Error(), envPath) {
+		t.Fatalf("error %q does not name the env file %q", err, envPath)
+	}
+}
+
+// ─── #49: port names carry no dot ────────────────────────────────────────────
+
+// TestLoad_RejectsDottedPortNames pins that a dotted port name is refused:
+// the endpoint reference name is "process.port", so a dot in the port name
+// would let two endpoints claim one reference.
+func TestLoad_RejectsDottedPortNames(t *testing.T) {
+	_, err := Load(writeConfig(t, "processes:\n  a:\n    cmd: x\n    ports:\n      b.c: 0\n"))
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != CodeInvalidPort || FormatPath(verr.Path) != "processes.a.ports.b.c" {
+		t.Fatalf("err = %v, want %s at processes.a.ports.b.c", err, CodeInvalidPort)
+	}
+	// The message names the rule that was broken.
+	if !strings.Contains(verr.Msg, "`.` is not allowed in port names") {
+		t.Fatalf("message = %q, want the dot rule", verr.Msg)
+	}
+}
+
+// TestLoad_RejectsTheCollidingPortConfig pins that the configuration the
+// collision net guards against no longer loads: the dotted port name is
+// refused by the port-name rule.
+func TestLoad_RejectsTheCollidingPortConfig(t *testing.T) {
+	_, err := Load(writeConfig(t, "processes:\n  a:\n    cmd: x\n    ports:\n      b.c: 0\n  a.b:\n    cmd: y\n    ports:\n      c: 0\n"))
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != CodeInvalidPort {
+		t.Fatalf("err = %v, want %s", err, CodeInvalidPort)
+	}
+}
+
+// TestCheckReferenceCollisions_ReportsBothNamespaces pins the safety net
+// itself: it names the colliding pair in the ports. and the urls. namespace.
+func TestCheckReferenceCollisions_ReportsBothNamespaces(t *testing.T) {
+	procs := map[string]Process{
+		"a":   {Cmd: "x", Ports: map[string]int{"b.c": 0}},
+		"a.b": {Cmd: "y", Ports: map[string]int{"c": 0}},
+	}
+	err := checkReferenceCollisions(procs)
+	if err == nil {
+		t.Fatal("expected a collision error, got nil")
+	}
+	for _, want := range []string{"ports.a.b.c", "urls.a.b.c"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("collision error %q does not name %q", err, want)
+		}
+	}
+}
+
+// TestCheckReferenceCollisions_AcceptsDotFreeNames pins that the safety net
+// stays quiet for the names the loader accepts.
+func TestCheckReferenceCollisions_AcceptsDotFreeNames(t *testing.T) {
+	procs := map[string]Process{
+		"a":   {Cmd: "x", Ports: map[string]int{"b": 0}},
+		"a.b": {Cmd: "y", Ports: map[string]int{"c": 0}},
+	}
+	if err := checkReferenceCollisions(procs); err != nil {
+		t.Fatalf("checkReferenceCollisions: %v", err)
+	}
+}
+
+// ─── #50: the merge ports are in range ────────────────────────────────────────
+
+// TestBuildMergeCmd_RejectsOutOfRangePorts pins the 1-65535 range for the
+// merge client, server and listen port.
+func TestBuildMergeCmd_RejectsOutOfRangePorts(t *testing.T) {
+	cases := []struct {
+		name     string
+		merge    Merge
+		wantErr  string
+		wantPath string
+	}{
+		{"client out of range", Merge{Client: 99999, Server: 3001}, "merge.client", "merge.client"},
+		{"negative client", Merge{Client: -5, Server: 3001}, "merge.client", "merge.client"},
+		{"server out of range", Merge{Client: 3000, Server: 70000}, "merge.server", "merge.server"},
+		{"listen port out of range", Merge{Client: 3000, Server: 3001, Port: 70000}, "merge.port", "merge.port"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PORT", "")
+			_, err := buildMergeCmd(&tc.merge)
+			if err == nil {
+				t.Fatalf("expected an error for %v, got nil", tc.merge)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %q does not name %q", err, tc.wantErr)
+			}
+			// The failure names the field it is about: the path is precise,
+			// not the whole merge section.
+			var verr *ValidationError
+			if !errors.As(err, &verr) || verr.Code != CodeInvalidMerge {
+				t.Fatalf("err = %v, want %s", err, CodeInvalidMerge)
+			}
+			if got := FormatPath(verr.Path); got != tc.wantPath {
+				t.Fatalf("path = %q, want %q", got, tc.wantPath)
+			}
+		})
+	}
+}
+
+// TestLoad_MergeOutOfRangePortIsRefused pins that an out-of-range merge port
+// is refused at load time with the invalid_merge code.
+func TestLoad_MergeOutOfRangePortIsRefused(t *testing.T) {
+	t.Setenv("PORT", "")
+	_, err := Load(writeConfig(t, "merge:\n  client: 3000\n  server: 3001\n  port: 70000\nprocesses:\n  api:\n    cmd: x\n"))
+	var verr *ValidationError
+	if !errors.As(err, &verr) || verr.Code != CodeInvalidMerge {
+		t.Fatalf("err = %v, want %s", err, CodeInvalidMerge)
+	}
+	// The diagnostic names the offending field, not the whole merge section.
+	if got := FormatPath(verr.Path); got != "merge.port" {
+		t.Fatalf("path = %q, want merge.port", got)
+	}
+}
+
+// TestLoad_MergeOutOfRangeClientAndServerAreRefusedAtTheirField pins that the
+// client and server ports are refused at their own field too.
+func TestLoad_MergeOutOfRangeClientAndServerAreRefusedAtTheirField(t *testing.T) {
+	t.Setenv("PORT", "")
+	cases := []struct {
+		name string
+		yaml string
+		path string
+	}{
+		{"client", "merge:\n  client: 99999\n  server: 3001\nprocesses:\n  api:\n    cmd: x\n", "merge.client"},
+		{"server", "merge:\n  client: 3000\n  server: 70000\nprocesses:\n  api:\n    cmd: x\n", "merge.server"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.yaml))
+			var verr *ValidationError
+			if !errors.As(err, &verr) || verr.Code != CodeInvalidMerge {
+				t.Fatalf("err = %v, want %s", err, CodeInvalidMerge)
+			}
+			if got := FormatPath(verr.Path); got != tc.path {
+				t.Fatalf("path = %q, want %q", got, tc.path)
+			}
+		})
+	}
+}
+
+// TestBuildMergeCmd_PortEnvVarOutOfRange pins that an out-of-range $PORT is
+// refused: the fallback is resolved before the range is checked.
+func TestBuildMergeCmd_PortEnvVarOutOfRange(t *testing.T) {
+	t.Setenv("PORT", "99999")
+	_, err := buildMergeCmd(&Merge{Client: 3000, Server: 3001})
+	if err == nil {
+		t.Fatal("expected an error for an out-of-range $PORT, got nil")
+	}
+	if !strings.Contains(err.Error(), "merge.port") {
+		t.Fatalf("error %q does not name merge.port", err)
+	}
 }

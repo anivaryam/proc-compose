@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/ansi"
@@ -1313,7 +1314,7 @@ func printUpdateNotice(cmd *cobra.Command, currentVersion string, interactive bo
 	if !updateNoticeEligible(cmd, interactive) {
 		return
 	}
-	latest := update.Default().Notice(currentVersion)
+	latest := checkerForUpdate().Notice(currentVersion)
 	if latest == "" {
 		return
 	}
@@ -1321,6 +1322,55 @@ func printUpdateNotice(cmd *cobra.Command, currentVersion string, interactive bo
 		ansi.SetDisabled(true)
 	}
 	fmt.Fprint(os.Stderr, update.Message(currentVersion, latest))
+}
+
+// updateChecker is the Checker this process uses for the release lookup. It is
+// created on first use and then kept: update.Default() returns a new Checker
+// per call, and only the Checker that scheduled a refresh knows that one is in
+// flight.
+//
+// It is deliberately not created at init time: resolving the cache path
+// creates the cache directory, and an invocation that is not eligible for the
+// notice must not create directories.
+var (
+	updateCheckerMu   sync.Mutex
+	updateChecker     *update.Checker
+	updateCheckerPath string
+)
+
+// updateRefreshBudget bounds the wait for the background release lookup at the
+// end of a command. It is the lookup's own HTTP timeout, so a cold round trip
+// to the release API is inside the budget: the cache is written even when the
+// first request of a session has to establish the connection. A slower or
+// unreachable release API still leaves the cache unwritten — the wait is
+// silent and best-effort, exactly as it is today.
+const updateRefreshBudget = update.HTTPTimeout
+
+// checkerForUpdate returns the Checker this process uses for the release
+// lookup, creating it on first use. The Checker follows the cache path, so a
+// process whose cache location changes gets a Checker for the new one.
+func checkerForUpdate() *update.Checker {
+	updateCheckerMu.Lock()
+	defer updateCheckerMu.Unlock()
+	path := update.CachePath()
+	if updateChecker == nil || updateCheckerPath != path {
+		updateChecker = update.New(path)
+		updateCheckerPath = path
+	}
+	return updateChecker
+}
+
+// waitForUpdateRefresh joins the background release lookup the notice
+// scheduled, so a short command still records the result for the next
+// invocation. It returns at once when no lookup was scheduled.
+func waitForUpdateRefresh() {
+	updateCheckerMu.Lock()
+	c := updateChecker
+	updateCheckerMu.Unlock()
+	if c == nil {
+		return
+	}
+	c.WaitRefresh(updateRefreshBudget)
 }
 
 // stderrIsTerminal reports whether diagnostics are going to a person.

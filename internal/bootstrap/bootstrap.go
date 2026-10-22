@@ -51,7 +51,7 @@ func Run(opts Options) (*Report, error) {
 		verificationPath := doctorReport.ConfigPath
 		cleanup := func() {}
 		if !opts.Write {
-			path, cleanupFunc, tempErr := writeTempConfig(doctorReport.SuggestedYAML)
+			path, cleanupFunc, tempErr := writeTempConfig(verificationConfig(doctorReport.SuggestedYAML, doctorReport.ConfigPath))
 			if tempErr != nil {
 				return report, tempErr
 			}

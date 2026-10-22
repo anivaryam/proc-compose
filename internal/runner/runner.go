@@ -46,6 +46,12 @@ type Runner struct {
 	// budget is only known at that moment (verify's single cleanup budget)
 	// supplies it here instead of writing CleanupHandoffTimeout while Run reads
 	// it.
+	//
+	// Either budget opts into the cleanup handoff: a caller that supplies only
+	// the deadline gets the same sealing and quiescing semantics, with the
+	// budget taken from the deadline, and its one-shot checks receive a
+	// non-nil checkHandoff. Supplying neither keeps the legacy behavior of
+	// waiting for every lifecycle worker.
 	CleanupHandoffDeadline func() time.Time
 	Project                *ipc.Project
 	// AttemptID stamps every journal event of this run with the owning
@@ -337,7 +343,10 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 	}
 
 	handoff := make(chan struct{})
-	if r.CleanupHandoffTimeout <= 0 {
+	// Either budget opts into the cleanup handoff. A deadline-only caller
+	// used to get no handoff at all, so the run waited for every lifecycle
+	// worker with no bound.
+	if r.CleanupHandoffTimeout <= 0 && r.CleanupHandoffDeadline == nil {
 		handoff = nil
 	}
 	checkCtx, cancelChecks := context.WithCancel(runCtx)
@@ -674,11 +683,13 @@ func (r *Runner) handleCommands(ctx context.Context, store *stateStore) {
 		if !holdsBarrier {
 			continue
 		}
-		// The verdict is not delivered until the server has written the
-		// acknowledgment carrying it, and only this goroutine can observe both
-		// the reply and the flush. WaitFlushed returns on disconnect, write
-		// failure and timeout alike, so a client that goes away cannot wedge
-		// the daemon — and the barrier is released on every path.
+		// The server writes the acknowledgment carrying the verdict once the
+		// runner has replied, and only this goroutine can observe both the
+		// reply and the flush. The barrier is released after the write
+		// attempt completes, whatever its result — the server reports a
+		// failed write on stderr — so WaitFlushed returns on disconnect,
+		// write failure and timeout alike, and a client that goes away
+		// cannot wedge the daemon.
 		cmd.WaitFlushed(shutdownFlushTimeout)
 		r.stopAck.leave()
 	}

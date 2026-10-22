@@ -87,6 +87,11 @@ func creationTime(h syscall.Handle) (uint64, error) {
 // ProcStat is Linux-only.
 func ProcStat(int) (ProcInfo, error) { return ProcInfo{}, errors.ErrUnsupported }
 
+// syncDirectory is a no-op on Windows, where a directory handle cannot be
+// flushed the way a Unix directory can. The write itself is unaffected: the
+// durability step is best-effort.
+func syncDirectory(string) error { return nil }
+
 // HostIdentity has nothing to report on Windows, which records no process
 // groups.
 func HostIdentity() Host { return Host{} }

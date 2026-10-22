@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/paths"
 )
@@ -32,6 +33,14 @@ type Plan struct {
 }
 
 func Acquire(cfg *config.Config, configPath, hash, name string, filter []string) (_ *Plan, err error) {
+	// The filter is validated before anything is leased: an unknown or
+	// teardown name is refused outright instead of silently selecting
+	// nothing.
+	for _, selector := range filter {
+		if selectorErr := config.CheckSelector(cfg, selector); selectorErr != nil {
+			return nil, selectorErr
+		}
+	}
 	p := &Plan{
 		Project:   &ipc.Project{Session: name, RunID: ipc.NewRunID(), ConfigPath: configPath, Directory: paths.SessionDir(hash), Ports: make(map[string]map[string]int), URLs: make(map[string]map[string]string), JournalPath: paths.Journal(hash)},
 		variables: make(map[string]string), preferred: make(map[string]map[string]int), resources: slices.Clone(cfg.Resources),
@@ -59,15 +68,36 @@ func Acquire(cfg *config.Config, configPath, hash, name string, filter []string)
 	p.variables["config.dir"] = filepath.Dir(configPath)
 	resources := slices.Clone(cfg.Resources)
 	sort.Strings(resources)
+	leased := make(map[string]bool, len(resources))
 	for _, label := range resources {
 		resolved, expandErr := p.expand(label)
 		if expandErr != nil {
 			return nil, expandErr
 		}
+		if leased[resolved] {
+			// Two labels expanded to the same resource: the plan already
+			// holds that lease, so it is not taken twice (the first
+			// occurrence wins).
+			continue
+		}
+		leased[resolved] = true
 		if err = p.lease("resource:" + resolved); err != nil {
 			return nil, err
 		}
 		p.Project.Resources = append(p.Project.Resources, resolved)
+	}
+	// The merge proxy listens on a fixed port baked into its command, so the
+	// port is leased rather than allocated: it is never moved and never
+	// recorded as a named port.
+	//
+	// The lease is taken only when the proxy is part of the selected process
+	// set. A filtered start that does not select the proxy never binds the
+	// port, so holding it would refuse a second session that would have been
+	// able to bind it.
+	if cfg.Merge != nil && cfg.Merge.Port > 0 && slices.Contains(p.names, config.MergePortProcessName) {
+		if err = p.lease(fmt.Sprintf("tcp:127.0.0.1:%d", cfg.Merge.Port)); err != nil {
+			return nil, err
+		}
 	}
 	for _, process := range p.names {
 		declared := cfg.Processes[process].Ports
@@ -102,7 +132,7 @@ func Acquire(cfg *config.Config, configPath, hash, name string, filter []string)
 // Resolve also applies reloads against the already-owned endpoint assignments.
 // Changing leases requires a new session, rather than silently changing owners.
 func (p *Plan) Resolve(cfg *config.Config) (*config.Config, error) {
-	if !slices.Equal(p.resources, cfg.Resources) {
+	if !sameResources(p.resources, cfg.Resources) {
 		return nil, fmt.Errorf("resources changed; restart the session")
 	}
 	result := *cfg
@@ -157,6 +187,19 @@ func (p *Plan) Resolve(cfg *config.Config) (*config.Config, error) {
 		result.Processes[name] = proc
 	}
 	return &result, nil
+}
+
+// sameResources reports whether two resource label lists name the same set of
+// resources. The order of the labels is not significant: the leases are taken
+// over the sorted labels, so a reordering changes no lease and is not a
+// resource-set change.
+func sameResources(a, b []string) bool {
+	sorted := func(labels []string) []string {
+		out := slices.Clone(labels)
+		sort.Strings(out)
+		return out
+	}
+	return slices.Equal(sorted(a), sorted(b))
 }
 
 // expandProbe returns a copy of probe with its endpoint references resolved,
@@ -298,12 +341,14 @@ func (p *Plan) Close() {
 	p.leases = nil
 }
 
+// Save writes the session metadata atomically: a reader never observes a
+// truncated document.
 func Save(path string, project *ipc.Project) error {
 	data, err := json.Marshal(project)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return daemon.WriteFileAtomic(path, data, 0600)
 }
 
 func Read(path string) (*ipc.Project, error) {
@@ -314,6 +359,11 @@ func Read(path string) (*ipc.Project, error) {
 	var project ipc.Project
 	if err := json.Unmarshal(data, &project); err != nil {
 		return nil, err
+	}
+	if project.RunID == "" && project.ConfigPath == "" {
+		// A document that describes no session is not a session: a null or
+		// empty object would otherwise register a phantom session.
+		return nil, fmt.Errorf("invalid session metadata %s: the document describes no session", path)
 	}
 	return &project, nil
 }

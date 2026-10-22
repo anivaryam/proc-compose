@@ -41,7 +41,7 @@ processes:
 | `max_restarts` | No | `0` (unlimited) | Stop restarting after N restarts; process enters "failed" state |
 | `shutdown_timeout` | No | `5` | Seconds to wait for graceful shutdown before SIGKILL |
 | `ready_when` | No | — | Readiness probe (see below) |
-| `ready_timeout` | No | `60` | Seconds to wait for readiness before failing (`-1` = no limit) |
+| `ready_timeout` | No | `60` | Seconds to wait for readiness before failing (`-1` = no limit; a value below `-1` is refused) |
 | `health_when` | No | — | Ongoing health check after readiness: `http`, `tcp`, or `cmd` (see [Health Checks](#health-checks)) |
 | `health_interval` | No | `10` | Seconds between health checks; `0` uses the default; requires `health_when` |
 | `health_action` | No | `report` | `report` marks the service unhealthy; `restart` restarts it through `restart`; requires `health_when` |
@@ -389,7 +389,10 @@ processes:
 
 When a `merge:` section is present, proc-compose auto-injects `depends_on` on `merge-port` for every upstream process so you don't need to wire it manually — see [merge-port Integration](#merge-port-integration) below.
 
-If a dependency fails before becoming ready, dependent processes also fail.
+If a dependency fails before becoming ready and is not restarted, dependent
+processes also fail. A dependency that the restart policy retries does not fail
+its dependents: they keep waiting for the replacement incarnation's readiness
+probe, and they fail only when the dependency's lifecycle ends for good.
 
 Task dependencies are useful for one-time setup before services start:
 
@@ -427,6 +430,53 @@ processes:
       PORT: "3000"  # overrides PORT from .env file
 ```
 
+A single line of the env file may be up to 1 MiB long. A longer line is an
+error (`env_file_unreadable`) that names the file, not a silently truncated
+value.
+
+## Shared Resources
+
+A top-level `resources` list declares the exclusive labels a stack holds while
+it runs, so two stacks that share a database or a build directory serialise
+instead of colliding:
+
+```yaml
+resources:
+  - 'postgresql:local:role-ddl'
+  - 'next-build:${config.dir}/apps/web'
+```
+
+A label is normalised **once**, when the config is loaded: surrounding
+whitespace is trimmed, and the trimmed label is the identity the lease, the
+duplicate check and `status --json` all use. `db` and `" db "` therefore name
+one resource — the first occurrence wins, the session holds one lease, and no
+error is raised. A label that is **exactly** repeated is still a configuration
+error (`invalid_resource`), as is an empty label, a label longer than 256
+**bytes** and a label containing a line break or a NUL byte; those checks run
+on the trimmed label, so a label padded with whitespace is accepted when its
+trimmed form is valid.
+
+The published JSON Schema (`proc-compose config schema`) states
+`uniqueItems: true` for `resources`, which is **raw**-scoped: JSON Schema
+cannot express trimming, so the schema rejects `" db "` next to `"db"` while
+the loader accepts it. The loader is the authority for what is accepted at
+runtime.
+
+The schema also requires a non-empty `processes` map or a `merge` section, as
+the loader does. A few loader rules are still **not** expressed in the schema,
+so a file can be schema-valid and refused at load time:
+
+- a resource label that is only whitespace (the loader trims it and refuses an
+  empty label; the schema's `minLength: 1` accepts it) — the loader is the
+  authority, so the schema does not add a whitespace rule that would also
+  forbid the padded labels the loader accepts;
+- the mode-conditional rules: a `task` or `teardown` process may not use
+  `ready_when`, `ready_timeout`, a restart policy, `max_restarts`, the
+  `health_*` fields, `foreign_listener`, `ports` or `depends_on`;
+- `health_interval`, `health_action` or `foreign_listener` without the probe
+  they need;
+- `max_restarts` together with `restart: never`.
+
 ## merge-port Integration
 
 The optional `merge` section auto-injects a [merge-port](https://github.com/anivaryam/merge-port) process to combine your client and server into a single port.
@@ -463,14 +513,20 @@ merge:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `client` | — | Client/frontend port (simple mode) |
-| `server` | — | Server/backend port (simple mode) |
-| `port` | `$PORT` → `8080` | Proxy listen port — reads `$PORT` env var if not set, then falls back to `8080` |
+| `client` | — | Client/frontend port (simple mode) — must be 1-65535 |
+| `server` | — | Server/backend port (simple mode) — must be 1-65535 |
+| `port` | `$PORT` → `8080` | Proxy listen port — reads `$PORT` env var if not set, then falls back to `8080`; must be 1-65535 |
 | `api_prefixes` | `[/api]` | Path prefixes routed to server (simple mode) |
 | `routes` | — | Explicit `prefix=target` routes (route mode) |
 | `client_process` | auto | Override the process name treated as the client (for env auto-injection) |
 
 `routes` cannot be combined with `client`, `server`, or `api_prefixes`.
+
+`client`, `server` and `port` must be a port number between 1 and 65535. A
+value outside that range is refused when the config is loaded
+(`invalid_merge`) — including a `PORT` environment variable outside the range,
+which the `port` fallback would otherwise pick up. `port: 0` still means
+"unset", so the `$PORT` value and then `8080` are used.
 
 Auto-detection of `api_prefixes` only matches top-level Express/Koa/Fastify/Hono handlers (`app.use`, `server.get`, etc.) and Go chi/gorilla/`net/http` handlers (`Route`, `Mount`, `Handle`, `HandleFunc`). Sub-router files and other frameworks (Django, Rails, Flask, etc.) need explicit `api_prefixes`.
 
@@ -481,11 +537,43 @@ When a `merge:` section is present, proc-compose wires the upstream ports automa
 - Each upstream process (`client`/`server` in simple mode; every backing process in route mode) gets a `ready_when: tcp localhost:<port>` probe — but only when you haven't supplied your own `ready_when`. A `ready_when` you set yourself, of any kind, always wins.
 - The injected `merge-port` process gets `depends_on` set to every upstream, so the runner blocks `merge-port` startup until the probes pass.
 
+Only **service** processes can be upstreams. A `task` or `teardown` process is
+never selected as one, so it gets neither the readiness probe nor the
+dependency edge — the merge wiring never writes a field the process's mode
+forbids.
+
 The upshot: a fresh `proc-compose up` on the simple example below boots `client` and `server`, waits for both to bind their ports, *then* starts `merge-port`. Requests that hit `:8080` after the daemon prints "ready" can never land on an unbound upstream.
 
 Override the auto-detected client process with `merge.client_process` (also used by the env-injection step). Upstream ports that don't match any managed process are left alone — proc-compose won't fabricate dependencies on external services.
 
+A process selected by name (or by `merge.client_process`) must serve the merge
+port it was selected for. If it declares a `PORT` that differs from
+`merge.client` or `merge.server`, the config is refused (`invalid_merge` at
+`merge.client` / `merge.server`) instead of being probed on a port the process
+does not serve. A process that declares no `PORT` at all is still probed at the
+merge port — the documented guess.
+
+The proxy is injected under the reserved process name `merge-port`. A config
+that defines a process with that name **and** a `merge:` section is refused
+(`reserved_process_name`); without a `merge:` section nothing generates a
+proxy, so the name is free.
+
 Before starting, proc-compose always checks that the merge-port proxy output port (`merge.port`, or `$PORT`/`8080`) is free. It also checks upstream ports owned by managed processes — ownership is determined by a process `env.PORT` matching `merge.client`, `merge.server`, or a `merge.routes` target port. Managed upstream ports must be free because proc-compose is about to start those processes. Upstream ports with no matching managed process are treated as external services and may already be listening; proc-compose does not reject those occupied external targets.
+
+The merge port is **leased** for the session's lifetime, like a named port: a
+second proc-compose session that declares the same merge port is refused at
+startup (`resource "tcp:127.0.0.1:8080" is owned by another session`) instead
+of failing later, when the proxy cannot bind. The lease is taken only when the
+proxy is part of the selected process set: a filtered start that does not
+select `merge-port` never binds the port, so it does not hold the lease and
+does not refuse another session that would bind it. The lease excludes **other
+proc-compose sessions only** — a third-party program can still take the port
+between the check and the proxy's bind, and `up --silent` checks the port in
+the parent process before the daemon child takes the lease. `verify` runs no
+port check of its own, so the lease is what keeps it from colliding with
+another session; a collision there is reported as `resource_unavailable`. The
+merge port is never reallocated and never reported as a named port: a managed
+process that prefers the same port is moved to the next free port.
 
 ### Client API URL auto-injection
 

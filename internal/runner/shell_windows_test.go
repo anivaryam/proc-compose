@@ -18,12 +18,21 @@ func TestShellTranslation(t *testing.T) {
 		{"path text is not normalized", "go run ./cmd/server", "cmd", []string{"/c", "go run ./cmd/server"}},
 		{"explicit powershell remains user command text", `powershell -NoProfile -Command "Write-Output $env:PORT"`, "cmd", []string{"/c", `powershell -NoProfile -Command "Write-Output $env:PORT"`}},
 		{"piped command uses existing powershell path", "cat a | grep b", "powershell", []string{"-Command", "cat a | grep b"}},
-		{"and command uses existing powershell path", "npm run dev && npm run build", "powershell", []string{"-Command", "npm run dev && npm run build"}},
+		{"and command uses the cmd path", "npm run dev && npm run build", "cmd", []string{"/c", "npm run dev && npm run build"}},
 		{"redirect command uses existing powershell path", "echo hi > out.txt", "powershell", []string{"-Command", "echo hi > out.txt"}},
-		{"or command uses existing powershell path", "cmd1 || cmd2", "powershell", []string{"-Command", "cmd1 || cmd2"}},
+		{"or command uses the cmd path", "cmd1 || cmd2", "cmd", []string{"/c", "cmd1 || cmd2"}},
 		{"multiple pipes use existing powershell path", "a | b | c", "powershell", []string{"-Command", "a | b | c"}},
+		{"mixed and and pipe uses the cmd path", "a && b | c", "cmd", []string{"/c", "a && b | c"}},
+		{"mixed pipe and and uses the cmd path", "a | b && c", "cmd", []string{"/c", "a | b && c"}},
 		{"env var in path is best effort compatibility", "$HOME/bin/app", "cmd", []string{"/c", "%HOME%/bin/app"}},
 		{"cmd substitution is best effort compatibility", "echo $(date)", "cmd", []string{"/c", "echo %(date)%"}},
+		{"sh -c keeps a single quoted inner command", `sh -c "echo 'x'"`, "cmd", []string{"/c", "echo 'x'"}},
+		{"sh -c keeps a double quoted inner command", `sh -c 'echo "x"'`, "cmd", []string{"/c", `echo "x"`}},
+		{"sh -c keeps escaped quotes verbatim", `sh -c "echo \"hello\""`, "cmd", []string{"/c", `echo \"hello\"`}},
+		{"sh -c without inner quotes is unchanged", "sh -c echo hello", "cmd", []string{"/c", "echo hello"}},
+		{"sh -c with a quoted inner command drops only that pair", `sh -c "echo hello"`, "cmd", []string{"/c", "echo hello"}},
+		{"sh -c with mismatched outer quotes is untouched", `sh -c "echo 'x'`, "cmd", []string{"/c", `"echo 'x'`}},
+		{"sh -c with a single quote byte is untouched", `sh -c "`, "cmd", []string{"/c", `"`}},
 	}
 
 	for _, tt := range tests {
@@ -58,12 +67,16 @@ func TestNeedsPowerShell(t *testing.T) {
 		{"echo ${VAR}", false},
 		{`powershell -NoProfile -Command "Write-Output $env:PORT"`, false},
 		{"cat a | grep b", true},
-		{"cmd && other", true},
-		{"cmd || other", true},
+		{"cmd && other", false},
+		{"cmd || other", false},
+		{"a && b | c", false},
+		{"a | b && c", false},
+		{"a || b | c", false},
 		{"echo hi > out.txt", true},
 		{"echo hi 2>&1", true},
 		{"$(echo $(date))", false},
 		{"$(cmd)", false},
+		{"echo $(date", true},
 	}
 
 	for _, tt := range tests {

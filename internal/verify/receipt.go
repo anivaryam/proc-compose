@@ -191,7 +191,10 @@ func WriteReceipt(path string, result *Result) error {
 	return daemon.WriteFileAtomic(path, append(data, '\n'), 0600)
 }
 
-// ReadReceipt loads one receipt.
+// ReadReceipt loads one receipt. A receipt that does not satisfy the receipt
+// contract — a known attempt state and a known overall status — is refused
+// like an unreadable file: the attempts listing skips it and Prune preserves
+// it, so a corrupt or hand-made file is never consumed as an attempt.
 func ReadReceipt(path string) (*Result, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -203,6 +206,12 @@ func ReadReceipt(path string) (*Result, error) {
 	}
 	if result.SchemaVersion != SchemaVersion || result.Kind != KindReceipt {
 		return nil, fmt.Errorf("receipt %s: unsupported schema %d/%q", path, result.SchemaVersion, result.Kind)
+	}
+	if !knownState(result.State) {
+		return nil, fmt.Errorf("receipt %s: state %q is not a known attempt state", path, result.State)
+	}
+	if !knownOverallStatus(result.Status) {
+		return nil, fmt.Errorf("receipt %s: status %q is not a known overall status", path, result.Status)
 	}
 	return &result, nil
 }

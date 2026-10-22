@@ -45,6 +45,13 @@ HTTP loopback URL. `${session.name}`, `${session.id}`, `${session.dir}`, and
 without `dir` run from the config directory. Applications create their own
 declared runtime subdirectories or use a setup task to provision them.
 
+A port name follows the process-name rules **without a dot**: letters, digits,
+`-` and `_`, starting and ending with a letter or a digit. The reference name
+of an endpoint is its process name and its port name joined by a dot, so a dot
+in a port name would let two different endpoints claim one reference name; a
+dotted port name is refused (`invalid_port`). A dot in a **process** name is
+fine — `a.b` with the port `c` is referenced as `${ports.a.b.c}`.
+
 Declare exclusive shared-resource labels with a top-level `resources` list:
 
 ```yaml
@@ -55,6 +62,9 @@ resources:
 
 Sessions in the same runtime directory hold these advisory leases for their
 entire lifetime. A conflicting session fails before configured commands start.
+A label is trimmed when the config is loaded, so `db` and `" db "` name the
+same resource: the first occurrence wins and the session holds one lease. An
+exactly repeated label is still a configuration error.
 Separate ports alone do not isolate databases or build directories: use separate
 worktrees and application-specific provisioning tasks, and declare shared
 resources that must serialize. Named-port leases coordinate proc-compose
@@ -77,6 +87,8 @@ the binary and linked from `--help`.
 Every managed output, lifecycle transition, readiness failure, and cleanup
 verdict enters one ordered event model. A separate rotating JSON-lines journal
 retains events even when human output is text or uses a custom `--log-file`.
+A journal that cannot be rotated keeps the events it already recorded and
+makes the run's result carry an `event journal: …` error.
 
 ```sh
 proc-compose --session feature logs worker --json --level error --max-bytes 4096
@@ -118,6 +130,15 @@ Resume using the returned cursor. A cursor outside rotated history sets `gap`
 and returns a bounded retained tail. Truncated records retain their identity;
 the original journal remains intact. Input lines above 1 MiB retain an explicit
 prefix, original byte count, and truncation flag without losing subsequent lines.
+
+A tail page is the newest end of the window, never the oldest. Under tail
+`has_more` is always `false` — a tail page is the end of the window, not a
+forward page that can be continued. `next_cursor` is the last event *scanned*,
+not the last event returned: it advances over events that did not match the
+filters as well, so resuming from it never replays a scanned event.
+`truncated` is `true` when older events were dropped to fit the event limit or
+the byte budget, and when a single event had to be shortened to fit it. A tail
+query that resumes from a cursor returns the newest events after that cursor.
 
 `--follow --json` and `-n 0 --json` produce newline-delimited pages. Filters
 include process, severity, kind, stable code, stream, substring, time, run, and

@@ -109,7 +109,7 @@ func (r *Runner) RunCheck(ctx context.Context, spec CheckSpec) CheckResult {
 	defer cancel()
 	defer context.AfterFunc(stackCtx, cancel)()
 
-	st := &procState{state: "starting", generation: 1, readyCh: make(chan struct{}), restartCh: make(chan struct{}, 1)}
+	st := &procState{state: "starting", generation: 1, readyCycle: newReadyCycle(), restartCh: make(chan struct{}, 1)}
 	r.checksMu.Lock()
 	if r.checks == nil {
 		r.checks = make(map[string]*procState)

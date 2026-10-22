@@ -32,7 +32,9 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why --attempt latest --j
   `check_exit_nonzero`, `check_timeout`, `required_process_failed`,
   `environment_ineligible`, `environment_unverified`, `cleanup_unverified`,
   `receipt_persistence_failed`, `session_occupied`, `invalid_configuration`).
-  `check.stdout`/`stderr` hold up to 4 KiB each.
+  `check.stdout`/`stderr` hold up to 4 KiB each; `stdout_sha256`/`stderr_sha256`
+  digest that captured prefix only, and `output_truncated` marks a stream that
+  was cut off.
 - Only `status: passed` means the check passed against a ready stack with
   verified cleanup. It proves that check, not general health;
   `source.loaded_code_proven` is always false. Readiness `not_configured`
@@ -80,6 +82,8 @@ events. For each process you get state transitions and output, with
 identical consecutive lines grouped into `count`, plus
 `first_id`/`last_id` for `logs --after`. `history_missing`, `gap`, and
 `truncated` mark incomplete evidence. It shows temporal order, not causes.
+A record without an attempt id is scoped to its run instead (`boundary:
+run_id`, limitation `attempt_boundary_unavailable`).
 `attempts --json` lists receipts. A nonterminal receipt is `active` only while
 its owner lives and still runs the session, `abandoned` only with positive owner loss plus a free lease,
 and otherwise `indeterminate`; it is never a pass. `sessions` never probes the
@@ -129,6 +133,9 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why api --json
 - A page has `schema_version`, `events`, `next_cursor` (save it, not the last
   event ID), `has_more`, `gap` (cursor expired; you got a bounded tail), and
   `truncated`.
+- A tail page is the newest end of the window: `has_more` is always `false`,
+  `next_cursor` is the last event scanned (it advances over events that did
+  not match the filters too), and `truncated` marks dropped events.
 - Defaults are 50 events / 64 KiB; maximums are 1000 / 1 MiB. Keep the same
   filters when resuming. `--after start` pages from the oldest event.
 - An empty page is not proof of health. Plain stderr is `stream: stderr`, not
@@ -156,8 +163,14 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why api --json
   with its `scope`.
 - `ports: {http: 0}` requests an ephemeral port and sets `PORT`. Reference ports
   as `${ports.api.http}` / `${urls.api.http}`; `${session.dir}` is the session
-  runtime root. `resources` labels take exclusive leases. Databases, build
-  outputs, and hardcoded ports remain shared unless separated explicitly.
+  runtime root. A port name carries no dot (the reference name is
+  `process.port`); a dot in a process name is fine. `resources` labels take
+  exclusive leases; they are trimmed when the config is loaded, so whitespace
+  variants name one resource. Databases, build outputs, and hardcoded ports
+  remain shared unless separated explicitly.
 - `compare --baseline DIR --candidate DIR --json -- CMD` runs one check against
   two worktrees. `outcomes_equal`/`differences` are observations, not
-  attributions, and isolating data is the caller's job.
+  attributions, and isolating data is the caller's job. `outcomes_equal` is
+  `null` when no verdict could be proven (one side's own repetitions
+  disagree, or a compared output was truncated); the reason is named in
+  `limitations`.

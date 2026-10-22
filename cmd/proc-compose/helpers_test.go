@@ -1194,72 +1194,6 @@ func (p *scriptedPeer) push(st ipc.ProcState) {
 	p.send <- st
 }
 
-func TestComputeClosure_AllProcs(t *testing.T) {
-	procs := map[string]config.Process{
-		"a": {Cmd: "echo a"},
-		"b": {Cmd: "echo b"},
-		"c": {Cmd: "echo c"},
-	}
-	got := computeClosure(procs, nil)
-	if len(got) != 3 {
-		t.Errorf("expected 3 procs, got %d", len(got))
-	}
-}
-
-func TestComputeClosure_WithDeps(t *testing.T) {
-	procs := map[string]config.Process{
-		"app":     {Cmd: "echo app", DependsOn: []string{"db"}},
-		"db":      {Cmd: "echo db", DependsOn: []string{"migrate"}},
-		"migrate": {Cmd: "echo migrate"},
-	}
-	got := computeClosure(procs, []string{"app"})
-	if len(got) != 3 {
-		t.Errorf("expected closure {app,db,migrate}, got %v", got)
-	}
-	found := make(map[string]bool)
-	for _, n := range got {
-		found[n] = true
-	}
-	if !found["app"] || !found["db"] || !found["migrate"] {
-		t.Errorf("expected app,db,migrate in closure, got %v", got)
-	}
-}
-
-func TestComputeClosure_TaskOnlyRejected(t *testing.T) {
-	procs := map[string]config.Process{
-		"migrate": {Cmd: "echo migrate", Mode: config.ProcessModeTask},
-	}
-	closure := computeClosure(procs, []string{"migrate"})
-	hasService := false
-	for _, name := range closure {
-		if procs[name].EffectiveMode() != config.ProcessModeTask {
-			hasService = true
-			break
-		}
-	}
-	if hasService {
-		t.Error("expected task-only closure to have no services")
-	}
-}
-
-func TestComputeClosure_ServiceWithTaskAllowed(t *testing.T) {
-	procs := map[string]config.Process{
-		"app":     {Cmd: "echo app", DependsOn: []string{"migrate"}},
-		"migrate": {Cmd: "echo migrate", Mode: config.ProcessModeTask},
-	}
-	closure := computeClosure(procs, []string{"app"})
-	hasService := false
-	for _, name := range closure {
-		if procs[name].EffectiveMode() != config.ProcessModeTask {
-			hasService = true
-			break
-		}
-	}
-	if !hasService {
-		t.Error("expected closure with app to have at least one service")
-	}
-}
-
 func TestCheckOptionalBinaries_MergeWithoutMergePort_ReturnsError(t *testing.T) {
 	cfg := &config.Config{
 		Merge: &config.Merge{
@@ -3437,6 +3371,18 @@ func TestUpdateNotice_EndToEndLeavesStructuredOutputIntact(t *testing.T) {
 // NO_COLOR.
 func runInteractive(t *testing.T, bin, dir string, env []string, noColor bool, args ...string) string {
 	t.Helper()
+	out, err := runInteractiveExit(t, bin, dir, env, noColor, args...)
+	if err != nil {
+		t.Fatalf("interactive %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return out
+}
+
+// runInteractiveExit is runInteractive for a command that is expected to fail:
+// it returns the combined output and the exit error instead of failing the
+// test.
+func runInteractiveExit(t *testing.T, bin, dir string, env []string, noColor bool, args ...string) (string, error) {
+	t.Helper()
 	if runtime.GOOS != "linux" {
 		t.Skip("interactive assertions require util-linux script")
 	}
@@ -3451,10 +3397,7 @@ func runInteractive(t *testing.T, bin, dir string, env []string, noColor bool, a
 		cmd.Env = append(cmd.Env, "NO_COLOR=")
 	}
 	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("interactive %s failed: %v\n%s", strings.Join(args, " "), err, out)
-	}
-	return string(out)
+	return string(out), err
 }
 
 // seedUpdateCache writes a cache entry standing in for a lookup that already

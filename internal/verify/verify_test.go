@@ -71,6 +71,24 @@ func helper(mode, arg string) int {
 			return 5
 		}
 		return 0
+	case "rep":
+		// The first repetition is the same on both sides, the second differs:
+		// a cross-side difference at a later repetition only.
+		if os.Getenv("PROC_COMPOSE_COMPARE_REPETITION") == "2" {
+			fmt.Printf("second side=%s\n", os.Getenv("PROC_COMPOSE_COMPARE_SIDE"))
+		} else {
+			fmt.Println("same")
+		}
+		return 0
+	case "big":
+		fmt.Print(strings.Repeat("x", 2*MaxOutputBytes))
+		return 0
+	case "bigerr":
+		fmt.Fprint(os.Stderr, strings.Repeat("x", 2*MaxOutputBytes))
+		return 0
+	case "env":
+		fmt.Printf("[%s|%s]\n", os.Getenv("FOO"), os.Getenv("PROC_COMPOSE_COMPARE_SIDE"))
+		return 0
 	}
 	return 99
 }
@@ -488,6 +506,102 @@ func TestReadReceipt_OwnerScopeIsAdditive(t *testing.T) {
 	}
 }
 
+// TestReadReceipt_ValidatesTheReceiptContract pins the receipt contract a
+// reader enforces: a receipt carries a known attempt state and a known
+// overall status. A record without them is refused like an unreadable file,
+// so a corrupt or hand-made file is never consumed as an attempt.
+func TestReadReceipt_ValidatesTheReceiptContract(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for name, body := range map[string]string{
+		"no state or status": `{"schema_version":1,"kind":"verify.receipt"}`,
+		"unknown state":      `{"schema_version":1,"kind":"verify.receipt","state":"weird","status":"passed"}`,
+		"empty state":        `{"schema_version":1,"kind":"verify.receipt","state":"","status":"passed"}`,
+		"no status":          `{"schema_version":1,"kind":"verify.receipt","state":"completed"}`,
+		"unknown status":     `{"schema_version":1,"kind":"verify.receipt","state":"completed","status":"weird"}`,
+		"phase status":       `{"schema_version":1,"kind":"verify.receipt","state":"completed","status":"not_configured"}`,
+	} {
+		path := write(strings.ReplaceAll(name, " ", "-")+".json", body)
+		receipt, err := ReadReceipt(path)
+		if err == nil {
+			t.Errorf("%s: accepted %+v", name, receipt)
+			continue
+		}
+		if !strings.Contains(err.Error(), "receipt "+path) {
+			t.Errorf("%s: error %v does not name the receipt", name, err)
+		}
+		if !strings.Contains(err.Error(), "state") && !strings.Contains(err.Error(), "status") {
+			t.Errorf("%s: error %v does not name the offending field", name, err)
+		}
+	}
+	// Every documented state and overall status is accepted.
+	for _, state := range []string{StateActive, StateCompleted, StateAbandoned, StateIndeterminate} {
+		for _, status := range []string{StatusPassed, StatusFailed, StatusInterrupted, StatusNotRun} {
+			path := write("ok.json", fmt.Sprintf(`{"schema_version":1,"kind":"verify.receipt","state":%q,"status":%q}`, state, status))
+			receipt, err := ReadReceipt(path)
+			if err != nil {
+				t.Errorf("%s/%s: %v", state, status, err)
+				continue
+			}
+			if receipt.State != state || receipt.Status != status {
+				t.Errorf("%s/%s: read %s/%s", state, status, receipt.State, receipt.Status)
+			}
+		}
+	}
+}
+
+// TestPrune_PreservesInvalidReceiptsAndAppliesTheRetentionCount pins that an
+// invalid receipt behaves exactly like an unreadable one: it is preserved and
+// does not consume the retention budget, which still applies to the valid
+// terminal receipts.
+func TestPrune_PreservesInvalidReceiptsAndAppliesTheRetentionCount(t *testing.T) {
+	dir := t.TempDir()
+	invalid := filepath.Join(AttemptsDir(dir), "invalid.json")
+	if err := os.MkdirAll(AttemptsDir(dir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(invalid, []byte(`{"schema_version":1,"kind":"verify.receipt"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var last string
+	for i := 0; i <= RetainedTerminalReceipts; i++ {
+		id := fmt.Sprintf("01J%023d", i)
+		path := filepath.Join(AttemptsDir(dir), id+".json")
+		r := newResult(Options{ConfigPath: "/x/c.yml"}, time.Now())
+		r.State = StateCompleted
+		if err := WriteReceipt(path, r); err != nil {
+			t.Fatal(err)
+		}
+		last = path
+	}
+	if err := Prune(dir, last); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(invalid); err != nil {
+		t.Fatalf("the invalid receipt was not preserved: %v", err)
+	}
+	valid := 0
+	paths, _ := ListReceipts(dir)
+	for _, path := range paths {
+		if path == invalid {
+			continue
+		}
+		if _, err := ReadReceipt(path); err != nil {
+			t.Fatalf("a valid receipt became invalid: %v", err)
+		}
+		valid++
+	}
+	if valid != RetainedTerminalReceipts {
+		t.Fatalf("retained %d valid receipts, want %d", valid, RetainedTerminalReceipts)
+	}
+}
+
 // TestProbeKind_NamesEveryReadinessKind keeps the receipt's probe field in step
 // with the probe kinds config accepts: a cmd probe is a probe, not unprobed.
 func TestProbeKind_NamesEveryReadinessKind(t *testing.T) {
@@ -520,6 +634,57 @@ func TestRun_UnprobedServiceIsDistinguishedFromProbeReadiness(t *testing.T) {
 	obs := result.Startup.ReadinessObservations
 	if len(obs) != 1 || obs[0].Probe != nil || obs[0].Status != StatusNotConfig || obs[0].Owner != nil || len(result.Startup.UnprobedProcesses) != 1 {
 		t.Fatalf("unprobed readiness = %+v / %v", obs, result.Startup.UnprobedProcesses)
+	}
+}
+
+// TestRun_ActiveReceiptCarriesNoVerdict pins the receipt written before the
+// attempt has any outcome: it must not claim a failed verdict (with exit
+// code 0) before one exists. The terminal receipt still carries the real
+// verdict.
+func TestRun_ActiveReceiptCarriesNoVerdict(t *testing.T) {
+	f := newFixture(t, serviceConfig)
+	withHelper(t, "exit")
+	opts := f.options(t, "active", checkArgv("exit", "0")...)
+	var first *Result
+	opts.writeReceipt = func(path string, result *Result) error {
+		if err := WriteReceipt(path, result); err != nil {
+			return err
+		}
+		if first != nil {
+			return nil
+		}
+		snapshot := *result
+		first = &snapshot
+		// The active receipt satisfies the receipt contract and reads back.
+		read, err := ReadReceipt(path)
+		if err != nil {
+			t.Errorf("the active receipt does not read back: %v", err)
+			return nil
+		}
+		if read.Status != StatusNotRun || read.State != StateActive {
+			t.Errorf("the active receipt reads back as %s/%s", read.State, read.Status)
+		}
+		return nil
+	}
+	result := Run(context.Background(), opts)
+	if first == nil {
+		t.Fatal("the attempt wrote no receipt")
+	}
+	if first.Kind != KindReceipt || first.State != StateActive || first.Phase != PhaseStarting {
+		t.Fatalf("active receipt = %s/%s/%s, want a receipt in the starting phase", first.Kind, first.State, first.Phase)
+	}
+	if first.Status != StatusNotRun || first.ExitCode != 0 || first.Precedence != "" {
+		t.Fatalf("active receipt verdict = %s exit %d precedence %q, want not_run/0/empty", first.Status, first.ExitCode, first.Precedence)
+	}
+	if result.Status != StatusPassed {
+		t.Fatalf("result = %s errors=%v", result.Status, result.Errors)
+	}
+	receipt, err := ReadReceipt(*result.ReceiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Status != StatusPassed || receipt.ExitCode != 0 || receipt.Precedence != PrecedencePassed {
+		t.Fatalf("terminal receipt = %s exit %d precedence %q", receipt.Status, receipt.ExitCode, receipt.Precedence)
 	}
 }
 
@@ -1140,6 +1305,69 @@ func TestDiagnose_ScopesToAttemptAndGroupsOutput(t *testing.T) {
 	}
 }
 
+// TestDiagnose_WithoutAttemptIDScansTheRun pins the boundary a diagnosis
+// reports. A record without an attempt id cannot be scoped to one attempt,
+// so the diagnosis scans the run and says so; it never labels an unscoped
+// scan as an attempt_id boundary, and it never shows another attempt's
+// output. An attempt id that matches nothing keeps its own limitation.
+func TestDiagnose_WithoutAttemptIDScansTheRun(t *testing.T) {
+	f := newFixture(t, serviceConfig)
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("POSIX shell required for this fixture")
+	}
+	opts := f.options(t, "diag", "/bin/sh", "-c", "echo boom; exit 2")
+	first := Run(context.Background(), opts)
+	second := Run(context.Background(), f.options(t, "diag", "/bin/sh", "-c", "echo other"))
+	if first.Status != StatusFailed || second.Status != StatusPassed {
+		t.Fatalf("fixture attempts: %s / %s", first.Status, second.Status)
+	}
+	receipt, err := ReadReceipt(*first.ReceiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.RunID == nil || receipt.Evidence.Journal == nil {
+		t.Fatalf("the receipt has no run id or journal: %+v", receipt)
+	}
+	corrupt := *receipt
+	corrupt.AttemptID = nil
+	d := Diagnose(&corrupt, StateCompleted, nil)
+	if d.Boundary != "run_id" {
+		t.Fatalf("boundary = %q, want run_id", d.Boundary)
+	}
+	if d.HistoryMissing || d.EventsScanned == 0 {
+		t.Fatalf("diagnosis = %+v", d)
+	}
+	named := false
+	for _, limitation := range d.Limitations {
+		named = named || limitation == "attempt_boundary_unavailable"
+	}
+	if !named {
+		t.Fatalf("limitations = %v, want the missing attempt boundary named", d.Limitations)
+	}
+	for _, p := range d.Processes {
+		for _, group := range p.Output {
+			if strings.Contains(group.Message, "other") {
+				t.Fatal("the diagnosis included output from a different attempt")
+			}
+		}
+	}
+
+	// An attempt id that matches nothing keeps its own limitation.
+	unknown := *receipt
+	unknown.AttemptID = ptr("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+	inferred := Diagnose(&unknown, StateCompleted, nil)
+	if inferred.Boundary != "run_id" {
+		t.Fatalf("boundary = %q, want run_id", inferred.Boundary)
+	}
+	named = false
+	for _, limitation := range inferred.Limitations {
+		named = named || limitation == "attempt_boundary_inferred_from_run"
+	}
+	if !named {
+		t.Fatalf("limitations = %v, want the inferred boundary named", inferred.Limitations)
+	}
+}
+
 func TestCompare_ReportsDifferencesWithoutAttribution(t *testing.T) {
 	base := newFixture(t, serviceConfig)
 	cand := newFixture(t, serviceConfig)
@@ -1163,6 +1391,219 @@ func TestCompare_ReportsDifferencesWithoutAttribution(t *testing.T) {
 	}
 	if bad := Compare(context.Background(), b, c, 0); bad.ExitCode != ExitUsage {
 		t.Fatalf("repeat 0 = %+v", bad)
+	}
+}
+
+// TestCompare_VerdictIsNullWhenUndeterminable pins the comparison verdict.
+// The sides agree iff every repetition pair agrees; a side that is not
+// internally consistent, or a compared output that was truncated, leaves the
+// verdict undeterminable: outcomes_equal is null and the reason is named.
+// A proven difference still yields false.
+func TestCompare_VerdictIsNullWhenUndeterminable(t *testing.T) {
+	base := newFixture(t, serviceConfig)
+	cand := newFixture(t, serviceConfig)
+	has := func(list []string, name string) bool {
+		for _, item := range list {
+			if item == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Repetitions that disagree: no verdict, and the reason is named.
+	withHelper(t, "rep")
+	noisy := Compare(context.Background(),
+		base.options(t, "verdict-baseline", checkArgv("rep", "")...),
+		cand.options(t, "verdict-candidate", checkArgv("rep", "")...), 2)
+	if noisy.Status != "comparable" || noisy.ExitCode != 0 {
+		t.Fatalf("comparison = %+v", noisy)
+	}
+	if noisy.OutcomesEqual != nil {
+		t.Fatalf("outcomes_equal = %t, want null for a repetition difference", *noisy.OutcomesEqual)
+	}
+	if !has(noisy.Limitations, "nondeterministic_within_side") {
+		t.Fatalf("limitations = %v, want the inconsistent side named", noisy.Limitations)
+	}
+
+	// Truncated output: no verdict, and the truncation is named.
+	for _, mode := range []string{"big", "bigerr"} {
+		t.Run(mode, func(t *testing.T) {
+			withHelper(t, mode)
+			truncated := Compare(context.Background(),
+				base.options(t, "trunc-baseline-"+mode, checkArgv(mode, "")...),
+				cand.options(t, "trunc-candidate-"+mode, checkArgv(mode, "")...), 1)
+			if truncated.Status != "comparable" || truncated.ExitCode != 0 {
+				t.Fatalf("comparison = %+v", truncated)
+			}
+			if truncated.OutcomesEqual != nil {
+				t.Fatalf("outcomes_equal = %t, want null for truncated output", *truncated.OutcomesEqual)
+			}
+			if !has(truncated.Limitations, "output_truncated") {
+				t.Fatalf("limitations = %v, want the truncation named", truncated.Limitations)
+			}
+			for _, side := range []string{"baseline", "candidate"} {
+				for _, a := range truncated.Sides[side].Attempts {
+					if !a.OutputTruncated {
+						t.Fatalf("%s attempt output_truncated = false, want true", side)
+					}
+				}
+			}
+		})
+	}
+
+	// A proven difference is still false, with the differing field named.
+	withHelper(t, "exit")
+	proven := Compare(context.Background(),
+		base.options(t, "proven-baseline", checkArgv("exit", "0")...),
+		cand.options(t, "proven-candidate", checkArgv("exit", "5")...), 1)
+	if proven.Status != "comparable" || proven.ExitCode != 0 {
+		t.Fatalf("comparison = %+v", proven)
+	}
+	if proven.OutcomesEqual == nil || *proven.OutcomesEqual {
+		t.Fatalf("outcomes_equal = %v, want false for a proven difference", proven.OutcomesEqual)
+	}
+	if len(proven.Differences) == 0 {
+		t.Fatal("a proven difference reported no differing field")
+	}
+
+	// An untruncated single-repetition comparison keeps its exact shape.
+	single := Compare(context.Background(),
+		base.options(t, "single-baseline", checkArgv("exit", "0")...),
+		cand.options(t, "single-candidate", checkArgv("exit", "0")...), 1)
+	if single.OutcomesEqual == nil || !*single.OutcomesEqual || len(single.Differences) != 0 {
+		t.Fatalf("comparison = %+v", single)
+	}
+	want := []string{"data_isolation_caller_asserted", "differences_not_attributed_to_code_change", "dependencies_and_build_inputs_not_controlled", "single_run_per_side"}
+	if len(single.Limitations) != len(want) {
+		t.Fatalf("limitations = %v, want %v", single.Limitations, want)
+	}
+	for i, limitation := range single.Limitations {
+		if limitation != want[i] {
+			t.Fatalf("limitations = %v, want %v", single.Limitations, want)
+		}
+	}
+}
+
+// TestSummaries_MedianCheckMs pins the median: the middle value for an odd
+// count, the average of the two middle values for an even count, rounded
+// half up.
+func TestSummaries_MedianCheckMs(t *testing.T) {
+	at := func(ms int64) *Result {
+		start := "2026-01-01T00:00:00Z"
+		end := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(ms) * time.Millisecond).Format(time.RFC3339Nano)
+		return &Result{Status: StatusPassed, Check: Check{Status: StatusPassed, StartedAt: &start, FinishedAt: &end}}
+	}
+	for _, tc := range []struct {
+		name string
+		ms   []int64
+		want int64
+	}{
+		{"even count", []int64{10, 30}, 20},
+		{"even count rounded half up", []int64{10, 31}, 21},
+		{"odd count", []int64{10, 20, 30}, 20},
+		{"single sample", []int64{7}, 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var results []*Result
+			for _, ms := range tc.ms {
+				results = append(results, at(ms))
+			}
+			sides := summaries(map[string]Options{"baseline": {Session: "s"}}, map[string][]*Result{"baseline": results})
+			got := sides["baseline"].MedianCheckMs
+			if got == nil {
+				t.Fatalf("median_check_ms = nil, want %d", tc.want)
+			}
+			if *got != tc.want {
+				t.Fatalf("median_check_ms = %d, want %d", *got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCompare_MergesCallerExtraEnv pins that Compare extends the caller's
+// ExtraEnv instead of replacing it: the caller's variables reach the check,
+// the tool's own variables still win, and the caller's map is not mutated
+// (it is shared between the two sides).
+func TestCompare_MergesCallerExtraEnv(t *testing.T) {
+	base := newFixture(t, serviceConfig)
+	cand := newFixture(t, serviceConfig)
+	withHelper(t, "env")
+	env := map[string]string{"FOO": "bar", "PROC_COMPOSE_COMPARE_SIDE": "hijacked"}
+	b, c := base.options(t, "env-baseline", checkArgv("env", "")...), cand.options(t, "env-candidate", checkArgv("env", "")...)
+	b.ExtraEnv, c.ExtraEnv = env, env
+	result := Compare(context.Background(), b, c, 1)
+	if result.Status != "comparable" {
+		t.Fatalf("comparison = %+v", result)
+	}
+	if got := result.Sides["baseline"].Attempts[0].StdoutExcerpt; !strings.Contains(got, "[bar|baseline]") {
+		t.Fatalf("baseline stdout = %q, want the caller's variable and the tool's side", got)
+	}
+	if got := result.Sides["candidate"].Attempts[0].StdoutExcerpt; !strings.Contains(got, "[bar|candidate]") {
+		t.Fatalf("candidate stdout = %q, want the caller's variable and the tool's side", got)
+	}
+	if env["PROC_COMPOSE_COMPARE_SIDE"] != "hijacked" || env["FOO"] != "bar" || len(env) != 2 {
+		t.Fatalf("the caller's map was mutated: %v", env)
+	}
+}
+
+// TestUsage_ZeroClockIsTolerated pins that an injected zero clock is
+// tolerated: the attempt records an empty started_at instead of panicking.
+func TestUsage_ZeroClockIsTolerated(t *testing.T) {
+	result := Usage(Options{Now: func() time.Time { return time.Time{} }}, CodeUsage)
+	if result.StartedAt != "" {
+		t.Fatalf("started_at = %q, want an empty string", result.StartedAt)
+	}
+	if result.FinishedAt != nil {
+		t.Fatalf("finished_at = %q, want null", *result.FinishedAt)
+	}
+	if result.Status != StatusFailed || result.ExitCode != ExitUsage {
+		t.Fatalf("usage result = %s/%d", result.Status, result.ExitCode)
+	}
+	if got := newResult(Options{}, time.Time{}); got.StartedAt != "" {
+		t.Fatalf("started_at = %q, want an empty string", got.StartedAt)
+	}
+}
+
+// TestTimestampDereferenceSites pins that the package has exactly one place
+// that dereferences a timestamp pointer, and that the place is guarded: a
+// zero clock makes timestamp return nil, and an unguarded dereference of it
+// panics.
+func TestTimestampDereferenceSites(t *testing.T) {
+	needle := "*" + "timestamp("
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sites []string
+	guarded := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(string(data), "\n")
+		for i, line := range lines {
+			if !strings.Contains(line, needle) {
+				continue
+			}
+			sites = append(sites, fmt.Sprintf("%s:%d", name, i+1))
+			for _, before := range lines[max(0, i-3):i] {
+				if strings.Contains(before, "IsZero()") || strings.Contains(before, "!= nil") {
+					guarded = true
+				}
+			}
+		}
+	}
+	if len(sites) != 1 {
+		t.Fatalf("timestamp dereference sites = %v, want exactly one", sites)
+	}
+	if !guarded {
+		t.Fatalf("the timestamp dereference at %s is not guarded against a nil timestamp", sites[0])
 	}
 }
 

@@ -21,7 +21,7 @@ func shellCommand(command string) (string, []string) {
 
 	if strings.HasPrefix(command, "sh -c ") {
 		inner := strings.TrimPrefix(command, "sh -c ")
-		inner = strings.Trim(inner, "\"'")
+		inner = stripOuterQuotes(inner)
 		return "cmd", []string{"/c", translateToCMD(inner)}
 	}
 
@@ -40,11 +40,38 @@ func isExplicitPowerShellCommand(command string) bool {
 		strings.HasPrefix(lower, "pwsh.exe ")
 }
 
-func needsPowerShell(cmd string) bool {
-	if strings.Contains(cmd, "|") {
-		return true
+// stripOuterQuotes removes exactly one matched outer quote pair from s and
+// returns the inner bytes verbatim. A string whose ends do not match, or that
+// is shorter than two bytes, is returned unchanged.
+//
+// The sh -c shim hands the inner text to cmd /c, so only the pair a shell
+// would have removed is removed: cmd has no single-quote semantics and does
+// not interpret a backslash-escaped quote, so the text after the pair is
+// passed through as it stands.
+func stripOuterQuotes(s string) string {
+	if len(s) < 2 {
+		return s
 	}
+	first, last := s[0], s[len(s)-1]
+	if first != last || (first != '"' && first != '\'') {
+		return s
+	}
+	return s[1 : len(s)-1]
+}
+
+// needsPowerShell reports whether a command has to run under PowerShell.
+//
+// The && and || test comes first and answers false, because cmd supports both
+// natively while Windows PowerShell 5.1 — the "powershell" on PATH — has no
+// chain operators at all. It has to be tested before the pipe test: "||"
+// contains "|", so a pipe test evaluated first would send the common "a || b"
+// form to a PowerShell that cannot parse it. A command that mixes operators
+// therefore runs under cmd as well.
+func needsPowerShell(cmd string) bool {
 	if strings.Contains(cmd, "&&") || strings.Contains(cmd, "||") {
+		return false
+	}
+	if strings.Contains(cmd, "|") {
 		return true
 	}
 	if strings.Contains(cmd, ">") || strings.Contains(cmd, "2>") {

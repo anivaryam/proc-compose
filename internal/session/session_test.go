@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -12,12 +13,396 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
+	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/paths"
 )
+
+// freePortPair returns a port nothing is listening on whose successor port is
+// free too, so a test can pin what happens when a named port prefers it.
+func freePortPair(t *testing.T) int {
+	t.Helper()
+	for attempt := 0; attempt < 100; attempt++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		if port < 65535 {
+			next, nextErr := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port+1))
+			if nextErr == nil {
+				next.Close()
+				listener.Close()
+				return port
+			}
+		}
+		listener.Close()
+	}
+	t.Fatal("no free port pair found")
+	return 0
+}
+
+// TestAcquire_ResourceLabelsAreNormalisedOnce pins that a resource label is
+// normalised once, at load time: the whitespace variants of one label are one
+// resource, so the session holds one lease and lists one resource. The
+// expansion of a trimmed label still applies.
+func TestAcquire_ResourceLabelsAreNormalisedOnce(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proc-compose.yml")
+	body := "processes:\n  api:\n    cmd: serve\nresources: [\"db\", \" db \"]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"db"}; !slices.Equal(cfg.Resources, want) {
+		t.Fatalf("cfg.Resources = %q, want %q", cfg.Resources, want)
+	}
+	plan, err := Acquire(cfg, path, "normalised", "normalised", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer plan.Close()
+	if want := []string{"db"}; !slices.Equal(plan.Project.Resources, want) {
+		t.Fatalf("Project.Resources = %q, want %q", plan.Project.Resources, want)
+	}
+	if len(plan.leases) != 2 {
+		t.Fatalf("leases = %d, want 2 (the instance lease and one resource lease)", len(plan.leases))
+	}
+
+	// A trimmed label still expands.
+	body = "processes:\n  api:\n    cmd: serve\nresources: [\" ${config.dir}/db \"]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan2, err := Acquire(cfg, path, "normalised-expand", "normalised-expand", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer plan2.Close()
+	if want := []string{filepath.Join(dir, "db")}; !slices.Equal(plan2.Project.Resources, want) {
+		t.Fatalf("Project.Resources = %q, want %q", plan2.Project.Resources, want)
+	}
+}
+
+// TestAcquire_ExpandedResourceCollisionIsLeasedOnce pins that two labels that
+// expand to the same resource are one lease: the plan does not conflict with
+// itself and lists the resource once.
+func TestAcquire_ExpandedResourceCollisionIsLeasedOnce(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proc-compose.yml")
+	absolute := filepath.Join(dir, "db")
+	body := fmt.Sprintf("processes:\n  api:\n    cmd: serve\nresources: [\"${config.dir}/db\", %q]\n", absolute)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := Acquire(cfg, path, "expand-collision", "expand", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer plan.Close()
+	if want := []string{absolute}; !slices.Equal(plan.Project.Resources, want) {
+		t.Fatalf("Project.Resources = %q, want %q", plan.Project.Resources, want)
+	}
+	if len(plan.leases) != 2 {
+		t.Fatalf("leases = %d, want 2 (the instance lease and one resource lease)", len(plan.leases))
+	}
+}
+
+// TestAcquire_MergePortIsLeased pins that the merge proxy's fixed port is
+// leased: a second session with the same merge port is refused with the
+// lease error, instead of both sessions acquiring it.
+//
+// The config carries the proxy process the merge section generates, so the
+// full start really selects the proxy and binds the port.
+func TestAcquire_MergePortIsLeased(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	port := freePortPair(t)
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	cfg := &config.Config{
+		Merge: &config.Merge{Client: 3000, Server: 3001, Port: port},
+		Processes: map[string]config.Process{
+			"api":                       {Cmd: "serve"},
+			config.MergePortProcessName: {Cmd: "merge-port --client 3000 --server 3001 --port " + strconv.Itoa(port)},
+		},
+	}
+	first, err := Acquire(cfg, path, "merge-first", "first", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer first.Close()
+	second, err := Acquire(cfg, path, "merge-second", "second", nil)
+	if err == nil {
+		second.Close()
+		t.Fatal("a second session acquired the merge port")
+	}
+	var lease *LeaseError
+	if !errors.As(err, &lease) || lease.Label != "tcp:127.0.0.1:"+strconv.Itoa(port) {
+		t.Fatalf("error = %v, want a *LeaseError for tcp:127.0.0.1:%d", err, port)
+	}
+	if lease.Instance() {
+		t.Fatalf("error = %v, want a resource lease, not the instance lease", err)
+	}
+}
+
+// TestAcquire_FilteredStartDoesNotLeaseTheMergePort pins that the merge port
+// is leased only when the proxy is part of the selected process set.
+//
+// A filtered start that does not select the proxy never binds the port, so it
+// must not hold the lease: a second session that would bind the port has to
+// start. A full start still leases it and is still refused.
+func TestAcquire_FilteredStartDoesNotLeaseTheMergePort(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	port := freePortPair(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proc-compose.yml")
+	body := fmt.Sprintf("merge:\n  client: 3000\n  server: 3001\n  port: %d\nprocesses:\n  api:\n    cmd: serve\n", port)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Processes[config.MergePortProcessName]; !ok {
+		t.Fatal("the loaded config has no merge-port process")
+	}
+	filtered, err := Acquire(cfg, path, "merge-filtered", "filtered", []string{"api"})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer filtered.Close()
+	if slices.Contains(filtered.names, config.MergePortProcessName) {
+		t.Fatalf("selected names = %q, want no merge-port proxy", filtered.names)
+	}
+	lease := leasePath(fmt.Sprintf("tcp:127.0.0.1:%d", port))
+	if _, err := os.Stat(lease); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge port lease %s exists (err = %v), want no lease for a start that never binds the port", lease, err)
+	}
+	// A second session that does start the proxy must not be refused.
+	full, err := Acquire(cfg, path, "merge-full", "full", nil)
+	if err != nil {
+		t.Fatalf("a second full session was refused: %v", err)
+	}
+	defer full.Close()
+}
+
+// TestAcquire_MergePortIsLeasedButNotAllocated pins that the merge port is
+// leased, never reallocated and never recorded as a named port: the merge
+// command keeps its own port, and a managed port that prefers it is moved
+// instead of refused.
+func TestAcquire_MergePortIsLeasedButNotAllocated(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	port := freePortPair(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proc-compose.yml")
+	body := fmt.Sprintf("merge:\n  client: 3000\n  server: 3001\n  port: %d\nprocesses:\n  api:\n    cmd: serve\n    ports:\n      http: %d\n", port, port)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mergeProc, ok := cfg.Processes["merge-port"]
+	if !ok {
+		t.Fatal("the loaded config has no merge-port process")
+	}
+	if len(mergeProc.Ports) != 0 {
+		t.Fatalf("merge-port Ports = %v, want none", mergeProc.Ports)
+	}
+	if want := "--port " + strconv.Itoa(port); !strings.Contains(mergeProc.Cmd, want) {
+		t.Fatalf("merge-port cmd = %q, want it to carry %q", mergeProc.Cmd, want)
+	}
+	plan, err := Acquire(cfg, path, "merge-plan", "merge", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer plan.Close()
+	if _, recorded := plan.Project.Ports["merge-port"]; recorded {
+		t.Fatalf("Project.Ports = %v, want no merge-port entry", plan.Project.Ports)
+	}
+	if got := plan.Project.Ports["api"]["http"]; got != port+1 {
+		t.Fatalf("managed port = %d, want %d (moved, not refused)", got, port+1)
+	}
+}
+
+// TestAcquire_RefusesAnInvalidFilter pins that the filter is validated before
+// anything is leased: an unknown name and a teardown name are refused, no
+// lease is left behind, and a valid filter still resolves as before.
+func TestAcquire_RefusesAnInvalidFilter(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	cfg := &config.Config{Processes: map[string]config.Process{
+		"api":     {Cmd: "serve"},
+		"cleanup": {Cmd: "clean", Mode: config.ProcessModeTeardown},
+	}}
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	for _, filter := range []string{"does-not-exist", "cleanup"} {
+		plan, err := Acquire(cfg, path, "filter-"+filter, "filter", []string{filter})
+		if err == nil {
+			plan.Close()
+			t.Fatalf("Acquire accepted the filter %q", filter)
+		}
+		if !strings.Contains(err.Error(), filter) {
+			t.Fatalf("error = %v, want it to name %q", err, filter)
+		}
+		entries, readErr := os.ReadDir(paths.LeaseDir())
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			t.Fatal(readErr)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("a refused filter left %d lease files behind", len(entries))
+		}
+	}
+
+	// A valid filter behaves exactly as before.
+	plan, err := Acquire(cfg, path, "filter-valid", "filter", []string{"api"})
+	if err != nil {
+		t.Fatalf("Acquire with a valid filter: %v", err)
+	}
+	plan.Close()
+
+	// The dependency closure is unchanged: an unknown dependency is still
+	// dropped, and the requested process is still selected.
+	closure := &config.Config{Processes: map[string]config.Process{"api": {Cmd: "serve", DependsOn: []string{"missing"}}}}
+	plan2, err := Acquire(closure, path, "filter-closure", "closure", []string{"api"})
+	if err != nil {
+		t.Fatalf("Acquire with an unknown dependency: %v", err)
+	}
+	defer plan2.Close()
+	if !slices.Contains(plan2.names, "api") || slices.Contains(plan2.names, "missing") {
+		t.Fatalf("selected names = %q, want the requested process only", plan2.names)
+	}
+}
+
+// TestSave_ReadNeverSeesAPartialDocument pins that the session metadata is
+// written atomically: a reader that reads while the writer saves never
+// observes a truncated document.
+func TestSave_ReadNeverSeesAPartialDocument(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := paths.Metadata("atomic")
+	project := &ipc.Project{
+		Session:    "atomic",
+		RunID:      ipc.NewRunID(),
+		ConfigPath: "/tmp/proc-compose.yml",
+		Ports:      map[string]map[string]int{"api": {"http": 4100}},
+	}
+	if err := Save(path, project); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var failures atomic.Int64
+	var reads atomic.Int64
+	var writers sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := Read(path); err != nil {
+					failures.Add(1)
+				}
+				reads.Add(1)
+			}
+		}()
+	}
+	for i := 0; i < 200; i++ {
+		if err := Save(path, project); err != nil {
+			close(stop)
+			writers.Wait()
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	writers.Wait()
+	if failures.Load() > 0 {
+		t.Fatalf("%d of %d reads failed while the metadata was written", failures.Load(), reads.Load())
+	}
+	if reads.Load() == 0 {
+		t.Fatal("no read observed the metadata")
+	}
+}
+
+// TestRead_RejectsDocumentWithoutSession pins that a metadata document that
+// describes no session is refused, and that a document naming either the run
+// or the config is still read.
+func TestRead_RejectsDocumentWithoutSession(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for _, body := range []string{"null", "{}", "null\n"} {
+		path := write("pc-empty.meta.json", body)
+		project, err := Read(path)
+		if err == nil {
+			t.Fatalf("Read(%q) = %+v, want an error", body, project)
+		}
+		if !strings.Contains(err.Error(), path) {
+			t.Fatalf("error = %v, want it to name the file", err)
+		}
+	}
+	for _, body := range []string{`{"run_id":"run-1"}`, `{"config_path":"/tmp/proc-compose.yml"}`} {
+		path := write("pc-session.meta.json", body)
+		if _, err := Read(path); err != nil {
+			t.Fatalf("Read(%q): %v", body, err)
+		}
+	}
+}
+
+// TestResolve_AcceptsReorderedResources pins that the order of the resource
+// labels is not a resource-set change: a pure reordering resolves, while
+// adding or removing a resource is still refused with the same message.
+func TestResolve_AcceptsReorderedResources(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	processes := map[string]config.Process{"api": {Cmd: "serve"}}
+	cfg := &config.Config{Resources: []string{"alpha", "beta"}, Processes: processes}
+	plan, err := Acquire(cfg, filepath.Join(t.TempDir(), "proc-compose.yml"), "reorder", "reorder", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	reordered := &config.Config{Resources: []string{"beta", "alpha"}, Processes: processes}
+	if _, err := plan.Resolve(reordered); err != nil {
+		t.Fatalf("a pure reorder was refused: %v", err)
+	}
+	for _, changed := range [][]string{{"alpha"}, {"alpha", "beta", "gamma"}} {
+		other := &config.Config{Resources: changed, Processes: processes}
+		_, err := plan.Resolve(other)
+		if err == nil {
+			t.Fatalf("a resource-set change to %q was accepted", changed)
+		}
+		if err.Error() != "resources changed; restart the session" {
+			t.Fatalf("error = %v, want the unchanged message", err)
+		}
+	}
+}
 
 func TestSessionLeaseHelper(t *testing.T) {
 	if len(os.Args) < 3 || os.Args[len(os.Args)-2] != "--session-lease-helper" {
@@ -333,4 +718,29 @@ func TestLeaseInstance_CreatesLeaseDir(t *testing.T) {
 		t.Fatalf("LeaseInstance without a lease dir: %v", err)
 	}
 	release()
+}
+
+// TestAcquire_DottedProcessNameExpandsItsPort pins that the session expands
+// the reference of a dotted process name to that process's port. The plan
+// splits the reference name at the last dot too, so the two agree: a dot in a
+// port name would break that, which is why the loader refuses one.
+func TestAcquire_DottedProcessNameExpandsItsPort(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	cfg := &config.Config{Processes: map[string]config.Process{
+		"a.b": {Cmd: "serve ${ports.a.b.c}", Ports: map[string]int{"c": 0}},
+	}}
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	hash, _ := paths.FromConfig(path, "dotted")
+	plan, err := Acquire(cfg, path, hash, "dotted", nil)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer plan.Close()
+	port := plan.Project.Ports["a.b"]["c"]
+	if port == 0 {
+		t.Fatalf("Project.Ports = %v, want a leased port for a.b/c", plan.Project.Ports)
+	}
+	if want := "serve " + strconv.Itoa(port); plan.Config.Processes["a.b"].Cmd != want {
+		t.Fatalf("cmd = %q, want %q", plan.Config.Processes["a.b"].Cmd, want)
+	}
 }

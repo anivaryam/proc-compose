@@ -7,10 +7,12 @@
 //
 // The check never blocks the command that triggered it. A cached result is
 // reused for CacheTTL; when that cache is missing or stale the lookup runs in
-// the background so the notice surfaces on the next invocation. Every failure
-// mode — no network, rate limiting, an unparseable tag, an unwritable cache —
-// is silent, because an update hint is never worth changing what a command
-// prints or the status it exits with.
+// the background so the notice surfaces on the next invocation. A caller that
+// wants the result recorded before its own process exits can wait for it with
+// WaitRefresh, which is bounded and returns at once when nothing was
+// scheduled. Every failure mode — no network, rate limiting, an unparseable
+// tag, an unwritable cache — is silent, because an update hint is never worth
+// changing what a command prints or the status it exits with.
 package update
 
 import (
@@ -56,9 +58,12 @@ const (
 	// document is a few KB; anything past this is not ours.
 	maxBodyBytes = 1 << 20
 
-	// httpTimeout bounds the background lookup. It is short because nothing
+	// HTTPTimeout bounds the background lookup. It is short because nothing
 	// waits on it: a slow or unreachable API just means no refresh.
-	httpTimeout = 3 * time.Second
+	//
+	// It is exported so a caller that joins the background lookup can budget
+	// the same timeout the lookup itself uses.
+	HTTPTimeout = 3 * time.Second
 )
 
 // Message renders the notice for a newer release, using the upgrade commands
@@ -152,6 +157,10 @@ type Checker struct {
 	client      *http.Client
 	now         func() time.Time
 	refreshOnce sync.Once
+	// refreshMu guards refreshDone, the channel closed when the background
+	// refresh this Checker scheduled has finished.
+	refreshMu   sync.Mutex
+	refreshDone chan struct{}
 }
 
 // New returns a Checker backed by cachePath.
@@ -159,14 +168,20 @@ func New(cachePath string) *Checker {
 	return &Checker{
 		cachePath: cachePath,
 		endpoint:  ReleaseURL,
-		client:    &http.Client{Timeout: httpTimeout},
+		client:    &http.Client{Timeout: HTTPTimeout},
 		now:       time.Now,
 	}
 }
 
+// CachePath returns the path of the shared update cache file, or an empty path
+// when the per-user cache directory is unavailable.
+func CachePath() string {
+	return paths.CacheFile(CacheFileName)
+}
+
 // Default returns a Checker backed by the shared per-user cache directory.
 func Default() *Checker {
-	return New(paths.CacheFile(CacheFileName))
+	return New(CachePath())
 }
 
 // Cached returns the newest release tag recorded by a lookup still within
@@ -223,7 +238,7 @@ func (c *Checker) Notice(installed string) string {
 // atomically, so a concurrent reader sees either the previous entry or the new
 // one, never a half-written file.
 func (c *Checker) Refresh() error {
-	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), HTTPTimeout)
 	defer cancel()
 	return c.refresh(ctx)
 }
@@ -231,15 +246,47 @@ func (c *Checker) Refresh() error {
 // refreshAsync schedules one background lookup for this Checker. The goroutine
 // may be cut short when the process exits before the HTTP timeout elapses; that
 // is harmless, because a missing entry only means the next invocation tries
-// again.
+// again. A caller that wants the result recorded before its own process exits
+// waits for it with WaitRefresh.
 func (c *Checker) refreshAsync() {
 	c.refreshOnce.Do(func() {
+		done := make(chan struct{})
+		c.refreshMu.Lock()
+		c.refreshDone = done
+		c.refreshMu.Unlock()
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
+			defer close(done)
+			ctx, cancel := context.WithTimeout(context.Background(), HTTPTimeout)
 			defer cancel()
 			_ = c.refresh(ctx)
 		}()
 	})
+}
+
+// WaitRefresh waits for the background refresh this Checker scheduled, for at
+// most timeout. It reports whether there is nothing left to wait for: the
+// refresh finished, or none was ever scheduled.
+//
+// It returns at once when nothing was scheduled. Notice returns "" both when
+// the cache is fresh and when it schedules a refresh, so only the Checker
+// itself knows whether a lookup is in flight. A refresh that has not finished
+// when the budget runs out is left running and abandoned with the process,
+// exactly as it is today.
+func (c *Checker) WaitRefresh(timeout time.Duration) bool {
+	c.refreshMu.Lock()
+	done := c.refreshDone
+	c.refreshMu.Unlock()
+	if done == nil {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (c *Checker) refresh(ctx context.Context) error {

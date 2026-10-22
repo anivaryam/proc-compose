@@ -7,6 +7,246 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A dependency that fails before it is ready and is then restarted no longer
+  fails its dependents. The dependents keep waiting for the replacement
+  incarnation's readiness probe, and they fail only when the dependency's
+  lifecycle ends for good.
+- A dependent that is still waiting for a dependency when the stack is stopped
+  now ends in the terminal state `exited`, with a `process.stopped` event,
+  instead of staying `starting`. A stop that the operator asked for is no
+  longer reported as a `dependency.failed` event; a dependency that really
+  failed still fails its dependent.
+- The `restart: always` policy now waits between restarts the way the failure
+  path does: the delay doubles from 1 second up to a maximum of 30 seconds
+  (1, 2, 4, 8, 16, 30, 30) instead of staying at one second. The failure
+  path's ceiling is 30 seconds as documented, not 32.
+- The shutdown verdict names the processes that survived it. When the members
+  of a process group could be enumerated, their PIDs are listed instead of
+  saying that the members could not be enumerated. The explanation of an
+  unavailable process group now belongs to the group it is reported for, so a
+  healthy group is never given another group's reason.
+- The monitor stops instead of redrawing in a hot loop when keyboard input
+  ends (stdin closed or unreadable). The terminal is restored first and the
+  monitor then prints `keyboard input closed — exiting monitor` on stderr.
+  When the monitor was not killed by a hangup — a backgrounded monitor, or
+  stdin on a pty that is not the controlling terminal — it previously kept
+  writing frames with no way out.
+- The monitor's highlighted row follows the process it names. A process that
+  fails, restarts or appears no longer moves the cursor onto another row, so
+  `Enter` filters the logs of the process that is highlighted.
+- `PgUp` and `PgDn` page the monitor's log area by exactly one visible page.
+  The page size is derived from the rendered frame, so consecutive pages are
+  contiguous and no log line is skipped between them.
+- Generated systemd units (`up --survive`) refer to the project paths as
+  written. `%` is escaped as `%%` in every specifier-expanded setting,
+  including `Description=`; the `ExecStart` executable and the `--file`
+  argument are quoted; and each `Environment=` value is quoted as a whole
+  assignment. A path containing a space is accepted instead of refused, and a
+  path containing `%` no longer produces a unit that fails to load or runs
+  against a rewritten path. A unit installed by an earlier version keeps the
+  file it was written with: re-run `proc-compose up --survive --install` to
+  regenerate it with the corrected quoting and escaping.
+- A tail log query returns the newest matching events whenever the tail is
+  requested, including when it resumes from a cursor. Under tail `has_more` is
+  always `false`, `next_cursor` is the last event scanned, and `truncated`
+  marks dropped events. The `logs` command output is unchanged.
+- Resource labels are normalised when the config is loaded: surrounding
+  whitespace is trimmed, and a label that differs only in whitespace from an
+  earlier one names the same resource. The session holds one lease for it and
+  lists it once, instead of taking two leases for one resource. The length and
+  character checks on a label now run on the trimmed label.
+- Two resource labels that expand to the same path no longer make a session
+  conflict with itself: the session starts instead of failing with a lease
+  error that names a foreign owner that does not exist.
+- The merge proxy's port is leased for the session's lifetime. A second
+  proc-compose session that declares the same merge port is refused at startup
+  (`resource "tcp:127.0.0.1:<port>" is owned by another session`) instead of
+  failing later, when the proxy cannot bind. The lease excludes other
+  proc-compose sessions only; the merge port is never reallocated and is never
+  reported as a named port. The lease is taken only when the proxy is part of
+  the selected process set: a filtered start that does not select
+  `merge-port` never binds the port, so it no longer refuses a second session
+  that would have bound it.
+- The session metadata is written atomically, so `sessions` and `status` no
+  longer briefly omit a session that is starting. The atomic replace always
+  writes the file with mode `0600`, so an existing metadata file that had a
+  wider mode is tightened.
+- A metadata file that describes no session (no run id and no config path) is
+  skipped instead of registering a phantom session named `default`.
+- A failed connection to the daemon now names the operating system's reason:
+  `no proc-compose daemon running (socket: ~/.proc-compose/daemon.sock): no
+  such file or directory`. The socket path stays sanitized — the raw home
+  path is never printed — and the returned error can be matched with
+  `errors.Is`.
+- The daemon reports an inbound command frame that is over the 64 KiB limit
+  instead of dropping it silently. The frame is still dropped and the
+  connection still closed; the diagnostic names the condition, the limit and
+  the peer.
+- The daemon reports a failed acknowledgment write. The barrier that releases
+  the shutdown verdict stays unconditional, so a client that has gone away
+  cannot wedge the daemon.
+- A log rotation that fails no longer truncates the live log. The live file
+  is renamed aside before anything else happens, so a failed rename keeps
+  every byte that was written, and the write reports the failure instead of
+  claiming success. A rotation that cannot install the new file keeps the
+  writer usable: the live path stays absent for the rest of the run, the
+  retained handle keeps appending into the rotated copy `.1`, and every later
+  rotation aborts at the staging rename with `ENOENT`. A run whose journal
+  cannot be rotated ends with an `event journal: …` error and exits non-zero.
+- `doctor` no longer reports a `missing_dir` error for a process `dir:` that
+  still holds a runtime template such as `${config.dir}` or `${session.dir}`.
+  The session expands those when it starts, so the doctor cannot say the
+  directory is missing. A `dir:` that names a real path is still checked.
+- `doctor` now also checks the config it suggests: a suggestion with a
+  `merge:` section reports the missing `merge-port` binary even when no
+  config exists yet. The finding names the suggested config so it can be
+  told apart from a finding about the config on disk.
+- `bootstrap --verify` verifies a config that resolves like the one that will
+  run. The verification copy is still written to the system temp dir — nothing
+  is written into the project — but its `dir:` values are rewritten to
+  absolute paths, so the merge topology and the client API URL it checks are
+  the ones the project actually uses.
+- `bootstrap --verify` no longer leaves an empty log file behind in the
+  system temp dir. The file is removed when it is empty and the verification
+  report then omits `log_file`; a log file the child wrote to is kept.
+- A verification attempt's receipt no longer claims a failed verdict while it
+  is still running. The receipt written before the attempt starts carries
+  `status: not_run` with `state: active` instead of `status: failed` with
+  exit code 0; the terminal receipt still carries the real verdict.
+- A receipt file that does not satisfy the receipt contract — a known attempt
+  `state` and a known overall `status` — is refused like an unreadable one.
+  `proc-compose attempts` skips it and it is preserved rather than pruned.
+- `why --attempt` on a record that carries no attempt id is scoped to the
+  attempt's run instead of the whole journal. The diagnosis reports
+  `boundary: run_id` and the limitation `attempt_boundary_unavailable`.
+- `compare`'s verdict `outcomes_equal` is `null` when no verdict could be
+  proven: when one side's own repetitions disagree, or when a compared output
+  was truncated at the 4 KiB capture cap. The reason is named in
+  `limitations` (`nondeterministic_within_side`, `output_truncated`). A proven
+  difference is still `false`, `status` stays `comparable` and the exit
+  status stays 0. The human output now states the undetermined verdict
+  instead of omitting it.
+- `compare`'s `median_check_ms` is the true median of the check durations:
+  the middle value for an odd number of samples, and the average of the two
+  middle values for an even number, rounded half up.
+- The human `compare` output prints a difference's values as values: an exit
+  code reads as a number instead of a heap address, and a missing value reads
+  as `(none)`. The `--json` output is unchanged.
+- The human `verify` output lists the endpoints sorted by name, so the
+  rendering is reproducible. The `--json` output is unchanged.
+- `verify.Compare` extends the caller's `Options.ExtraEnv` instead of
+  replacing it: the caller's variables reach the check, the tool's
+  `PROC_COMPOSE_COMPARE_SIDE` and `PROC_COMPOSE_COMPARE_REPETITION` still win,
+  and the caller's map is not mutated.
+- The cleanup handoff terminates the managed process groups it sweeps instead
+  of only sealing them. A managed tree that ignores `SIGTERM` no longer
+  outlives the shutdown that was meant to stop it: the sweep force-kills the
+  group while it is still ours to signal, and only then seals it. The group is
+  reported as terminated rather than as a survivor. The same sweep governs the
+  teardown phase and the normal shutdown, so a group that survives either of
+  them is reported the same way. On Windows the forced kill empties the Job
+  Object before the seal, so a terminated group is now observed empty and is
+  reported as terminated rather than as a survivor.
+- The sweep's forced kill no longer depends on the group's membership being
+  enumerable. A group whose members cannot be enumerated is killed like any
+  other group, because the authority to signal it is what decides — a group
+  that was sealed without a kill kept its tree alive.
+- A managed process group whose membership cannot be enumerated is signalled
+  and waited for like any other group. The runner already holds the authority
+  to signal it, so an unreadable `/proc` no longer skips the graceful signal
+  and the forced kill that follows it.
+- A merge upstream must be a **service**. A `task` or `teardown` process is no
+  longer selected as one, so the merge wiring no longer writes a `ready_when`
+  probe into a process whose mode forbids it and no longer adds a dependency
+  edge to a teardown process.
+- A merge port is no longer probed on a port the selected process does not
+  serve. A process selected by name (or by `merge.client_process`) that
+  declares a `PORT` different from `merge.client` / `merge.server` is refused
+  with `invalid_merge` at `merge.client` / `merge.server` instead of being
+  probed on the wrong port. A process that declares no `PORT` is still probed
+  at the merge port.
+- The merge upstream selection is deterministic. When two processes declare the
+  same `PORT`, the lexicographically first one is now always selected, so the
+  readiness probe, the dependency edge and the proxy command line are the same
+  on every load.
+- An `env_file` line longer than 1 MiB is now an error that names the file
+  (`env_file_unreadable`) instead of a silently truncated environment. A
+  value of up to 1 MiB is parsed in full.
+- `ready_timeout` below `-1` is refused (`invalid_value`). The published
+  schema already declared `-1` as the floor.
+- An `sh -c "..."` command on Windows no longer loses the tail of its inner
+  text. Exactly one matched outer quote pair is removed instead of trimming
+  every quote character, so the inner text reaches `cmd /c` intact. The shim
+  stays best-effort: `cmd` has no single-quote semantics and does not
+  interpret `\"`.
+- A daemon that dies during startup now reports `died during startup` instead
+  of `did not become ready within 10s`, and the failure is reported as soon as
+  the child exits rather than after the readiness timeout.
+- A log query that opens the journal while it is being rotated no longer
+  reports that the journal does not exist. The rotation replaces the live
+  journal file, so the query waits the rotation out and reads the journal; a
+  journal that is really gone is still reported as missing. If a rotation
+  fails permanently, the live journal path stays absent for the rest of the
+  run and the query reports a retryable error instead of the events.
+- A dependent that is cancelled while its dependency is between a restart
+  request and the dependency's next incarnation now ends in the terminal state
+  `exited` instead of being failed with a `dependency.failed` event.
+- The release lookup that the update notice schedules is now joined with the
+  lookup's own HTTP timeout, so a cold round trip to the release API is inside
+  the budget and the result is recorded. The lookup stays silent and
+  best-effort, and a run without a terminal still never schedules one.
+- The out-of-range merge-port error now names the field it is about
+  (`merge.client`, `merge.server` or `merge.port`) instead of the whole
+  `merge` section. The `invalid_merge` hint also mentions that a name-matched
+  process whose declared `PORT` differs from the merge port is refused, and
+  the `invalid_port` hint says that `.` is not allowed in port names.
+
+### Changed
+
+- A config that defines a process named `merge-port` **and** a `merge:`
+  section is refused with the new `reserved_process_name` code instead of
+  having the user's process silently replaced by the generated proxy. A
+  service literally named `merge-port` in a doctor-generated config is now
+  rejected too.
+- A port name may no longer contain a dot (`invalid_port`). The endpoint
+  reference name is the process name and the port name joined by a dot, so a
+  dotted port name let two endpoints claim one reference; configs with dotted
+  port names were already broken. A dot in a **process** name stays legal.
+- `merge.client`, `merge.server` and the resolved `merge.port` must be a port
+  between 1 and 65535 and are refused with `invalid_merge` otherwise — an
+  out-of-range `merge.port` used to surface as the misleading preflight
+  message "port(s) already in use". `port: 0` still means unset.
+- The published JSON Schema now requires a non-empty `processes` map or a
+  `merge` section, as the loader does. The schema's `resources` rule stays
+  raw-scoped: the loader is the authority, so the schema does not forbid the
+  whitespace-padded labels the loader accepts.
+- `up --survive` refuses a project path that contains a newline, a carriage
+  return, a NUL byte, a quote, a backslash or `$`, and its error message now
+  names those characters instead of claiming that spaces are refused. A path
+  containing a space or a tab is accepted and quoted.
+- `reload` with a reordered `resources` list applies the reload. The order of
+  the labels is not a resource-set change: only adding or removing a resource
+  still requires a new session.
+- `doctor` reports its findings in a deterministic order: the processes are
+  iterated by name, so repeated runs produce the same findings in the same
+  order and the output can be compared across runs. The reported pair of a
+  duplicate-port finding is now the two lexicographically-first processes; the
+  number of findings does not change.
+- The platform documentation now states the leader-side `setsid(2)` restriction
+  on Linux and macOS: a managed command leads its own process group, so a
+  program that calls `setsid(2)` itself fails with `EPERM`. Descendants may
+  call it, and the `setsid(1)` utility is unaffected, so `cmd: setsid server`
+  keeps working. FreeBSD, OpenBSD and NetBSD are recorded as unsupported: they
+  build, but every launch fails there.
+- A command that chains with `&&` or `||` now runs under `cmd /c` on Windows,
+  including a command that mixes `&&`/`||` with other operators. The `&&`/`||`
+  test is evaluated before the `|` test, so `||` is no longer routed to
+  PowerShell, which has no chain operators at all. A command with no `&&` or
+  `||` that uses `|` or `>` still routes to PowerShell, and the `$(` routing
+  is unchanged (a balanced `$(...)` stays under `cmd /c`).
+
 ## [1.11.0] - 2026-10-19
 
 ### Added

@@ -962,8 +962,75 @@ func TestNotice_SchedulesAtMostOneRefreshPerChecker(t *testing.T) {
 	}
 }
 
-// ── defaults ─────────────────────────────────────────────────────────────────
+// TestWaitRefresh_ReturnsWhenTheRefreshFinishes proves the join can observe
+// the completion of the refresh this Checker scheduled: the result is recorded
+// and the wait reports that nothing is pending any more.
+func TestWaitRefresh_ReturnsWhenTheRefreshFinishes(t *testing.T) {
+	c, path := testChecker(t)
+	srv, _ := testServer(t, http.StatusOK, releaseJSON("v1.3.0", false, false))
+	c.endpoint = srv.URL
 
+	if got := c.Notice("v1.2.0"); got != "" {
+		t.Fatalf("Notice() = %q with no cache, want \"\"", got)
+	}
+	if !c.WaitRefresh(10 * time.Second) {
+		t.Fatal("WaitRefresh reported a pending refresh after the endpoint answered")
+	}
+	entry := readCacheFile(t, path)
+	if entry.Latest != "v1.3.0" {
+		t.Fatalf("recorded latest = %q, want v1.3.0", entry.Latest)
+	}
+}
+
+// TestWaitRefresh_ReturnsAtTheBudgetWhenTheEndpointStalls pins the bound: a
+// lookup that has not answered within the budget is abandoned, and the wait
+// returns instead of blocking past it.
+func TestWaitRefresh_ReturnsAtTheBudgetWhenTheEndpointStalls(t *testing.T) {
+	c, _ := testChecker(t)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseEndpoint := func() { releaseOnce.Do(func() { close(release) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(releaseEndpoint)
+	c.endpoint = srv.URL
+
+	if got := c.Notice("v1.2.0"); got != "" {
+		t.Fatalf("Notice() = %q with no cache, want \"\"", got)
+	}
+	budget := 200 * time.Millisecond
+	started := time.Now()
+	if c.WaitRefresh(budget) {
+		t.Fatal("WaitRefresh reported success while the endpoint was stalling")
+	}
+	elapsed := time.Since(started)
+	if elapsed < budget {
+		t.Fatalf("WaitRefresh returned after %s, want at least the %s budget", elapsed, budget)
+	}
+	if elapsed > budget+5*time.Second {
+		t.Fatalf("WaitRefresh returned after %s, want it bounded by the %s budget", elapsed, budget)
+	}
+}
+
+// TestWaitRefresh_ReturnsImmediatelyWhenNothingWasScheduled pins that a
+// command with a fresh cache pays nothing: no lookup was scheduled, so the
+// wait returns at once.
+func TestWaitRefresh_ReturnsImmediatelyWhenNothingWasScheduled(t *testing.T) {
+	c, path := testChecker(t)
+	seedCache(t, path, "v1.3.0", time.Now())
+
+	started := time.Now()
+	if !c.WaitRefresh(10 * time.Second) {
+		t.Fatal("WaitRefresh reported a pending refresh although none was scheduled")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("WaitRefresh took %s with nothing scheduled, want an immediate return", elapsed)
+	}
+}
+
+// ── defaults ─────────────────────────────────────────────────────────────────
 func TestDefault_UsesSharedUserCacheDirectory(t *testing.T) {
 	// Shared across projects, never written into a project directory.
 	t.Setenv("HOME", t.TempDir())

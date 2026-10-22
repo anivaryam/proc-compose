@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -16,6 +17,7 @@ import (
 	"github.com/anivaryam/proc-compose/internal/ipc"
 	"github.com/anivaryam/proc-compose/internal/paths"
 	"github.com/anivaryam/proc-compose/internal/session"
+	"github.com/anivaryam/proc-compose/internal/verify"
 )
 
 func buildCLI(t *testing.T) string {
@@ -265,5 +267,119 @@ func TestVerifyCLI_InvalidSessionIsStructured(t *testing.T) {
 	stdout, stderr, code = runVerifyCLI(t, bin, dir, "--session", "invalid space", "status")
 	if code != 1 || stdout != "" || !strings.Contains(stderr, "invalid --session") {
 		t.Fatalf("status: code %d stdout %q stderr %q", code, stdout, stderr)
+	}
+}
+
+// TestCompareHumanRenderer_DereferencesPointerValues pins the human compare
+// output: a difference's values are printed as values, not as heap
+// addresses, and a null verdict is stated instead of omitted. The JSON path
+// is untouched: it encodes the pointer itself.
+func TestCompareHumanRenderer_DereferencesPointerValues(t *testing.T) {
+	exitCode, other := 0, 1
+	comparison := &verify.Comparison{
+		SchemaVersion: verify.SchemaVersion, Kind: "verify.comparison", Status: "comparable", ExitCode: 0,
+		OutcomesEqual: nil,
+		Differences: []verify.Difference{
+			{Field: "status", Baseline: "passed", Candidate: "failed"},
+			{Field: "check.exit_code", Baseline: &exitCode, Candidate: &other},
+			{Field: "check.stdout_sha256", Baseline: nil, Candidate: nil},
+		},
+		Sides: map[string]verify.SideSummary{}, Order: []string{},
+		Limitations: []string{"output_truncated"}, Errors: []verify.ErrorRecord{},
+	}
+	var human bytes.Buffer
+	if err := renderComparison(&human, comparison, false); err != nil {
+		t.Fatal(err)
+	}
+	out := human.String()
+	if !strings.Contains(out, "differs: check.exit_code baseline=0 candidate=1") {
+		t.Fatalf("human output = %q, want the exit codes as numbers", out)
+	}
+	if strings.Contains(out, "0x") {
+		t.Fatalf("human output = %q, want no pointer address", out)
+	}
+	if !strings.Contains(out, "differs: status baseline=passed candidate=failed") {
+		t.Fatalf("human output = %q, want the string values unchanged", out)
+	}
+	if !strings.Contains(out, "differs: check.stdout_sha256 baseline=(none) candidate=(none)") {
+		t.Fatalf("human output = %q, want a readable placeholder for a missing value", out)
+	}
+	if !strings.Contains(out, "outcomes equal: undetermined") {
+		t.Fatalf("human output = %q, want the null verdict stated", out)
+	}
+	var machine bytes.Buffer
+	if err := renderComparison(&machine, comparison, true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(machine.String(), `{"field":"check.exit_code","baseline":0,"candidate":1}`) {
+		t.Fatalf("json output = %q", machine.String())
+	}
+	if !strings.Contains(machine.String(), `"outcomes_equal":null`) {
+		t.Fatalf("json output = %q", machine.String())
+	}
+}
+
+// TestVerifyHumanRenderer_SortsEndpoints pins the human verify output: the
+// endpoint lines are sorted by name, so the rendering is reproducible. The
+// JSON path is already sorted by encoding/json and is unchanged.
+func TestVerifyHumanRenderer_SortsEndpoints(t *testing.T) {
+	result := &verify.Result{
+		Session: "s", Status: "passed", ExitCode: 0,
+		ConfigPath: "/x/proc-compose.yml",
+		Startup:    verify.Startup{Status: "passed", Validation: "passed"},
+		Check:      verify.Check{Status: "passed", Argv: []string{"true"}},
+		Cleanup:    verify.Cleanup{Status: "passed", SignalingAuthority: "none"},
+		Endpoints: map[string]verify.Endpoint{
+			"db.http":   {Port: 5432, URL: "http://127.0.0.1:5432"},
+			"api.http":  {Port: 3000, URL: "http://127.0.0.1:3000"},
+			"api.admin": {Port: 3001, URL: "http://127.0.0.1:3001"},
+		},
+	}
+	first := ""
+	for i := 0; i < 40; i++ {
+		var buf bytes.Buffer
+		printVerifyHuman(&buf, result)
+		if i == 0 {
+			first = buf.String()
+			continue
+		}
+		if buf.String() != first {
+			t.Fatalf("rendering %d differs from the first:\n%s\n%s", i, first, buf.String())
+		}
+	}
+	var got []string
+	for _, line := range strings.Split(first, "\n") {
+		if strings.HasPrefix(line, "  endpoint: ") {
+			got = append(got, strings.Fields(strings.TrimPrefix(line, "  endpoint: "))[0])
+		}
+	}
+	if strings.Join(got, ",") != "api.admin,api.http,db.http" {
+		t.Fatalf("endpoints = %v, want them sorted by name", got)
+	}
+}
+
+// TestAttemptsListing_SkipsInvalidReceipts pins that a receipt which does
+// not satisfy the receipt contract is skipped by the attempts listing
+// instead of failing it, and is never consumed as an attempt.
+func TestAttemptsListing_SkipsInvalidReceipts(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	config := filepath.Join(t.TempDir(), "proc-compose.yml")
+	hash, err := paths.FromConfig(config, "invalid-receipt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := verify.AttemptsDir(paths.SessionDir(hash))
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bad.json"), []byte(`{"schema_version":1,"kind":"verify.receipt"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := listAttempts(hash, false)
+	if err != nil {
+		t.Fatalf("listAttempts: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("rows = %+v, want the invalid receipt skipped", rows)
 	}
 }

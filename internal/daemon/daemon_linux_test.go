@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -111,6 +112,39 @@ func TestStartProven_ZombieIsNotProven(t *testing.T) {
 	reaped = true
 	if StartProven(rec) {
 		t.Fatal("StartProven = true for a reaped child")
+	}
+}
+
+// TestReexec_ReapsTheChildItStarts pins that the daemon the starter launches
+// is reaped when it exits. Without a wait(2) the child stays a zombie for as
+// long as the starter lives: it keeps its pid, /proc/<pid> stays readable, and
+// kill(pid, 0) still succeeds — so IsAlive reports a dead daemon as alive.
+//
+// The assertion is on /proc, so this test is Linux-only: it must not also be
+// required on windows-latest.
+func TestReexec_ReapsTheChildItStarts(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "daemon.log")
+	// Reexec re-executes this very binary, so the args must make it exit at
+	// once: "-test.run=^$" matches no test.
+	pid, err := Reexec([]string{"-test.run=^$"}, logPath)
+	if err != nil {
+		t.Fatalf("Reexec: %v", err)
+	}
+	if pid <= 0 {
+		t.Fatalf("Reexec returned pid %d, want a live pid", pid)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		_, statErr := os.Stat(fmt.Sprintf("/proc/%d", pid))
+		if os.IsNotExist(statErr) {
+			return // reaped: the pid is gone
+		}
+		if time.Now().After(deadline) {
+			info, procErr := ProcStat(pid)
+			t.Fatalf("child %d was not reaped within 10s (state %q, procfs error %v)", pid, info.State, procErr)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

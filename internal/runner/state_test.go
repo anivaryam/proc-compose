@@ -4,8 +4,10 @@ import (
 	"context"
 	"io"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/ipc"
@@ -14,7 +16,7 @@ import (
 // TestProcState_RaceMarkReadyAndReset exercises concurrent markReady/resetReady
 // to surface unsynchronised writes via the race detector. Run with -race.
 func TestProcState_RaceMarkReadyAndReset(t *testing.T) {
-	st := &procState{readyCh: make(chan struct{})}
+	st := &procState{readyCycle: newReadyCycle()}
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(3)
@@ -29,7 +31,7 @@ func TestProcState_RaceMarkReadyAndReset(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			// Simulate a depends_on waiter reading the channel field.
-			_ = st.readyChannel()
+			_ = st.currentReadyCycle().ch
 		}()
 	}
 	wg.Wait()
@@ -37,30 +39,87 @@ func TestProcState_RaceMarkReadyAndReset(t *testing.T) {
 
 // TestProcState_ResetReadyDoesNotCloseStaleChannel verifies that markReady
 // from a previous run cycle does not affect the newly-reset channel.
+//
+// The old expectation was that resetReady only replaced the channel, leaving
+// the previous one open and unannounced: a depends_on waiter holding it was
+// never woken. The cycle now settles with the readyAgain verdict before the
+// fresh cycle is installed, so the waiter is woken with a verdict it can act
+// on; a cycle that already settled keeps its verdict, because a published
+// outcome is immutable.
 func TestProcState_ResetReadyDoesNotCloseStaleChannel(t *testing.T) {
-	st := &procState{readyCh: make(chan struct{})}
+	st := &procState{readyCycle: newReadyCycle()}
 	st.markReady(false)
-	// First channel should be closed.
+	// First cycle should be closed.
 	select {
-	case <-st.readyCh:
+	case <-st.currentReadyCycle().ch:
 	default:
-		t.Fatal("first readyCh should be closed after markReady")
+		t.Fatal("first readiness cycle should be closed after markReady")
 	}
 
 	st.resetReady()
-	// New channel should be open.
-	newCh := st.readyChannel()
+	// New cycle should be open.
+	newCycle := st.currentReadyCycle()
 	select {
-	case <-newCh:
-		t.Fatal("readyCh should be open after resetReady")
+	case <-newCycle.ch:
+		t.Fatal("readiness cycle should be open after resetReady")
 	default:
 	}
 
 	st.markReady(true)
 	select {
-	case <-newCh:
+	case <-newCycle.ch:
 	default:
-		t.Fatal("new readyCh should be closed after markReady on fresh cycle")
+		t.Fatal("new readiness cycle should be closed after markReady on fresh cycle")
+	}
+}
+
+// TestProcState_ResetReadyPublishesAgainOnTheHeldCycle pins the restart
+// contract a depends_on waiter depends on: resetReady settles the cycle the
+// waiter may already be holding with the readyAgain verdict — it is never
+// replaced silently — and installs a fresh, open cycle.
+func TestProcState_ResetReadyPublishesAgainOnTheHeldCycle(t *testing.T) {
+	st := &procState{readyCycle: newReadyCycle()}
+	held := st.currentReadyCycle()
+
+	st.resetReady()
+
+	if got := st.outcomeOf(held); got != readyAgain {
+		t.Fatalf("held cycle settled with %v, want readyAgain", got)
+	}
+	select {
+	case <-held.ch:
+	default:
+		t.Fatal("the held cycle was not closed, so a waiter would never learn of the restart")
+	}
+	fresh := st.currentReadyCycle()
+	if fresh == held {
+		t.Fatal("resetReady did not install a fresh cycle")
+	}
+	select {
+	case <-fresh.ch:
+		t.Fatal("the fresh cycle must start open")
+	default:
+	}
+}
+
+// TestProcState_SettledCycleKeepsItsVerdict pins that a published outcome is
+// never overwritten: a cycle that already settled keeps its verdict when a
+// fresh cycle is installed, so a terminal verdict cannot be lost.
+func TestProcState_SettledCycleKeepsItsVerdict(t *testing.T) {
+	st := &procState{readyCycle: newReadyCycle()}
+	held := st.currentReadyCycle()
+	st.markReady(false)
+	if got := st.outcomeOf(held); got != readyTerminal {
+		t.Fatalf("cycle settled with %v, want readyTerminal", got)
+	}
+
+	st.resetReady()
+
+	if got := st.outcomeOf(held); got != readyTerminal {
+		t.Fatalf("settled cycle changed to %v, want its verdict to be immutable", got)
+	}
+	if st.currentReadyCycle() == held {
+		t.Fatal("resetReady did not install a fresh cycle")
 	}
 }
 
@@ -80,7 +139,7 @@ func TestProcState_CurrentlyReadyRequiresLiveState(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.state, func(t *testing.T) {
-			st := &procState{state: "starting", readyCh: make(chan struct{})}
+			st := &procState{state: "starting", readyCycle: newReadyCycle()}
 			st.markReady(true)
 			st.state = tc.state
 			st.mu.Lock()
@@ -124,7 +183,7 @@ func TestProcState_HealthDescribesOnlyTheRunningIncarnation(t *testing.T) {
 // TestProcState_CurrentlyReadyFalseWhenNeverReady covers the failed-before-ready
 // case: a closed latch with readyOK=false must never read as ready.
 func TestProcState_CurrentlyReadyFalseWhenNeverReady(t *testing.T) {
-	st := &procState{state: "running", readyCh: make(chan struct{})}
+	st := &procState{state: "running", readyCycle: newReadyCycle()}
 	st.markReady(false)
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -181,7 +240,7 @@ func TestStoreSnapshot_ExitedServiceNotReady(t *testing.T) {
 // iteration cancels procCtx before resetReady, and resetReady runs before the
 // next generation++, so only a context check made under st.mu closes the window.
 func TestProcState_MarkReadyForRejectsStaleCycle(t *testing.T) {
-	st := &procState{readyCh: make(chan struct{}), generation: 1}
+	st := &procState{readyCycle: newReadyCycle(), generation: 1}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	st.resetReady()
@@ -189,13 +248,13 @@ func TestProcState_MarkReadyForRejectsStaleCycle(t *testing.T) {
 		t.Fatal("markReadyFor latched a cycle after its incarnation context was cancelled")
 	}
 	st.mu.Lock()
-	closed := st.readyClosed
+	closed := st.readyCycle != nil && st.readyCycle.outcome != readyUnset
 	st.mu.Unlock()
 	if closed {
 		t.Fatal("readiness cycle latched by a stale probe")
 	}
 	select {
-	case <-st.readyChannel():
+	case <-st.currentReadyCycle().ch:
 		t.Fatal("readyCh closed by a stale probe")
 	default:
 	}
@@ -208,7 +267,7 @@ func TestProcState_MarkReadyForRejectsStaleCycle(t *testing.T) {
 // one; and that a refused answer is kept only until the readiness latch.
 func TestProcState_OwnersFollowTheirIncarnation(t *testing.T) {
 	refused := &ipc.EndpointOwner{Result: ipc.OwnerForeign, Address: "127.0.0.1:3000", PID: 41}
-	waiting := &procState{readyCh: make(chan struct{}), generation: 1, state: "running"}
+	waiting := &procState{readyCycle: newReadyCycle(), generation: 1, state: "running"}
 	if waiting.recordRefusedOwner(2, refused) || waiting.readinessOwner != nil {
 		t.Fatal("a stale generation's refusal was recorded")
 	}
@@ -224,7 +283,7 @@ func TestProcState_OwnersFollowTheirIncarnation(t *testing.T) {
 	}
 
 	owner := &ipc.EndpointOwner{Result: ipc.OwnerForeign, Address: "127.0.0.1:3000", PID: 42, Command: "node"}
-	st := &procState{readyCh: make(chan struct{}), generation: 2, state: "running"}
+	st := &procState{readyCycle: newReadyCycle(), generation: 2, state: "running"}
 	if st.markReadyFor(context.Background(), 1, true, owner) || st.readinessOwner != nil {
 		t.Fatal("a stale generation's probe recorded its owner")
 	}
@@ -281,7 +340,7 @@ func TestProcState_ForeignHealthOwnerIsReportedOncePerHolder(t *testing.T) {
 // TestProcState_MarkReadyForRejectsOtherGeneration covers a probe whose context
 // is still live but whose incarnation is no longer current.
 func TestProcState_MarkReadyForRejectsOtherGeneration(t *testing.T) {
-	st := &procState{readyCh: make(chan struct{}), generation: 2}
+	st := &procState{readyCycle: newReadyCycle(), generation: 2}
 	if st.markReadyFor(context.Background(), 1, true, nil) {
 		t.Fatal("markReadyFor latched a cycle for a previous generation")
 	}
@@ -289,7 +348,7 @@ func TestProcState_MarkReadyForRejectsOtherGeneration(t *testing.T) {
 		t.Fatal("markReadyFor refused the live incarnation")
 	}
 	st.mu.Lock()
-	ok := st.readyClosed && st.readyOK
+	ok := st.readySettled()
 	st.mu.Unlock()
 	if !ok {
 		t.Fatal("live incarnation not latched ready")
@@ -304,7 +363,7 @@ func TestProcState_FailReadinessForIsGuarded(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	st := &procState{readyCh: make(chan struct{}), generation: 3}
+	st := &procState{readyCycle: newReadyCycle(), generation: 3}
 	if st.failReadinessFor(cancelled, 3, "late") {
 		t.Fatal("failReadinessFor applied after the incarnation was cancelled")
 	}
@@ -355,11 +414,11 @@ func TestReadinessWiring_StaleIncarnationCannotLatchNextCycle(t *testing.T) {
 			r.handleProbeResult(p, st, 1, "tcp", true, "", nil, ctx, cancel)
 		}},
 		{"no-probe onStart", nil, func(r *Runner, p procInfo, st *procState, ctx context.Context, cancel context.CancelFunc) {
-			onStart, _ := r.buildReadinessCallbacks(p, 0, st, 1, nil, 0, ctx, cancel, nil, nil, nil)
+			onStart, _ := r.buildReadinessCallbacks(p, 0, st, 1, nil, 0, ctx, cancel, nil, &sync.WaitGroup{}, nil)
 			onStart()
 		}},
 		{"log onLine", &config.ReadyWhen{Log: "listening"}, func(r *Runner, p procInfo, st *procState, ctx context.Context, cancel context.CancelFunc) {
-			_, onLine := r.buildReadinessCallbacks(p, 0, st, 1, logRe, 0, ctx, cancel, nil, nil, nil)
+			_, onLine := r.buildReadinessCallbacks(p, 0, st, 1, logRe, 0, ctx, cancel, nil, &sync.WaitGroup{}, nil)
 			onLine("server listening on :8080")
 		}},
 	}
@@ -372,7 +431,7 @@ func TestReadinessWiring_StaleIncarnationCannotLatchNextCycle(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				r := &Runner{Output: io.Discard}
 				p := procInfo{name: "web", proc: config.Process{Cmd: "true", ReadyWhen: path.ready}}
-				st := &procState{readyCh: make(chan struct{}), generation: 1, state: "running"}
+				st := &procState{readyCycle: newReadyCycle(), generation: 1, state: "running"}
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				if stale {
@@ -384,7 +443,7 @@ func TestReadinessWiring_StaleIncarnationCannotLatchNextCycle(t *testing.T) {
 				path.fire(r, p, st, ctx, cancel)
 				latched := false
 				select {
-				case <-st.readyChannel():
+				case <-st.currentReadyCycle().ch:
 					latched = true
 				default:
 				}
@@ -399,6 +458,119 @@ func TestReadinessWiring_StaleIncarnationCannotLatchNextCycle(t *testing.T) {
 	}
 }
 
+// TestWaitForDependency_UnsettledAgainEndsTheWait pins the wait loop's
+// termination rule: a cycle that settles without a verdict and is still the
+// current cycle means no further verdict will come, so the dependent ends in a
+// terminal state instead of waiting forever.
+func TestWaitForDependency_UnsettledAgainEndsTheWait(t *testing.T) {
+	r := &Runner{Output: io.Discard}
+	depSt := &procState{readyCycle: newReadyCycle(), state: "running"}
+	// The cycle ends without a verdict and no further cycle follows.
+	depSt.publishAgain()
+
+	res := r.waitForDependency(context.Background(), procInfo{name: "app"}, "db", depSt, nil)
+	if res.verdict != readyStopped {
+		t.Fatalf("verdict = %v, want the wait to end instead of waiting for a verdict that cannot come", res.verdict)
+	}
+	if res.quiesced {
+		t.Fatal("the wait was reported as quiesced, want a verdict")
+	}
+}
+
+// TestWaitForDependency_ContinuesOnTheNextCycle pins the other half: a cycle
+// that ends without a verdict while a further cycle follows is not the end of
+// the wait — the dependent waits for the next cycle's verdict.
+func TestWaitForDependency_ContinuesOnTheNextCycle(t *testing.T) {
+	r := &Runner{Output: io.Discard}
+	depSt := &procState{readyCycle: newReadyCycle(), state: "running"}
+	// The cycle ends without a verdict and a fresh cycle follows.
+	depSt.resetReady()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		depSt.markReady(true)
+	}()
+	res := r.waitForDependency(context.Background(), procInfo{name: "app"}, "db", depSt, nil)
+	if res.verdict != readySatisfied {
+		t.Fatalf("verdict = %v, want the wait to continue to the next cycle", res.verdict)
+	}
+}
+
+// The lifecycle verdict belongs to the incarnation that published it. Renewing
+// the readiness cycle clears it: the cycle that ended is not the end of the
+// process's life, another incarnation follows.
+func TestProcState_ResetReadyClearsTheLifecycleVerdict(t *testing.T) {
+	st := &procState{readyCycle: newReadyCycle(), state: "running"}
+	st.endProcess()
+	if got := st.disposition(); got != readyTerminal {
+		t.Fatalf("disposition = %v, want readyTerminal", got)
+	}
+	st.resetReady()
+	if got := st.disposition(); got != readyUnset {
+		t.Fatalf("disposition = %v after the cycle was renewed, want readyUnset: the next incarnation can run again", got)
+	}
+}
+
+// A dependency that is between a restart request and its next incarnation
+// carries no verdict: the cycle that ended was renewed. A dependent cancelled
+// in that window must end as "exited" — the state the sibling path uses — and
+// must not be reported as a dependency failure.
+func TestRunProcess_DependentCancelledBetweenResetAndNextIncarnationEndsExited(t *testing.T) {
+	r := &Runner{Output: io.Discard}
+	journal := &synchronizedBuffer{}
+	r.Journal = journal
+
+	store := newStateStore([]procInfo{
+		{name: "app", proc: config.Process{Cmd: "should-not-run", Restart: "never", DependsOn: []string{"db"}}},
+		{name: "db", proc: config.Process{Cmd: "serve", Restart: "never"}},
+	})
+	// The dependency's lifecycle ended: it published the terminal verdict.
+	depSt := store.get("db")
+	depSt.endProcess()
+	// A restart request renews the cycle: another incarnation follows, so the
+	// dependency is no longer over.
+	depSt.resetReady()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	app, _ := store.info("app")
+	result := r.runProcess(ctx, app, 0, store, nil)
+	if result.failed {
+		t.Fatal("the dependent was reported as failed")
+	}
+	appSt := store.get("app")
+	appSt.mu.Lock()
+	state, lastError := appSt.state, appSt.lastError
+	appSt.mu.Unlock()
+	if state != "exited" {
+		t.Fatalf("dependent state = %q (last error %q), want exited", state, lastError)
+	}
+	if strings.Contains(journal.String(), "dependency.failed") {
+		t.Fatalf("the dependent was reported as a dependency failure:\n%s", journal.String())
+	}
+}
+
+// TestWaitForDependency_CancelledBetweenResetAndNextIncarnationEndsStopped
+// pins the decision the dependent's wait makes: a dependency between a restart
+// request and its next incarnation has no verdict, so a cancellation ends the
+// wait with the stopped verdict rather than the terminal one.
+func TestWaitForDependency_CancelledBetweenResetAndNextIncarnationEndsStopped(t *testing.T) {
+	r := &Runner{Output: io.Discard}
+	depSt := &procState{readyCycle: newReadyCycle(), state: "running"}
+	depSt.endProcess()
+	depSt.resetReady()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res := r.waitForDependency(ctx, procInfo{name: "app"}, "db", depSt, nil)
+	if res.verdict != readyStopped {
+		t.Fatalf("verdict = %v, want readyStopped: the dependency is not over, so the dependent is not failed", res.verdict)
+	}
+	if res.quiesced {
+		t.Fatal("the wait was reported as quiesced, want a verdict")
+	}
+}
+
 // TestProcState_RecordHealthTransitions pins the health state machine: the
 // first pass is healthy, healthThreshold consecutive failures make the
 // incarnation unhealthy once per episode, one pass recovers it, and a result
@@ -407,7 +579,7 @@ func TestReadinessWiring_StaleIncarnationCannotLatchNextCycle(t *testing.T) {
 func TestProcState_RecordHealthTransitions(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	st := &procState{state: "running", generation: 1, health: healthUnknown, readyCh: make(chan struct{})}
+	st := &procState{state: "running", generation: 1, health: healthUnknown, readyCycle: newReadyCycle()}
 	step := func(ok bool, detail string, want healthTransition, wantHealth string, wantFailures int) {
 		t.Helper()
 		if got := st.recordHealth(ctx, 1, ok, detail, false); got != want {
@@ -438,14 +610,14 @@ func TestProcState_RecordHealthTransitions(t *testing.T) {
 	st.mu.Unlock()
 
 	// A failure before any pass is unhealthy at the threshold too.
-	st = &procState{state: "running", generation: 1, health: healthUnknown, readyCh: make(chan struct{})}
+	st = &procState{state: "running", generation: 1, health: healthUnknown, readyCycle: newReadyCycle()}
 	for i := 1; i < healthThreshold; i++ {
 		step(false, "refused", healthCheckFailed, healthUnknown, i)
 	}
 	step(false, "refused", healthBecameUnhealthy, healthUnhealthy, healthThreshold)
 
 	// The restart action marks the incarnation failed for the run loop.
-	st = &procState{state: "running", generation: 1, health: healthHealthy, readyCh: make(chan struct{})}
+	st = &procState{state: "running", generation: 1, health: healthHealthy, readyCycle: newReadyCycle()}
 	for i := 1; i < healthThreshold; i++ {
 		st.recordHealth(ctx, 1, false, "refused", true)
 	}
@@ -457,7 +629,7 @@ func TestProcState_RecordHealthTransitions(t *testing.T) {
 	}
 
 	// Stale results are dropped without touching the state.
-	st = &procState{state: "running", generation: 2, health: healthHealthy, readyCh: make(chan struct{})}
+	st = &procState{state: "running", generation: 2, health: healthHealthy, readyCycle: newReadyCycle()}
 	if got := st.recordHealth(ctx, 1, false, "old", true); got != healthNone || st.healthFailures != 0 {
 		t.Fatalf("stale generation applied: %v failures=%d", got, st.healthFailures)
 	}

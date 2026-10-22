@@ -27,50 +27,52 @@ var (
 // Stable diagnostic codes. Codes are a machine contract: add new ones, never
 // rename or repurpose existing ones.
 const (
-	CodeReadError          = "read_error"
-	CodeYAMLSyntax         = "yaml_syntax"
-	CodeUnknownField       = "unknown_field"
-	CodeInvalidType        = "invalid_type"
-	CodeNoProcesses        = "no_processes"
-	CodeInvalidMerge       = "invalid_merge"
-	CodeInvalidProcessName = "invalid_process_name"
-	CodeMissingCmd         = "missing_cmd"
-	CodeInvalidRestart     = "invalid_restart"
-	CodeInvalidMode        = "invalid_mode"
-	CodeTaskIncompatible   = "task_incompatible_field"
-	CodeInvalidValue       = "invalid_value"
-	CodeInvalidReadyWhen   = "invalid_ready_when"
-	CodeInvalidPort        = "invalid_port"
-	CodeEnvFile            = "env_file_unreadable"
-	CodeSelfDependency     = "self_dependency"
-	CodeUnknownDependency  = "unknown_dependency"
-	CodeDependencyCycle    = "dependency_cycle"
-	CodeInvalidResource    = "invalid_resource"
-	CodeTeardownDependency = "teardown_dependency"
-	CodeInvalid            = "invalid_config"
+	CodeReadError           = "read_error"
+	CodeYAMLSyntax          = "yaml_syntax"
+	CodeUnknownField        = "unknown_field"
+	CodeInvalidType         = "invalid_type"
+	CodeNoProcesses         = "no_processes"
+	CodeInvalidMerge        = "invalid_merge"
+	CodeInvalidProcessName  = "invalid_process_name"
+	CodeMissingCmd          = "missing_cmd"
+	CodeInvalidRestart      = "invalid_restart"
+	CodeInvalidMode         = "invalid_mode"
+	CodeTaskIncompatible    = "task_incompatible_field"
+	CodeInvalidValue        = "invalid_value"
+	CodeInvalidReadyWhen    = "invalid_ready_when"
+	CodeInvalidPort         = "invalid_port"
+	CodeEnvFile             = "env_file_unreadable"
+	CodeSelfDependency      = "self_dependency"
+	CodeUnknownDependency   = "unknown_dependency"
+	CodeDependencyCycle     = "dependency_cycle"
+	CodeInvalidResource     = "invalid_resource"
+	CodeTeardownDependency  = "teardown_dependency"
+	CodeReservedProcessName = "reserved_process_name"
+	CodeInvalid             = "invalid_config"
 )
 
 var diagnosticHints = map[string]string{
-	CodeReadError:          "check that the config path exists and is readable",
-	CodeYAMLSyntax:         "fix the YAML syntax near the reported line",
-	CodeUnknownField:       "remove the key or correct its spelling; run proc-compose config schema for accepted keys",
-	CodeInvalidType:        "change the value to the type the schema declares",
-	CodeNoProcesses:        "define at least one entry under processes (or a merge section)",
-	CodeInvalidMerge:       "use either merge.client/server/api_prefixes or merge.routes",
-	CodeInvalidProcessName: "use [-A-Za-z0-9._] and start/end with an alphanumeric character",
-	CodeMissingCmd:         "add a cmd: the shell command that runs this process",
-	CodeInvalidRestart:     "use never, on-failure, or always",
-	CodeInvalidMode:        "use service, task, or teardown",
-	CodeTaskIncompatible:   "remove the field, or change the mode: tasks and teardown processes cannot use it",
-	CodeInvalidValue:       "use a non-negative value consistent with the restart policy",
-	CodeInvalidReadyWhen:   "set exactly one of ready_when.http, ready_when.tcp, ready_when.cmd, or ready_when.log (a valid Go regex); health_when takes http, tcp, or cmd",
-	CodeInvalidPort:        "port names follow process-name rules; preferred ports are 0-65535 (0 = ephemeral)",
-	CodeEnvFile:            "create the env_file or fix its path (relative paths resolve from the config directory)",
-	CodeSelfDependency:     "remove the process from its own depends_on",
-	CodeUnknownDependency:  "name an existing process in depends_on",
-	CodeDependencyCycle:    "remove one depends_on edge to break the cycle",
-	CodeInvalidResource:    "resource labels must be unique, non-empty, single-line, and at most 256 bytes",
-	CodeTeardownDependency: "remove the teardown process from depends_on: it runs only after the stack stops",
+	CodeReadError:           "check that the config path exists and is readable",
+	CodeYAMLSyntax:          "fix the YAML syntax near the reported line",
+	CodeUnknownField:        "remove the key or correct its spelling; run proc-compose config schema for accepted keys",
+	CodeInvalidType:         "change the value to the type the schema declares",
+	CodeNoProcesses:         "define at least one entry under processes (or a merge section)",
+	CodeInvalidMerge:        "use either merge.client/server/api_prefixes or merge.routes; a name-matched process whose declared PORT differs from the merge port is refused",
+	CodeInvalidProcessName:  "use [-A-Za-z0-9._] and start/end with an alphanumeric character",
+	CodeMissingCmd:          "add a cmd: the shell command that runs this process",
+	CodeInvalidRestart:      "use never, on-failure, or always",
+	CodeInvalidMode:         "use service, task, or teardown",
+	CodeTaskIncompatible:    "remove the field, or change the mode: tasks and teardown processes cannot use it",
+	CodeInvalidValue:        "use a non-negative value consistent with the restart policy",
+	CodeInvalidReadyWhen:    "set exactly one of ready_when.http, ready_when.tcp, ready_when.cmd, or ready_when.log (a valid Go regex); health_when takes http, tcp, or cmd",
+	CodeInvalidPort:         "`.` is not allowed in port names; the other characters follow the process-name rules; preferred ports are 0-65535 (0 = ephemeral)",
+	CodeEnvFile:             "create the env_file or fix its path (relative paths resolve from the config directory)",
+	CodeSelfDependency:      "remove the process from its own depends_on",
+	CodeUnknownDependency:   "name an existing process in depends_on",
+	CodeDependencyCycle:     "remove one depends_on edge to break the cycle",
+	CodeInvalidResource:     "resource labels must be unique, non-empty, single-line, and at most 256 bytes",
+	CodeTeardownDependency:  "remove the teardown process from depends_on: it runs only after the stack stops",
+	CodeReservedProcessName: "merge-port is reserved for the proxy the merge section generates; rename the process",
 }
 
 // ValidationError is the typed error Load returns for rule violations. Its
@@ -89,7 +91,10 @@ func invalid(code string, path []any, cause error, format string, args ...any) e
 	return &ValidationError{Code: code, Path: path, Msg: fmt.Errorf(format, args...).Error(), Err: cause}
 }
 
-func sortedProcessNames(processes map[string]Process) []string {
+// SortedProcessNames returns the keys of a process map in lexicographic
+// order. Callers that iterate processes use it so that findings, diagnostics,
+// and plans stay deterministic: Go randomises map iteration order.
+func SortedProcessNames[T any](processes map[string]T) []string {
 	names := make([]string, 0, len(processes))
 	for name := range processes {
 		names = append(names, name)
@@ -381,9 +386,19 @@ const SchemaID = "https://github.com/anivaryam/proc-compose/schema/v1/proc-compo
 // "Type.yamlkey" (field) or "Type" (object). Field names come from struct
 // tags, so the property set itself has one source of truth.
 func schemaExtras() map[string]map[string]any {
-	portName := map[string]any{"pattern": processNameRe.String()}
+	portName := map[string]any{"pattern": portNameRe.String()}
 	return map[string]map[string]any{
-		"Config":                   {"anyOf": []any{map[string]any{"required": []string{"processes"}}, map[string]any{"required": []string{"merge"}}}},
+		// At least one of a non-empty processes map or a merge section. The
+		// non-empty rule lives inside the branch, because a bare
+		// minProperties on Config.processes would refuse processes: {} next
+		// to a merge section — which Load accepts.
+		"Config": {"anyOf": []any{
+			map[string]any{
+				"required":   []string{"processes"},
+				"properties": map[string]any{"processes": map[string]any{"minProperties": 1}},
+			},
+			map[string]any{"required": []string{"merge"}},
+		}},
 		"Config.processes":         {"propertyNames": map[string]any{"pattern": processNameRe.String()}},
 		"Config.resources":         {"uniqueItems": true, "items": map[string]any{"type": "string", "minLength": 1, "maxLength": 256}},
 		"Process":                  {"required": []string{"cmd"}},

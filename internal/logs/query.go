@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -19,9 +20,23 @@ import (
 )
 
 type Options struct {
-	Limit      int
-	MaxBytes   int
-	After      string
+	Limit    int
+	MaxBytes int
+	After    string
+	// Tail selects the newest matching events instead of the oldest ones.
+	// It applies whenever it is set, with or without a cursor: the window
+	// is the newest Limit events after the cursor, or the newest Limit
+	// events of the whole journal when there is no cursor.
+	//
+	// Under tail:
+	//   - has_more is always false. A tail page is the end of the window,
+	//     not a forward page that can be continued.
+	//   - next_cursor is the last event scanned, not the last event
+	//     returned. It advances over events that did not match the filters
+	//     as well, so resuming from it never replays a scanned event.
+	//   - truncated is true when older events were dropped to fit the
+	//     event limit or the byte budget, and also when a single event had
+	//     to be shortened to fit the budget.
 	Tail       bool
 	Processes  []string
 	Level      string
@@ -112,7 +127,7 @@ func Query(path string, opts Options) (Page, error) {
 				page.NextCursor = event.ID
 				continue
 			}
-			if opts.Tail && opts.After == "" {
+			if opts.Tail {
 				bounded, size, err := fit(event, opts.MaxBytes)
 				if err != nil {
 					file.Close()
@@ -172,15 +187,37 @@ type retainedFile struct {
 	info os.FileInfo
 }
 
+// snapshotAttempts bounds how many times the reader re-pins the journal family
+// before it reports the journal as unavailable.
+const snapshotAttempts = 5
+
+// snapshotRetryDelay is the pause between two pinning attempts.
+//
+// It is a variable so a test can widen the window a reader waits out. A
+// rotation replaces the live journal in microseconds, so the production value
+// is far longer than the window it has to cover.
+var snapshotRetryDelay = time.Millisecond
+
 // Pin a coherent set of file handles before scanning. Opening each rotated
 // pathname only after reading the previous one can replay or skip entire files
 // if rotation occurs during the query. Validate names after opening and retry
 // a bounded number of times; a busy journal returns an explicit retryable error.
+//
+// A rotation renames the live journal aside before it installs the replacement,
+// so a reader that opens the journal in that window finds the live path
+// missing. That absence is a rotation in flight, not a missing journal: the
+// snapshot is taken again instead of reporting that the journal does not
+// exist. The journal is reported as gone only when no file of its family is
+// left.
 func snapshotFiles(path string) ([]retainedFile, error) {
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt < snapshotAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(snapshotRetryDelay)
+		}
 		var files []retainedFile
 		observed := make(map[string]os.FileInfo)
 		var openErr error
+		liveMissing := false
 		for index := 3; index >= 0; index-- {
 			name := path
 			if index != 0 {
@@ -191,6 +228,9 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 			// deleting at this moment also reports as not existing.
 			if errors.Is(err, fs.ErrNotExist) {
 				observed[name] = nil
+				if index == 0 {
+					liveMissing = true
+				}
 				continue
 			}
 			if err != nil {
@@ -206,7 +246,11 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 			observed[name] = info
 			files = append(files, retainedFile{file: file, info: info})
 		}
-		stable := openErr == nil
+		// The live journal is always there: the writer creates it with the
+		// session and a rotation replaces it within the same operation. A
+		// missing live file therefore means a rotation is in flight, so the
+		// snapshot is not coherent and has to be taken again.
+		stable := openErr == nil && !liveMissing
 		if stable {
 			for name, info := range observed {
 				current, err := os.Stat(name)
@@ -220,9 +264,6 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 			}
 		}
 		if stable {
-			if len(files) == 0 {
-				return nil, os.ErrNotExist
-			}
 			return files, nil
 		}
 		for _, file := range files {
@@ -232,7 +273,33 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 			return nil, openErr
 		}
 	}
+	// The live journal stayed unavailable for the whole budget. It is really
+	// gone only when no file of its family is left; anything else means a
+	// rotation is in flight and the query has to be retried.
+	if !journalFamilyPresent(path) {
+		return nil, os.ErrNotExist
+	}
 	return nil, fmt.Errorf("journal rotated repeatedly while opening history; retry this query with the same cursor")
+}
+
+// journalFamilyPresent reports whether any file of the journal family is still
+// on disk.
+//
+// The live journal is renamed aside while it is rotated, so the rotated copies
+// and the writer's staged file are the evidence that the journal exists and
+// that the query has to be read again rather than reported as missing.
+func journalFamilyPresent(path string) bool {
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		return false
+	}
+	prefix := filepath.Base(path) + "."
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func completeLines(data []byte, atEOF bool) (int, []byte, error) {

@@ -67,7 +67,11 @@ type Options struct {
 	// to another live session (runner.Runner.RefuseCrossSession). The
 	// verify command sets it unless --allow-cross-session is given.
 	RefuseCrossSession bool
-	Now                func() time.Time
+	// Now supplies the attempt's clock. It is a supported injection point for
+	// library callers and tests, not a test-only seam. A zero clock is
+	// tolerated: the attempt then records an empty started_at (and a null
+	// finished_at) instead of panicking.
+	Now func() time.Time
 
 	// writeReceipt is a test seam; nil uses WriteReceipt.
 	writeReceipt func(path string, result *Result) error
@@ -113,11 +117,13 @@ func newResult(opts Options, started time.Time) *Result {
 	if name == "" {
 		name = "default"
 	}
+	// The seeded status is not a verdict: an attempt that has not run has no
+	// verdict yet. failPreAcquisition and finishVerdict set the real one.
 	result := &Result{
 		SchemaVersion:     SchemaVersion,
 		Kind:              KindResponse,
 		State:             StateCompleted,
-		Status:            StatusFailed,
+		Status:            StatusNotRun,
 		Phase:             PhaseValidation,
 		Session:           name,
 		ConfigPath:        opts.ConfigPath,
@@ -133,7 +139,11 @@ func newResult(opts Options, started time.Time) *Result {
 		Evidence:          Evidence{ExcerptStatus: "not_collected", Events: []EvidenceEvent{}},
 		Errors:            []ErrorRecord{},
 		Retention:         "no receipt created",
-		StartedAt:         *timestamp(started),
+	}
+	// A zero clock has no timestamp: timestamp returns nil for the zero time,
+	// so the attempt records an empty started_at instead of dereferencing nil.
+	if !started.IsZero() {
+		result.StartedAt = *timestamp(started)
 	}
 	if len(opts.Argv) > 0 {
 		result.Check.Argv = append([]string(nil), opts.Argv...)

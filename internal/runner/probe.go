@@ -272,7 +272,7 @@ func (r *Runner) probeCmd(ctx context.Context, p procInfo, handoff <-chan struct
 			attemptDeadline = deadline
 		}
 		attemptCtx, cancel := context.WithDeadline(ctx, attemptDeadline)
-		st := &procState{state: "starting", generation: 1, readyCh: make(chan struct{}), restartCh: make(chan struct{}, 1)}
+		st := &procState{state: "starting", generation: 1, readyCycle: newReadyCycle(), restartCh: make(chan struct{}, 1)}
 		res := r.runOwned(attemptCtx, probe, st, handoff, cmdProbeOutputLimit)
 		// An attempt ended by ready_timeout itself, rather than by its own
 		// exit or the per-attempt limit, says only that time ran out.
@@ -343,18 +343,16 @@ func cmdProbeInfo(p procInfo, command string) procInfo {
 // the incarnation; the run loop counts that as a failure (restart policy and
 // max_restarts apply). The caller joins it before the incarnation ends.
 func (r *Runner) monitorHealth(ctx context.Context, cancel context.CancelFunc, p procInfo, st *procState, gen uint64, handoff <-chan struct{}) {
-	st.mu.Lock()
-	readyCh := st.readyCh
-	st.mu.Unlock()
+	cycle := st.currentReadyCycle()
 	select {
-	case <-readyCh:
+	case <-cycle.ch:
 	case <-ctx.Done():
 		return
 	case <-handoff:
 		return
 	}
 	st.mu.Lock()
-	ready := st.readyOK && st.generation == gen
+	ready := cycle.outcome == readySatisfied && st.generation == gen
 	st.mu.Unlock()
 	if !ready {
 		return
@@ -453,7 +451,7 @@ func (r *Runner) healthCheck(ctx context.Context, p procInfo, hw *config.ReadyWh
 		}
 		return true, "", false, owner
 	case hw.Cmd != "":
-		st := &procState{state: "starting", generation: 1, readyCh: make(chan struct{}), restartCh: make(chan struct{}, 1)}
+		st := &procState{state: "starting", generation: 1, readyCycle: newReadyCycle(), restartCh: make(chan struct{}, 1)}
 		res := r.runOwned(checkCtx, cmdProbeInfo(p, hw.Cmd), st, handoff, cmdProbeOutputLimit)
 		switch {
 		case exitedZeroInTime(checkCtx, &res):

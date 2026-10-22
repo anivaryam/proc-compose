@@ -61,7 +61,7 @@ proc-compose unlocks additional capabilities when these binaries are available o
 | [`merge-port`](https://github.com/anivaryam/merge-port) | `merge:` config section — combine frontend + backend into one port | `brokit install merge-port` |
 | [`tunnel`](https://github.com/anivaryam/tunnel) | Public URL for a local port (see [examples](examples.md#full-stack-with-public-tunnel)) | `brokit install tunnel` |
 
-If `merge:` is configured but merge-port is not on PATH, `up`, `validate`, and `up --dry-run` fail with an actionable error. `doctor` reports a finding. Without `merge:`, merge-port is not required.
+If `merge:` is configured but merge-port is not on PATH, `up`, `validate`, and `up --dry-run` fail with an actionable error. `doctor` reports a finding — both for a configured `merge:` section and for the `merge:` section of the config it suggests. Without `merge:`, merge-port is not required.
 
 ## Update notifications
 
@@ -134,4 +134,4 @@ The check is notification-only. proc-compose never downloads, installs, or repla
 
 **Cache:** the last result is recorded in `$XDG_CACHE_HOME/proc-compose/update-check.json` (normally `~/.cache/proc-compose/` on Linux, or `~/Library/Caches/proc-compose/` on macOS). The file is shared by every project for the same user and never written into a project directory. Failed attempts are recorded for the same 24 hours, so an offline or rate-limited machine does not retry on every command. If the user cache directory cannot be created, update checks are skipped.
 
-The check never blocks a command. The notice is printed from the cache alone; when that cache is missing or stale the lookup runs in the background, so a fresh result shows up on the *next* invocation instead of delaying the current one. Because the cache is shared and long-lived, one `proc-compose up` or `proc-compose monitor` session is enough to arm it for the next 24 hours — a short command such as `list` finishes long before a background request could land, so it never waits and never blocks, it just may be the invocation that does not arm the cache.
+The check never blocks the command's own work. The notice is printed from the cache alone; when that cache is missing or stale the lookup runs in the background, so a fresh result shows up on the *next* invocation instead of delaying the current one. Before the process exits, proc-compose waits up to about two seconds for that lookup to finish, so a short command such as `list` can arm the cache as well — as long as the release API answers within that budget. A slower or unreachable API leaves the cache unwritten, exactly as before. Because the cache is shared and long-lived, one `proc-compose up` or `proc-compose monitor` session is enough to arm it for the next 24 hours.

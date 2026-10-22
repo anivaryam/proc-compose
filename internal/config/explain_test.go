@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeConfig(t *testing.T, content string) string {
@@ -48,6 +50,9 @@ func TestDiagnose_Codes(t *testing.T) {
 		{"invalid ready_when", "processes:\n  api:\n    cmd: x\n    ready_when:\n      http: http://x\n      tcp: x:1\n", CodeInvalidReadyWhen, "processes.api.ready_when", 5},
 		{"invalid resource", "processes:\n  api:\n    cmd: x\nresources: [db, db]\n", CodeInvalidResource, "resources[1]", 4},
 		{"invalid merge", "merge:\n  routes: [\"/api=1\"]\n  client: 3000\n", CodeInvalidMerge, "merge", 2},
+		{"merge port out of range", "merge:\n  client: 3000\n  server: 3001\n  port: 70000\nprocesses:\n  web:\n    cmd: x\n", CodeInvalidMerge, "merge.port", 4},
+		{"merge client out of range", "merge:\n  client: 99999\n  server: 3001\nprocesses:\n  web:\n    cmd: x\n", CodeInvalidMerge, "merge.client", 2},
+		{"merge server out of range", "merge:\n  client: 3000\n  server: 70000\nprocesses:\n  web:\n    cmd: x\n", CodeInvalidMerge, "merge.server", 3},
 		{"unknown field pulled in by merge key", "processes:\n  copy:\n    <<: &d\n      cmd: x\n      bogus: 1\n", CodeUnknownField, "processes.copy.bogus", 5},
 		{"invalid merged field located at its anchor", "processes:\n  base: &d\n    cmd: x\n    restart: always\n  copy:\n    <<: *d\n    mode: task\n", CodeTaskIncompatible, "processes.copy.restart", 4},
 		{"earlier merge source wins and is located", "processes:\n  a: &a\n    cmd: x\n    restart: always\n  b: &b\n    cmd: y\n    restart: never\n  job:\n    <<: [*a, *b]\n    mode: task\n", CodeTaskIncompatible, "processes.job.restart", 4},
@@ -68,6 +73,19 @@ func TestDiagnose_Codes(t *testing.T) {
 				t.Fatalf("diagnostic lacks message or hint: %+v", d)
 			}
 		})
+	}
+}
+
+// TestDiagnosticHints_NameTheRuleTheyExplain pins the two hints that state a
+// rule: the invalid_merge hint names the refused name-matched PORT, and the
+// invalid_port hint says that a dot is not allowed in a port name.
+func TestDiagnosticHints_NameTheRuleTheyExplain(t *testing.T) {
+	if !strings.Contains(diagnosticHints[CodeInvalidMerge], "PORT") ||
+		!strings.Contains(diagnosticHints[CodeInvalidMerge], "merge port") {
+		t.Fatalf("invalid_merge hint omits the refused PORT rule: %q", diagnosticHints[CodeInvalidMerge])
+	}
+	if !strings.Contains(diagnosticHints[CodeInvalidPort], "`.` is not allowed in port names") {
+		t.Fatalf("invalid_port hint does not say that a dot is not allowed: %q", diagnosticHints[CodeInvalidPort])
 	}
 }
 
@@ -285,6 +303,22 @@ func TestSchema_ParityWithStructTagsAndParser(t *testing.T) {
 	if _, err := Load(writeConfig(t, healthYAML(fmt.Sprintf("    health_interval: %d\n", int(floor)-1)))); err == nil {
 		t.Fatalf("health_interval %d is below the schema minimum %v but Load accepted it", int(floor)-1, floor)
 	}
+	// ready_timeout floor parity: Load accepts the schema minimum (-1 = no
+	// limit) and rejects the value below it.
+	readyTimeout, _ := process["ready_timeout"].(map[string]any)
+	readyFloor, ok := readyTimeout["minimum"].(float64)
+	if !ok {
+		t.Fatalf("ready_timeout schema = %v, want a minimum", readyTimeout)
+	}
+	readyYAML := func(extra string) string {
+		return "processes:\n  api:\n    cmd: x\n" + extra
+	}
+	if _, err := Load(writeConfig(t, readyYAML(fmt.Sprintf("    ready_timeout: %d\n", int(readyFloor))))); err != nil {
+		t.Fatalf("schema minimum ready_timeout %v rejected by Load: %v", readyFloor, err)
+	}
+	if _, err := Load(writeConfig(t, readyYAML(fmt.Sprintf("    ready_timeout: %d\n", int(readyFloor)-1)))); err == nil {
+		t.Fatalf("ready_timeout %d is below the schema minimum %v but Load accepted it", int(readyFloor)-1, readyFloor)
+	}
 	// Probe kind parity: for ready_when and health_when, the schema forbids a
 	// kind (not.required) exactly when Load rejects it.
 	probeValues := map[string]string{"http": "http://localhost:1/", "tcp": "localhost:1", "cmd": "true", "log": "ready"}
@@ -436,4 +470,145 @@ func TestPlan_LevelsReadinessAndReferences(t *testing.T) {
 	if _, err := Plan(cfg, []string{"nope"}); err == nil {
 		t.Fatal("unknown filter accepted")
 	}
+}
+
+// TestPlan_DottedProcessNameResolvesItsPort pins that a dotted process name
+// with a dot-free port name resolves to that process's port: the plan and the
+// session split the reference name at the last dot, so they agree.
+func TestPlan_DottedProcessNameResolvesItsPort(t *testing.T) {
+	cfg := loadFromString(t, "processes:\n  a.b:\n    cmd: serve ${ports.a.b.c}\n    ports:\n      c: 0\n")
+	plan, err := Plan(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []EndpointReference{{Field: "cmd", Ref: "ports.a.b.c", Resolvable: true, Treatment: ReferenceTreatment}}
+	if !reflect.DeepEqual(plan.Processes[0].References, want) {
+		t.Fatalf("references = %+v, want %+v", plan.Processes[0].References, want)
+	}
+}
+
+// ─── #56: the published schema's root constraint ──────────────────────────────
+
+// TestSchema_RootAnyOfRequiresANonEmptyProcessesMapOrAMerge pins the root
+// anyOf of the published schema: a config carries a non-empty processes map or
+// a merge section, exactly as Load requires. The measurement is the generated
+// keywords plus the verdict of the changed constraint for a table of sample
+// documents.
+func TestSchema_RootAnyOfRequiresANonEmptyProcessesMapOrAMerge(t *testing.T) {
+	var schema struct {
+		AnyOf []map[string]any `json:"anyOf"`
+	}
+	if err := json.Unmarshal(Schema(), &schema); err != nil {
+		t.Fatal(err)
+	}
+	if len(schema.AnyOf) != 2 {
+		t.Fatalf("root anyOf has %d branches, want 2", len(schema.AnyOf))
+	}
+	first := schema.AnyOf[0]
+	required, _ := first["required"].([]any)
+	if len(required) != 1 || required[0] != "processes" {
+		t.Fatalf("branch 1 required = %v, want [processes]", required)
+	}
+	props, _ := first["properties"].(map[string]any)
+	processes, _ := props["processes"].(map[string]any)
+	min, ok := processes["minProperties"].(float64)
+	if !ok || min != 1 {
+		t.Fatalf("branch 1 properties.processes.minProperties = %v, want 1", processes["minProperties"])
+	}
+	second := schema.AnyOf[1]
+	secondRequired, _ := second["required"].([]any)
+	if len(secondRequired) != 1 || secondRequired[0] != "merge" {
+		t.Fatalf("branch 2 required = %v, want [merge]", secondRequired)
+	}
+
+	// The changed constraint, evaluated against sample documents. Only the
+	// root anyOf is evaluated: it is the constraint this change adds. Each
+	// row below is therefore a verdict about the root anyOf branch, not about
+	// the whole schema — the real schema also requires `processes` to be an
+	// object, which this evaluator does not model.
+	samples := []struct {
+		name      string
+		yaml      string
+		wantValid bool
+	}{
+		{"root anyOf verdict: an empty processes map without a merge section", "processes: {}\n", false},
+		{"root anyOf verdict: an empty processes map with a merge section", "processes: {}\nmerge:\n  client: 3000\n  server: 3001\n", true},
+		{"root anyOf verdict: a null processes map without a merge section", "processes:\n", false},
+		{"root anyOf verdict: a null processes map with a merge section", "processes:\nmerge:\n  client: 3000\n  server: 3001\n", true},
+		{"root anyOf verdict: one process", "processes:\n  api:\n    cmd: x\n", true},
+		{"root anyOf verdict: a merge section only", "merge:\n  client: 3000\n  server: 3001\n", true},
+		{"root anyOf verdict: neither a processes map nor a merge section", "resources: [db]\n", false},
+	}
+	for _, sample := range samples {
+		t.Run(sample.name, func(t *testing.T) {
+			var doc map[string]any
+			if err := yaml.Unmarshal([]byte(sample.yaml), &doc); err != nil {
+				t.Fatal(err)
+			}
+			if got := rootAnyOfAccepts(doc, schema.AnyOf); got != sample.wantValid {
+				t.Fatalf("root anyOf verdict = %v, want %v", got, sample.wantValid)
+			}
+		})
+	}
+
+	// The repo's own example config stays valid under the changed
+	// constraint, and Load still accepts it.
+	example := filepath.Join("..", "..", "examples", "environment-report", "proc-compose.yml")
+	data, err := os.ReadFile(example)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if !rootAnyOfAccepts(doc, schema.AnyOf) {
+		t.Fatal("the repo's example config is invalid under the changed constraint")
+	}
+	if _, err := Load(example); err != nil {
+		t.Fatalf("Load(%s): %v", example, err)
+	}
+}
+
+// rootAnyOfAccepts evaluates the root anyOf of the published schema against a
+// parsed document: a branch is satisfied when it requires the keys it names
+// and the properties it constrains hold.
+func rootAnyOfAccepts(doc map[string]any, branches []map[string]any) bool {
+	for _, branch := range branches {
+		satisfied := true
+		if required, ok := branch["required"].([]any); ok {
+			for _, key := range required {
+				name, _ := key.(string)
+				if _, present := doc[name]; !present {
+					satisfied = false
+					break
+				}
+			}
+		}
+		if !satisfied {
+			continue
+		}
+		if props, ok := branch["properties"].(map[string]any); ok {
+			for name, constraint := range props {
+				value, present := doc[name]
+				if !present {
+					continue
+				}
+				rule, _ := constraint.(map[string]any)
+				min, ok := rule["minProperties"].(float64)
+				if !ok {
+					continue
+				}
+				entries, isMap := value.(map[string]any)
+				if !isMap || float64(len(entries)) < min {
+					satisfied = false
+					break
+				}
+			}
+		}
+		if satisfied {
+			return true
+		}
+	}
+	return false
 }
