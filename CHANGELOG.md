@@ -428,6 +428,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete them, as on Linux and macOS; a removed live file is recreated at the
   next rotation.
 
+### Security
+
+- Release binaries are built with Go 1.26.10, which fixes GO-2026-6809
+  (`crypto/x509` did not distrust compromised intermediate certificates).
+
 ## [1.11.0] - 2026-10-19
 
 ### Added
