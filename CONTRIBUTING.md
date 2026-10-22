@@ -12,7 +12,7 @@ Open an issue at <https://github.com/anivaryam/proc-compose/issues> with:
 
 ## Development setup
 
-You need Go (see `go.mod`; releases are built with Go 1.26.9) and `make`.
+You need Go (see `go.mod`; releases are built with Go 1.26.10) and `make`.
 
 ```sh
 git clone https://github.com/anivaryam/proc-compose.git

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/ansi"
@@ -169,21 +170,23 @@ func managedMergeUpstreamPorts(cfg *config.Config) []mergePortRole {
 	return checks
 }
 
+// processPorts maps each port a managed service binds at a number the config
+// fixes to the services that bind it. A service's port is the PORT it is
+// started with, read the way Load matches merge upstreams
+// (config.ServedPorts); only a service can be an upstream. A PORT the session
+// assigns from a named port is left out: the session holds that port from
+// Acquire and never moves a merge upstream's, so a busy one refuses the start
+// there, for up and verify alike.
 func processPorts(processes map[string]config.Process) map[int][]string {
 	out := make(map[int][]string)
-	for name, proc := range processes {
-		if name == "merge-port" {
+	for name, served := range config.ServedPorts(processes) {
+		if name == config.MergePortProcessName || processes[name].EffectiveMode() != config.ProcessModeService {
 			continue
 		}
-		value := ""
-		if proc.Env != nil {
-			value = proc.Env["PORT"]
-		}
-		port, err := strconv.Atoi(strings.TrimSpace(value))
-		if err != nil || port <= 0 {
+		if served.Port <= 0 || len(served.Named) > 0 {
 			continue
 		}
-		out[port] = append(out[port], name)
+		out[served.Port] = append(out[served.Port], name)
 	}
 	return out
 }
@@ -469,6 +472,22 @@ func requestShutdown(socketPath string, force bool, deadline time.Time) stopResu
 	// unusable, so the caller must not keep reading it.
 	defer client.Close()
 
+	// Read the snapshot the daemon writes first before sending, under the
+	// same cap as the write. An older daemon reads nothing until it is out,
+	// and a Windows named pipe does not buffer, so a request sent first would
+	// wait for it past its budget. No daemon acts on a command before its
+	// snapshot is out, so one that sends none in time could not have been
+	// asked either.
+	readBy := remainingUntil(deadline, connectBudget)
+	if readBy <= 0 {
+		return stopResult{outcome: stopUnavailable,
+			detail: "no time left in the stop budget to read the daemon's state"}
+	}
+	if _, err := client.RecvTimeout(readBy); err != nil {
+		return stopResult{outcome: stopUnavailable,
+			detail: fmt.Sprintf("daemon did not send its state on connect (%v)", err)}
+	}
+
 	// The write shares the overall deadline. Without this a wedged daemon whose
 	// receive buffer is full would block the request past --timeout.
 	//
@@ -707,10 +726,12 @@ func remainingUntil(deadline time.Time, cap time.Duration) time.Duration {
 }
 
 // waitProcessGone polls until pid is no longer running or timeout elapses.
+// An exited process counts as gone even while a handle (stop's own, on
+// Windows) or a missing reap keeps it visible.
 func waitProcessGone(pid int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {
-		if !daemon.IsAlive(pid) {
+		if !daemon.IsRunning(pid) {
 			return true
 		}
 		if !time.Now().Before(deadline) {
@@ -1263,6 +1284,13 @@ func topLevelName(cmd *cobra.Command) string {
 	return cmd.Name()
 }
 
+// jsonRequested reports whether cmd has a --json flag and it is set: this
+// CLI's marker for "this output is for a machine".
+func jsonRequested(cmd *cobra.Command) bool {
+	machine, err := cmd.Flags().GetBool("json")
+	return err == nil && machine
+}
+
 // updateNoticeEligible reports whether this invocation may print an update
 // notice.
 //
@@ -1278,11 +1306,8 @@ func updateNoticeEligible(cmd *cobra.Command, interactive bool) bool {
 	if updateNoticeSkip[name] {
 		return false
 	}
-	// --json is this CLI's marker for "this output is for a machine".
-	if f := cmd.Flags().Lookup("json"); f != nil {
-		if machine, err := cmd.Flags().GetBool("json"); err == nil && machine {
-			return false
-		}
+	if jsonRequested(cmd) {
+		return false
 	}
 	// "up --survive" prints a systemd unit that callers write to a file, and
 	// "up --silent" hands off to a daemon that re-runs this same binary
@@ -1313,7 +1338,7 @@ func printUpdateNotice(cmd *cobra.Command, currentVersion string, interactive bo
 	if !updateNoticeEligible(cmd, interactive) {
 		return
 	}
-	latest := update.Default().Notice(currentVersion)
+	latest := checkerForUpdate().Notice(currentVersion)
 	if latest == "" {
 		return
 	}
@@ -1321,6 +1346,57 @@ func printUpdateNotice(cmd *cobra.Command, currentVersion string, interactive bo
 		ansi.SetDisabled(true)
 	}
 	fmt.Fprint(os.Stderr, update.Message(currentVersion, latest))
+}
+
+// updateChecker is the Checker this process uses for the release lookup. It is
+// created on first use and then kept: update.Default() returns a new Checker
+// per call, and only the Checker that scheduled a refresh knows that one is in
+// flight.
+//
+// It is deliberately not created at init time: resolving the cache path
+// creates the cache directory, and an invocation that is not eligible for the
+// notice must not create directories.
+var (
+	updateCheckerMu   sync.Mutex
+	updateChecker     *update.Checker
+	updateCheckerPath string
+)
+
+// updateRefreshBudget bounds the wait for the background release lookup at the
+// end of a command. It is the lookup's own HTTP timeout, so a cold round trip
+// to the release API is inside the budget: the result is recorded even when
+// the first request of a session has to establish the connection. A slower or
+// unreachable release API is given up at the budget, silently. The attempt was
+// recorded when the lookup was scheduled, so the next invocations neither
+// repeat the lookup nor wait for it until update.CacheTTL has passed: the
+// budget is paid at most once per check interval.
+const updateRefreshBudget = update.HTTPTimeout
+
+// checkerForUpdate returns the Checker this process uses for the release
+// lookup, creating it on first use. The Checker follows the cache path, so a
+// process whose cache location changes gets a Checker for the new one.
+func checkerForUpdate() *update.Checker {
+	updateCheckerMu.Lock()
+	defer updateCheckerMu.Unlock()
+	path := update.CachePath()
+	if updateChecker == nil || updateCheckerPath != path {
+		updateChecker = update.New(path)
+		updateCheckerPath = path
+	}
+	return updateChecker
+}
+
+// waitForUpdateRefresh joins the background release lookup the notice
+// scheduled, so a short command still records the result for the next
+// invocation. It returns at once when no lookup was scheduled.
+func waitForUpdateRefresh() {
+	updateCheckerMu.Lock()
+	c := updateChecker
+	updateCheckerMu.Unlock()
+	if c == nil {
+		return
+	}
+	c.WaitRefresh(updateRefreshBudget)
 }
 
 // stderrIsTerminal reports whether diagnostics are going to a person.

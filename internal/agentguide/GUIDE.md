@@ -3,7 +3,10 @@
 Offline and version-matched: `proc-compose agent-guide`. Use `<command> --help`
 for exact flags. Schema version 1. Pass the same explicit
 `-f /abs/proc-compose.yml --session NAME` to every command; session identity is
-the absolute config path plus the optional name.
+the absolute config path plus the optional name. A NAME outside
+`[A-Za-z0-9._-]{1,64}` is refused by every command before it does anything:
+exit 2 and, with `--json`, one object on stdout (`verify`/`compare`: their own
+kind with `usage_error`; others: `{operation, status: "error", message}`).
 
 ## To check a change, use `verify`
 
@@ -21,18 +24,24 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why --attempt latest --j
   after `--` runs directly, with no shell; write `-- sh -c '...'` for shell
   syntax. Budgets: `--startup-timeout` (default 120s), `--check-timeout`
   (10m), `--cleanup-timeout` (30s).
-- Exit codes: 0 passed; 1 failed; 2 nothing started (usage, invalid config, or
-  a session that is already running); 130 interrupted. On exit 2 with
-  `session_occupied`, choose another `--session`. Never stop a session you did
-  not start.
+- Exit codes: 0 passed; 1 failed; 2 nothing started (usage, invalid config, a
+  session that is already running, or a resource or fixed port in use);
+  130 interrupted. On exit 2 with `session_occupied`, choose another
+  `--session`. On exit 2 with `resource_unavailable`, another session holds a
+  `resources` label, or another session or program holds the merge port or a
+  merge upstream's named port (never moved); stderr names it. Never stop a
+  session you did not start.
 - After successful flag parsing, `--json` normal/semantic results are one bounded
   object. Read `status` (`passed`/`failed`/`interrupted`), then
   `startup.status`, `check.status`/`check.exit_code`, `cleanup.status`, and
   `errors` (`{code,count}`: `startup_timeout`, `startup_failed`,
   `check_exit_nonzero`, `check_timeout`, `required_process_failed`,
   `environment_ineligible`, `environment_unverified`, `cleanup_unverified`,
-  `receipt_persistence_failed`, `session_occupied`, `invalid_configuration`).
-  `check.stdout`/`stderr` hold up to 4 KiB each.
+  `receipt_persistence_failed`, `session_occupied`, `resource_unavailable`,
+  `invalid_configuration`).
+  `check.stdout`/`stderr` hold up to 4 KiB each; `stdout_sha256`/`stderr_sha256`
+  digest that captured prefix only, and `output_truncated` marks a stream that
+  was cut off.
 - Only `status: passed` means the check passed against a ready stack with
   verified cleanup. It proves that check, not general health;
   `source.loaded_code_proven` is always false. Readiness `not_configured`
@@ -80,7 +89,12 @@ events. For each process you get state transitions and output, with
 identical consecutive lines grouped into `count`, plus
 `first_id`/`last_id` for `logs --after`. `history_missing`, `gap`, and
 `truncated` mark incomplete evidence. It shows temporal order, not causes.
-`attempts --json` lists receipts. A nonterminal receipt is `active` only while
+A record without a run id reports `history_missing` (limitation
+`journal_unavailable`) instead of scanning the whole journal.
+`attempts --json` lists receipts; a file that is not a valid receipt is
+skipped, and `latest` is the newest valid one. A running attempt's receipt
+has `status: not_run`, `exit_code: 0`, `precedence: no_verdict`.
+A nonterminal receipt is `active` only while
 its owner lives and still runs the session, `abandoned` only with positive owner loss plus a free lease,
 and otherwise `indeterminate`; it is never a pass. `sessions` never probes the
 lease, so it shows a gone owner as `indeterminate`. Receipts live in the runtime
@@ -110,12 +124,14 @@ proc-compose -f /repo/proc-compose.yml --session task-1 stop --timeout 30
   does not prove readiness. Restart reports the acknowledged `generation` when
   available; with `--wait-ready`, `ready: true` proves that replacement passed
   readiness, while `ready: false` is not a pass. Plain restart omits `ready`.
+  Errors exit 1, except an invalid `--session` (exit 2, as everywhere).
   Flag-parsing errors remain exit 1 with text stderr and empty stdout.
 - `sessions --json` lists every session: owner (command, PID,
   `PROC_COMPOSE_OWNER` label, worktree), URLs, latest attempt, and a stop
   command. It only reads.
 - Other commands and flag-parsing failures may print only stderr text; do not
-  assume every failure has JSON to decode.
+  assume every failure has JSON to decode. An invalid `--session` is the
+  exception: it always has its JSON object under `--json`.
 
 ## Logs and failure packets
 
@@ -129,6 +145,9 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why api --json
 - A page has `schema_version`, `events`, `next_cursor` (save it, not the last
   event ID), `has_more`, `gap` (cursor expired; you got a bounded tail), and
   `truncated`.
+- A tail page is the newest end of the window: `has_more` is always `false`,
+  `next_cursor` is the last event scanned (it advances over events that did
+  not match the filters too), and `truncated` marks dropped events.
 - Defaults are 50 events / 64 KiB; maximums are 1000 / 1 MiB. Keep the same
   filters when resuming. `--after start` pages from the oldest event.
 - An empty page is not proof of health. Plain stderr is `stream: stderr`, not
@@ -145,7 +164,9 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why api --json
 
 - `config check --json` gives `{code,path,line,column,message,hint}`
   diagnostics. `config plan --json` gives start order, readiness kinds, and
-  endpoint references. `config schema` prints the JSON Schema. `validate`,
+  endpoint references. `config schema` prints the JSON Schema; it cannot state
+  every rule (dependencies, env files, a merge upstream's `PORT`), so
+  `config check` is the authority. `validate`,
   `up --dry-run`, and `bootstrap --verify` (`validation_status`) are static and
   start nothing.
 - Readiness: without a probe, a service is ready once it starts. Tasks are ready
@@ -154,10 +175,20 @@ proc-compose -f /repo/proc-compose.yml --session task-1 why api --json
   `foreign_listener: reject`, or, under verify, the server belongs to another
   live session; `status --json` `readiness_owner` (Linux, Windows) says whose,
   with its `scope`.
-- `ports: {http: 0}` requests an ephemeral port and sets `PORT`. Reference ports
-  as `${ports.api.http}` / `${urls.api.http}`; `${session.dir}` is the session
-  runtime root. `resources` labels take exclusive leases. Databases, build
-  outputs, and hardcoded ports remain shared unless separated explicitly.
+- `ports: {http: 0}` requests an ephemeral port and sets `PORT`. A busy
+  preferred port moves to the next free one, except a merge upstream's named
+  port, which refuses the start. Reference ports as `${ports.api.http}` /
+  `${urls.api.http}`; `${session.dir}` is the session runtime root. A port name carries no dot (the reference name is
+  `process.port`); a dot in a process name is fine. `resources` labels take
+  exclusive leases; they are trimmed when the config is loaded, so whitespace
+  variants name one resource. Databases, build outputs, and hardcoded ports
+  remain shared unless separated explicitly.
 - `compare --baseline DIR --candidate DIR --json -- CMD` runs one check against
   two worktrees. `outcomes_equal`/`differences` are observations, not
-  attributions, and isolating data is the caller's job.
+  attributions, and isolating data is the caller's job. `outcomes_equal` is
+  `false` when a difference was proven, even beside a limitation: in every
+  pairing of a baseline with a candidate repetition, status, check status, or
+  exit code differ, or output does (complete output whenever it differs;
+  truncated output only where both captures hold different bytes). It is
+  `null` when nothing was proven and one side's own repetitions disagree or
+  an output was truncated; every such reason is named in `limitations`.

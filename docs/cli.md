@@ -71,6 +71,17 @@ Flags (init):
 Flags (logs): see `proc-compose logs --help` and [Sessions and logs](sessions-and-logs.md)
 ```
 
+### An invalid `--session`
+
+A `--session` name must match `[A-Za-z0-9._-]{1,64}`. Every command refuses
+any other name the same way, before it does anything: it exits `2`. With
+`--json`, stdout holds exactly one JSON object. `verify` and `compare` report
+the refusal in their own result (error code `usage_error`); every other
+command prints `{"operation": …, "status": "error", "message": "invalid
+--session: …"}`, where `operation` is the command, such as `status` or
+`config check`, and leaves stderr empty. Without `--json`, the error is
+printed on stderr.
+
 ## Environment variables
 
 | Variable | Read by | Effect |
@@ -100,6 +111,18 @@ On Unix, the paths are:
 ```
 
 Windows uses a named pipe (`\\.\pipe\pc-<hash>`) for IPC instead of a Unix socket.
+
+Each command a client sends over the socket is one JSON line of at most 64 KiB,
+newline included. The daemon discards a longer line and answers it with an
+`error` acknowledgment that names the limit. The connection stays open, so the
+commands sent after it on the same connection are still processed.
+
+Every connection starts with a snapshot of the daemon's state, followed by
+events and acknowledgments. The daemon reads commands while it writes the
+snapshot, so a client may send its command before reading it; the command is
+acted on and answered once the snapshot is out. `restart`, `reload` and `stop`
+read the snapshot before they send, so they also work promptly with older
+daemons, which read nothing until the snapshot is out.
 
 The PID file is JSON and is replaced atomically, so a reader never sees a
 partial file. On Linux and macOS it also records every process group the
@@ -185,6 +208,14 @@ Keys:
 | `G`             | Jump to live tail                     |
 | `g`             | Jump to top of log buffer             |
 
+The highlighted row follows the process it names. When the health-sorted order
+changes — a process fails, restarts, or appears — the cursor stays on the same
+process, and `Enter` filters the logs of the highlighted process.
+
+If keyboard input ends (stdin is closed or unreadable), the monitor restores
+the terminal and exits, printing `keyboard input closed — exiting monitor` on
+stderr. It does not keep redrawing without a usable keyboard.
+
 `NO_COLOR=1` (or `--no-color` on `up`) disables colour output in both the runner and the monitor.
 
 Completed task rows stay visible as `✓ completed` with readiness `done`.
@@ -199,6 +230,20 @@ proc-compose up --survive --name myapp --install
 
 This writes a unit to `~/.config/systemd/user/proc-compose-<name>.service` and enables it.
 The service starts `proc-compose up --silent` in daemon mode, which manages all processes.
+
+The generated unit refers to your project paths as written: a path containing a
+space is quoted, and a path containing `%` is escaped so systemd keeps it
+literal. A path containing a newline, a NUL byte, a quote, a backslash or `$`
+is refused — systemd would rewrite it instead of running it.
+
+`ExecStart=` and `Environment=` are quoted; `WorkingDirectory=` is **not**,
+because systemd does not strip quotes there. A project path must therefore not
+begin or end with whitespace: a path with surrounding whitespace is used
+verbatim and the unit starts in the wrong directory.
+
+A unit that was installed by an earlier version keeps the file it was written
+with. Re-run `proc-compose up --survive --install` to regenerate it with the
+corrected quoting and escaping.
 
 To manually install without enabling immediately:
 
@@ -260,7 +305,9 @@ readiness. Reload does not wait for replacement readiness and omits `ready`.
 
 Exit `0` still includes both full and **partial** reloads: inspect `status`,
 not just the exit code. Busy, rejection, missing daemon, failed readiness and
-semantic usage errors exit `1`. Flag-parsing errors (such as an unknown flag,
+semantic usage errors exit `1`, except an invalid `--session`, which exits `2`
+as on every command ([An invalid `--session`](#an-invalid---session)); its
+JSON object is the same `status: error` result. Flag-parsing errors (such as an unknown flag,
 even after `--json`) remain exit `1` with plaintext stderr and empty stdout;
 `--help` remains normal help text. A stdout write failure also exits nonzero
 and cannot guarantee a complete JSON object.
@@ -282,8 +329,12 @@ process, including descendants, and reports whether it verified that all of
 them exited. `stop` exits 0 only when the daemon verified this. When
 termination could not be verified, `stop` names what it could not confirm and
 exits non-zero. `--timeout` (default 10) bounds the wait for that verdict. If
-the daemon cannot be reached and has to be killed directly, the final kill
-can add up to 5 seconds.
+the daemon cannot be reached (it does not accept the connection, or does not
+send its state when it does) and has to be killed directly, the final kill
+can add up to 5 seconds. A `stop` that never receives the verdict (it was
+interrupted, or its `--timeout` ran out first) cannot report it, so the daemon records the verdict
+in the session's event journal as `shutdown.verdict_undelivered`; read it with
+`proc-compose logs --json --level error`.
 
 When the stack declares [teardown processes](configuration.md#teardown-processes),
 the daemon runs them after termination is verified (also with `--force`), and
@@ -391,7 +442,7 @@ proc-compose doctor --write  # create proc-compose.yml when none exists
 proc-compose doctor --json   # emit machine-readable report
 ```
 
-`doctor` helps first-time setup and existing config debugging. Without a config file, it scans common Node, Go, and Python project layouts, then prints suggested processes, ports, readiness probes, and YAML. It understands npm/yarn/pnpm/bun package runners, common frontend dev servers (Next.js, Vite, SvelteKit, Astro), Go `cmd/**/main.go` binaries, and Python Django/Flask/Uvicorn/Hypercorn entrypoints. With an existing config, it checks paths, env files, port conflicts, readiness gaps, restart loops, merge-port setup, and likely missing binaries.
+`doctor` helps first-time setup and existing config debugging. Without a config file, it scans common Node, Go, and Python project layouts, then prints suggested processes, ports, readiness probes, and YAML. It understands npm/yarn/pnpm/bun package runners, common frontend dev servers (Next.js, Vite, SvelteKit, Astro), Go `cmd/**/main.go` binaries, and Python Django/Flask/Uvicorn/Hypercorn entrypoints. With an existing config, it checks paths, env files, port conflicts, readiness gaps, restart loops, merge-port setup, and likely missing binaries. It also checks the config it suggests, so a suggestion that needs `merge-port` reports the missing binary even when no config exists yet; that finding names the suggested config so it can be told apart from a finding about the config on disk.
 
 `--write` is safe by default: it only creates `proc-compose.yml` when neither `proc-compose.yml` nor `proc-compose.yaml` exists.
 
@@ -436,6 +487,14 @@ When running with `--log-file`, use `--max-log-size` to automatically rotate log
 ```sh
 proc-compose up --silent --log-file app.log --max-log-size 52428800  # 50 MB
 ```
+
+A rotation that fails keeps the bytes already written: the live file is
+renamed aside before anything else happens, so a failed rename never
+truncates the log. The write that triggered the failed rotation reports the
+failure. For the **event journal**, the run's result then carries an
+`event journal: …` error and the command exits non-zero. For the `--log-file`
+writer, the write error is not carried into the run's result: the failure is
+reported on the daemon's stderr only, and the command still exits zero.
 
 ### Use a different config file
 

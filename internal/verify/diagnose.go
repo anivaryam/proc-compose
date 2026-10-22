@@ -103,19 +103,33 @@ func Diagnose(receipt *Result, state string, processes []string) Diagnosis {
 	if state != StateCompleted {
 		d.Limitations = append(d.Limitations, "attempt_not_terminal")
 	}
-	if receipt.Journal() == "" || receipt.RunID == nil {
+	// An empty run id is no run id: logs.Query reads an empty RunID as no
+	// filter, so a run-scoped scan with it would return the whole journal.
+	if receipt.Journal() == "" || receipt.RunID == nil || *receipt.RunID == "" {
 		d.HistoryMissing = true
 		d.Limitations = append(d.Limitations, "journal_unavailable")
 		return d
 	}
-	events, gap, truncated, err := scanAttempt(receipt.Journal(), logs.Options{AttemptID: d.AttemptID})
-	d.Boundary = "attempt_id"
-	if err == nil && len(events) == 0 {
-		// Journals written before attempt identity existed: fall back to the
-		// run, which this attempt owned exclusively.
+	var events []ipc.LogEntry
+	var gap, truncated bool
+	var err error
+	if d.AttemptID == "" {
+		// No attempt id: an attempt-scoped scan would filter nothing and
+		// return the whole journal under an attempt_id label. Scan the run
+		// instead, and say so.
 		events, gap, truncated, err = scanAttempt(receipt.Journal(), logs.Options{RunID: *receipt.RunID})
 		d.Boundary = "run_id"
-		d.Limitations = append(d.Limitations, "attempt_boundary_inferred_from_run")
+		d.Limitations = append(d.Limitations, "attempt_boundary_unavailable")
+	} else {
+		events, gap, truncated, err = scanAttempt(receipt.Journal(), logs.Options{AttemptID: d.AttemptID})
+		d.Boundary = "attempt_id"
+		if err == nil && len(events) == 0 {
+			// Journals written before attempt identity existed: fall back to
+			// the run, which this attempt owned exclusively.
+			events, gap, truncated, err = scanAttempt(receipt.Journal(), logs.Options{RunID: *receipt.RunID})
+			d.Boundary = "run_id"
+			d.Limitations = append(d.Limitations, "attempt_boundary_inferred_from_run")
+		}
 	}
 	if err != nil || len(events) == 0 {
 		d.Boundary = "unavailable"

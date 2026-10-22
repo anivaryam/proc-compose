@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -43,8 +44,9 @@ never attributes a difference to the code change; both are reported as
 limitations.
 
 Exit status: 0 the comparison is valid (every attempt ran its check and
-verified cleanup) — read outcomes_equal for the verdict; 1 not comparable;
-2 usage; 130 interrupted.`,
+verified cleanup) — read outcomes_equal for the verdict (true or false when
+it could be determined, null when it could not; the reason is named in
+limitations); 1 not comparable; 2 usage; 130 interrupted.`,
 		Example:       "  proc-compose compare --baseline ../main --candidate . --json -- npm run test:smoke\n  proc-compose compare --baseline /tmp/base --candidate . --repeat 3 -- go test ./e2e",
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -121,8 +123,11 @@ func renderComparison(w io.Writer, c *verify.Comparison, machine bool) error {
 		}
 	} else {
 		fmt.Fprintf(w, "compare %s (exit %d)\n", strings.ToUpper(c.Status), c.ExitCode)
-		if c.OutcomesEqual != nil {
+		switch {
+		case c.OutcomesEqual != nil:
 			fmt.Fprintf(w, "  outcomes equal: %t\n", *c.OutcomesEqual)
+		case c.Status == "comparable":
+			fmt.Fprintf(w, "  outcomes equal: undetermined (see limitations)\n")
 		}
 		for _, side := range []string{"baseline", "candidate"} {
 			summary, ok := c.Sides[side]
@@ -139,7 +144,7 @@ func renderComparison(w io.Writer, c *verify.Comparison, machine bool) error {
 			}
 		}
 		for _, d := range c.Differences {
-			fmt.Fprintf(w, "  differs: %s baseline=%v candidate=%v\n", d.Field, d.Baseline, d.Candidate)
+			fmt.Fprintf(w, "  differs: %s baseline=%s candidate=%s\n", d.Field, formatDifference(d.Baseline), formatDifference(d.Candidate))
 		}
 		fmt.Fprintf(w, "  limitations: %s\n", strings.Join(c.Limitations, ", "))
 	}
@@ -147,4 +152,29 @@ func renderComparison(w io.Writer, c *verify.Comparison, machine bool) error {
 		return exitCodeError{c.ExitCode}
 	}
 	return nil
+}
+
+// formatDifference renders one side of a difference for humans. A pointer is
+// dereferenced, so an exit code reads as a number instead of a heap address,
+// and a missing value reads as "(none)". The JSON path is untouched: it
+// encodes the pointer itself, keeping the null/number distinction.
+func formatDifference(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return "(none)"
+	case *int:
+		if v == nil {
+			return "(none)"
+		}
+		return strconv.Itoa(*v)
+	case *string:
+		if v == nil {
+			return "(none)"
+		}
+		return *v
+	case string:
+		return v
+	default:
+		return fmt.Sprint(value)
+	}
 }

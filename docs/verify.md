@@ -91,12 +91,94 @@ proc-compose config schema                 # versioned JSON Schema for proc-comp
 Receipts and journals live in the runtime directory and may disappear at
 logout or reboot. `why --attempt` reads only events stamped with that attempt
 and reports missing or rotated history explicitly; it shows temporal order, not
-causes. `sessions` only reads metadata (set `PROC_COMPOSE_OWNER` to label who
+causes. It never scans the whole journal: a receipt always names its attempt
+(see the receipt contract below), and a record without a run id (`null` or
+empty) has no journal scope, so it reports `history_missing` with the
+limitation `journal_unavailable`.
+`sessions` only reads metadata (set `PROC_COMPOSE_OWNER` to label who
 started a session); retained environments are the ones started with
 `up --silent`, and are stopped with the command it prints. `compare` runs the
 same check against two worktrees with separate sessions and reports outcome
 differences; it neither isolates external data nor attributes differences to
 the code change.
+
+A receipt is a complete attempt record, stored as
+`attempts/<attempt_id>.json`: its `attempt_id` is the ULID that names the
+file, and its `state`, `status`, `exit_code` and `precedence` are one of the
+combinations below. `precedence` names the rule that decided `status` and
+`exit_code`.
+
+| `state` | `status` | `exit_code` | `precedence` | Recorded when |
+|---|---|---|---|---|
+| `active` | `not_run` | 0 | `no_verdict` | Before the attempt starts any process. It has no verdict yet, and the exit code means nothing until the terminal receipt replaces it. |
+| `completed` | `passed` | 0 | `all_required_phases_passed` | Startup, check, environment, cleanup, teardown, and the receipt all passed. |
+| `completed` | `failed` | 1 | `failure_without_interruption` | At least one error code was recorded, without an interruption. |
+| `completed` | `interrupted` | 130 | `interruption` | The attempt was interrupted; this wins over any failure. Cleanup still ran. |
+
+A refusal before the session is acquired (exit 2: usage, invalid config,
+occupied session, or `resource_unavailable` — a resource or a held port such
+as the merge port that another session or program has taken) creates no
+receipt; its `--json` response has
+`status: failed` and `precedence: pre_acquisition_failure`. Receipts written
+by earlier releases while an attempt ran say `status: failed` with
+`exit_code: 0` and an empty `precedence`; they are still read. A receipt
+never records `abandoned` or `indeterminate`: `attempts` derives those, and
+`active`, from an active receipt's owner evidence, and lists the recorded
+state as `recorded_state`. `run_id` is not part of the contract; it only
+scopes the journal evidence.
+
+A file that does not satisfy the contract is refused like an unreadable one:
+`attempts` skips it, `attempts latest` and `why --attempt latest` take the
+newest receipt that does, and the file is preserved rather than pruned.
+Naming it explicitly (`attempts <id>`) reports why it was refused.
+
+## Comparisons
+
+`compare` runs the same check against two worktrees, one attempt per side per
+repetition, alternating which side goes first. The verdict is
+`outcomes_equal`:
+
+- `true` — every repetition pair agreed: repetition *i* of the baseline
+  against repetition *i* of the candidate, on complete output, with each
+  side's own repetitions agreeing too.
+- `false` — a difference was proven: a compared field differs between every
+  baseline repetition and every candidate repetition (with one repetition per
+  side, between the two attempts). A proven difference is `false` whatever
+  limitations also apply.
+- `null` — no difference was proven, and the data cannot show that there is
+  none. The reasons are named in `limitations`: `nondeterministic_within_side`
+  when a side's own repetitions disagree, and `output_truncated` when an
+  output was truncated; both are listed when both apply.
+
+`status` stays `comparable` and the exit status stays 0 for all three; only
+the verdict is withheld. `differences` and `sides[*].attempts[]` remain the
+observations either way: `differences` lists every field that differs in some
+repetition pair, proven or not. `nondeterministic_within_side` and
+`output_truncated` are listed whenever they apply, beside `false` too.
+
+When a side's repetitions disagree, which repetitions ran together is
+incidental, so a field proves a difference only if it differs in every
+pairing. A baseline that always passes against a candidate that fails with
+varying exit codes is `false`; repetitions that differ in some pairings but
+agree in others are `null`.
+
+Each stream of the check's output is captured up to 4 KiB, so `stdout_sha256`
+and `stderr_sha256` digest the captured prefix only, and `output_truncated`
+marks an attempt with a stream that was cut off. The overall status, check
+status, and exit code are recorded in full, so a difference in them is proven
+however much output was cut. A truncated output proves a difference only where
+the two captures disagree at a byte both hold: equal captures cannot show what
+followed the cap, and neither can a capture that is a prefix of the other
+(including one the 64 KiB result limit emptied).
+
+`sides[*].median_check_ms` is the median of that side's check durations: the
+middle value for an odd number of samples, and the average of the two middle
+values for an even number, rounded half up.
+
+The check receives `PROC_COMPOSE_COMPARE_SIDE` (`baseline` or `candidate`)
+and `PROC_COMPOSE_COMPARE_REPETITION` (1-based) so it can select explicitly
+isolated data. The tool sets both, and they win over a variable of the same
+name supplied by the caller.
 
 ## Environment reports
 

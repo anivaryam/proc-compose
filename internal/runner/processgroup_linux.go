@@ -17,7 +17,7 @@ import (
 // established, so that callers skip escalation rather than assume a group is
 // empty on incomplete information.
 func groupMembers(pgid int) (int, bool) {
-	pids, ok := groupMemberPIDs(pgid)
+	pids, ok := enumerateGroupMembers(pgid)
 	return len(pids), ok
 }
 

@@ -16,12 +16,28 @@ import (
 	"unicode/utf8"
 
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/logrotate"
+	"github.com/anivaryam/proc-compose/internal/sharedfile"
 )
 
 type Options struct {
-	Limit      int
-	MaxBytes   int
-	After      string
+	Limit    int
+	MaxBytes int
+	After    string
+	// Tail selects the newest matching events instead of the oldest ones.
+	// It applies whenever it is set, with or without a cursor: the window
+	// is the newest Limit events after the cursor, or the newest Limit
+	// events of the whole journal when there is no cursor.
+	//
+	// Under tail:
+	//   - has_more is always false. A tail page is the end of the window,
+	//     not a forward page that can be continued.
+	//   - next_cursor is the last event scanned, not the last event
+	//     returned. It advances over events that did not match the filters
+	//     as well, so resuming from it never replays a scanned event.
+	//   - truncated is true when older events were dropped to fit the
+	//     event limit or the byte budget, and also when a single event had
+	//     to be shortened to fit the budget.
 	Tail       bool
 	Processes  []string
 	Level      string
@@ -112,7 +128,7 @@ func Query(path string, opts Options) (Page, error) {
 				page.NextCursor = event.ID
 				continue
 			}
-			if opts.Tail && opts.After == "" {
+			if opts.Tail {
 				bounded, size, err := fit(event, opts.MaxBytes)
 				if err != nil {
 					file.Close()
@@ -172,12 +188,38 @@ type retainedFile struct {
 	info os.FileInfo
 }
 
+// snapshotAttempts bounds how many times the reader re-pins the journal family
+// before it reports the journal as unavailable.
+const snapshotAttempts = 5
+
+// snapshotRetryDelay is the pause between two pinning attempts.
+//
+// It is a variable so a test can widen the window a reader waits out. A
+// rotation replaces the live journal in microseconds, so the production value
+// is far longer than the window it has to cover.
+var snapshotRetryDelay = time.Millisecond
+
+// openJournal opens one file of the journal family for reading. The handle
+// lets the writer rename and delete the file while the query has it pinned.
+func openJournal(path string) (*os.File, error) { return sharedfile.Open(path) }
+
 // Pin a coherent set of file handles before scanning. Opening each rotated
 // pathname only after reading the previous one can replay or skip entire files
 // if rotation occurs during the query. Validate names after opening and retry
 // a bounded number of times; a busy journal returns an explicit retryable error.
+//
+// While a rotation is in flight, and after one that failed could not put the
+// live journal back, the live path is absent and the newest events are in the
+// staged file, so the staged file is read in its place. A live path that is
+// absent with nothing staged is a journal whose live file was removed, or a
+// rotation between installing the newest copy and the new live file: the
+// rotated copies are the whole journal then. The journal is reported as
+// missing only when no file of it is left.
 func snapshotFiles(path string) ([]retainedFile, error) {
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt < snapshotAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(snapshotRetryDelay)
+		}
 		var files []retainedFile
 		observed := make(map[string]os.FileInfo)
 		var openErr error
@@ -187,6 +229,11 @@ func snapshotFiles(path string) ([]retainedFile, error) {
 				name = fmt.Sprintf("%s.%d", path, index)
 			}
 			file, err := openJournal(name)
+			if index == 0 && errors.Is(err, fs.ErrNotExist) {
+				observed[name] = nil
+				name = path + logrotate.StagingSuffix
+				file, err = openJournal(name)
+			}
 			// errors.Is, not os.IsNotExist: on Windows a name that rotation is
 			// deleting at this moment also reports as not existing.
 			if errors.Is(err, fs.ErrNotExist) {

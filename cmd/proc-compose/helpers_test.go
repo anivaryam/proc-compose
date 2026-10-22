@@ -503,6 +503,50 @@ func TestPreflightCheck_RouteModeMixedManagedExternalTargetsOnlyManagedFails(t *
 	}
 }
 
+// TestPreflightCheck_ManagedUpstreamPortsAgreeWithLoad pins that the preflight
+// reads a managed upstream's port the way Load matches it
+// (config.ServedPorts), on a loaded config: an env_file PORT is a managed
+// upstream port, while a task that names the merge port in its env is not an
+// upstream. A port the session assigns from a named port is left to the
+// session, which holds it and refuses the start at Acquire when it is busy, so
+// the preflight does not report it.
+func TestPreflightCheck_ManagedUpstreamPortsAgreeWithLoad(t *testing.T) {
+	t.Setenv("PORT", "")
+	client, closeClient := occupyTCPPort(t)
+	defer closeClient()
+	server, closeServer := occupyTCPPort(t)
+	defer closeServer()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(fmt.Sprintf("PORT=%d\n", server)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "proc-compose.yml")
+	body := fmt.Sprintf("merge:\n  client: %d\n  server: %d\n  port: %d\nprocesses:\n"+
+		"  web:\n    cmd: npm run dev\n    ports:\n      http: %d\n"+
+		"  api:\n    cmd: go run .\n    env_file: .env\n"+
+		"  seed:\n    cmd: ./seed\n    mode: task\n    env:\n      PORT: \"%d\"\n",
+		client, server, freeTCPPort(t), client, client)
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	err = preflightCheck(testPIDPath(t), cfg)
+	if err == nil {
+		t.Fatal("expected the occupied env_file upstream port to fail preflight")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, fmt.Sprintf(":%d", server)) || !strings.Contains(msg, "managed upstream api") {
+		t.Fatalf("error should name the env_file upstream api on :%d, got: %s", server, msg)
+	}
+	if strings.Contains(msg, fmt.Sprintf(":%d", client)) {
+		t.Fatalf("error should leave the session-assigned port :%d to the session and not count the task, got: %s", client, msg)
+	}
+}
+
 // TestPreflight_RefusesWhenCrashedDaemonLeftLiveGroups is the S4 gate: a PID
 // file left by a crashed daemon whose recorded group is still running must stop
 // `up` from overwriting the only record of that group. The file is kept and the
@@ -1192,72 +1236,6 @@ func (p *scriptedPeer) waitConnected(t *testing.T) {
 // push queues one state event for delivery.
 func (p *scriptedPeer) push(st ipc.ProcState) {
 	p.send <- st
-}
-
-func TestComputeClosure_AllProcs(t *testing.T) {
-	procs := map[string]config.Process{
-		"a": {Cmd: "echo a"},
-		"b": {Cmd: "echo b"},
-		"c": {Cmd: "echo c"},
-	}
-	got := computeClosure(procs, nil)
-	if len(got) != 3 {
-		t.Errorf("expected 3 procs, got %d", len(got))
-	}
-}
-
-func TestComputeClosure_WithDeps(t *testing.T) {
-	procs := map[string]config.Process{
-		"app":     {Cmd: "echo app", DependsOn: []string{"db"}},
-		"db":      {Cmd: "echo db", DependsOn: []string{"migrate"}},
-		"migrate": {Cmd: "echo migrate"},
-	}
-	got := computeClosure(procs, []string{"app"})
-	if len(got) != 3 {
-		t.Errorf("expected closure {app,db,migrate}, got %v", got)
-	}
-	found := make(map[string]bool)
-	for _, n := range got {
-		found[n] = true
-	}
-	if !found["app"] || !found["db"] || !found["migrate"] {
-		t.Errorf("expected app,db,migrate in closure, got %v", got)
-	}
-}
-
-func TestComputeClosure_TaskOnlyRejected(t *testing.T) {
-	procs := map[string]config.Process{
-		"migrate": {Cmd: "echo migrate", Mode: config.ProcessModeTask},
-	}
-	closure := computeClosure(procs, []string{"migrate"})
-	hasService := false
-	for _, name := range closure {
-		if procs[name].EffectiveMode() != config.ProcessModeTask {
-			hasService = true
-			break
-		}
-	}
-	if hasService {
-		t.Error("expected task-only closure to have no services")
-	}
-}
-
-func TestComputeClosure_ServiceWithTaskAllowed(t *testing.T) {
-	procs := map[string]config.Process{
-		"app":     {Cmd: "echo app", DependsOn: []string{"migrate"}},
-		"migrate": {Cmd: "echo migrate", Mode: config.ProcessModeTask},
-	}
-	closure := computeClosure(procs, []string{"app"})
-	hasService := false
-	for _, name := range closure {
-		if procs[name].EffectiveMode() != config.ProcessModeTask {
-			hasService = true
-			break
-		}
-	}
-	if !hasService {
-		t.Error("expected closure with app to have at least one service")
-	}
 }
 
 func TestCheckOptionalBinaries_MergeWithoutMergePort_ReturnsError(t *testing.T) {
@@ -2666,13 +2644,33 @@ func startFakeDaemon(t *testing.T, script func(fd *fakeDaemon, conn net.Conn), c
 	return fd
 }
 
-// serveAck answers the first command with a fixed ack, then runs onAck and holds
-// the connection open — which is what a daemon does while it tears itself down.
-// onAck lets a test make its stand-in actually exit, so the exit checks
-// downstream are exercised rather than short-circuited by a still-running peer.
+// sendSnapshot writes the snapshot a daemon sends first on every connection,
+// before reading anything and under a deadline, as daemons before the
+// concurrent read did. A Windows named pipe does not buffer, so there a client
+// that sends its command before reading the snapshot is never read and fails
+// instead of being answered. It reports whether the snapshot was written.
+func sendSnapshot(conn net.Conn) bool {
+	data, err := json.Marshal(ipc.Event{Type: ipc.TypeSnapshot})
+	if err != nil {
+		return false
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err = conn.Write(append(data, '\n'))
+	_ = conn.SetWriteDeadline(time.Time{})
+	return err == nil
+}
+
+// serveAck sends the snapshot, answers the first command with a fixed ack, then
+// runs onAck and holds the connection open — which is what a daemon does while
+// it tears itself down. onAck lets a test make its stand-in actually exit, so
+// the exit checks downstream are exercised rather than short-circuited by a
+// still-running peer.
 func serveAck(ack, detail string, onAck func(), generation ...uint64) func(*fakeDaemon, net.Conn) {
 	return func(_ *fakeDaemon, conn net.Conn) {
 		defer conn.Close()
+		if !sendSnapshot(conn) {
+			return
+		}
 		sc := bufio.NewScanner(conn)
 		sc.Buffer(make([]byte, 1<<16), 1<<16)
 		for sc.Scan() {
@@ -2698,9 +2696,13 @@ func serveAck(ack, detail string, onAck func(), generation ...uint64) func(*fake
 	}
 }
 
-// serveSilent accepts the connection and never answers, modelling a daemon that
-// is connected but wedged.
+// serveSilent accepts the connection, sends the snapshot and never answers,
+// modelling a daemon that is connected but wedged.
 func serveSilent(_ *fakeDaemon, conn net.Conn) {
+	if !sendSnapshot(conn) {
+		_ = conn.Close()
+		return
+	}
 	buf := make([]byte, 1)
 	for {
 		if _, err := conn.Read(buf); err != nil {
@@ -2935,6 +2937,52 @@ func TestStopDaemon_SilentPeerIsBoundedAndNotSuccess(t *testing.T) {
 	// fallback's own bounded signalling on top.
 	if elapsed > budget+5*time.Second {
 		t.Fatalf("stopDaemon took %s against a %s budget; the deadline is not enforced", elapsed, budget)
+	}
+}
+
+// TestStopDaemon_PeerWithoutSnapshotIsNotAsked pins the snapshot read that
+// precedes the shutdown request. stop reads the snapshot every daemon sends
+// first before it sends anything, so it does not stall against a daemon that
+// reads nothing until its snapshot is out. A peer that accepts the connection
+// but never sends one would not act on a request, so none is sent: stop falls
+// back to signalling the daemon directly, labelled unverified, within budget.
+func TestStopDaemon_PeerWithoutSnapshotIsNotAsked(t *testing.T) {
+	received := make(chan []byte, 1)
+	fd := startFakeDaemon(t, func(_ *fakeDaemon, conn net.Conn) {
+		defer conn.Close()
+		buf := make([]byte, 512)
+		n, _ := conn.Read(buf) // returns once the client writes or hangs up
+		received <- buf[:n]
+	})
+	dir := socketDirForTest(t)
+
+	const budget = 5 * time.Second
+	start := time.Now()
+	var err error
+	stderr := captureStderr(t, func() {
+		err = stopDaemon(fd.socketPath, filepath.Join(dir, "x.pid"), fd.pid, fd.proc.Process, false, budget)
+	})
+	elapsed := time.Since(start)
+
+	if err == nil || !strings.Contains(err.Error(), "NOT verified") {
+		t.Fatalf("stopDaemon = %v, want the direct stop labelled unverified", err)
+	}
+	if !strings.Contains(stderr, "did not send its state") {
+		t.Fatalf("stderr = %q, want the warning to say the daemon sent no snapshot", stderr)
+	}
+	if elapsed > budget+5*time.Second {
+		t.Fatalf("stopDaemon took %s against a %s budget", elapsed, budget)
+	}
+	if pidIsRunning(fd.pid) {
+		t.Fatal("the daemon stand-in is still running; the fallback did not stop it")
+	}
+	select {
+	case data := <-received:
+		if len(data) > 0 {
+			t.Fatalf("stop sent %q to a peer that never sent its snapshot", data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client never hung up")
 	}
 }
 
@@ -3437,6 +3485,18 @@ func TestUpdateNotice_EndToEndLeavesStructuredOutputIntact(t *testing.T) {
 // NO_COLOR.
 func runInteractive(t *testing.T, bin, dir string, env []string, noColor bool, args ...string) string {
 	t.Helper()
+	out, err := runInteractiveExit(t, bin, dir, env, noColor, args...)
+	if err != nil {
+		t.Fatalf("interactive %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return out
+}
+
+// runInteractiveExit is runInteractive for a command that is expected to fail:
+// it returns the combined output and the exit error instead of failing the
+// test.
+func runInteractiveExit(t *testing.T, bin, dir string, env []string, noColor bool, args ...string) (string, error) {
+	t.Helper()
 	if runtime.GOOS != "linux" {
 		t.Skip("interactive assertions require util-linux script")
 	}
@@ -3451,10 +3511,7 @@ func runInteractive(t *testing.T, bin, dir string, env []string, noColor bool, a
 		cmd.Env = append(cmd.Env, "NO_COLOR=")
 	}
 	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("interactive %s failed: %v\n%s", strings.Join(args, " "), err, out)
-	}
-	return string(out)
+	return string(out), err
 }
 
 // seedUpdateCache writes a cache entry standing in for a lookup that already
@@ -3561,11 +3618,13 @@ func TestMutationCLI_JSONValidation(t *testing.T) {
 		name, message string
 		args          []string
 		plain         bool
+		code          int // 0 means the mutation failure status, 1
 	}{
 		{name: "restart_missing_process", args: []string{"restart", "--json"}, message: "accepts 1 arg(s), received 0"},
 		{name: "restart_extra_process", args: []string{"restart", "api", "worker", "--json"}, message: "accepts 1 arg(s), received 2"},
-		{name: "restart_invalid_session", args: []string{"--session", "bad/name", "restart", "api", "--json"}, message: "invalid --session"},
-		{name: "reload_invalid_session", args: []string{"--session", "bad/name", "reload", "--json"}, message: "invalid --session"},
+		// An invalid --session is refused as on every command: exit 2.
+		{name: "restart_invalid_session", args: []string{"--session", "bad/name", "restart", "api", "--json"}, message: "invalid --session", code: 2},
+		{name: "reload_invalid_session", args: []string{"--session", "bad/name", "reload", "--json"}, message: "invalid --session", code: 2},
 		{name: "restart_no_daemon", args: []string{"restart", "api", "--json"}, message: "no proc-compose daemon running"},
 		{name: "reload_no_daemon", args: []string{"reload", "--json"}, message: "no proc-compose daemon running"},
 		{name: "restart_bad_flag", args: []string{"restart", "api", "--json", "--bogus"}, message: "unknown flag: --bogus", plain: true},
@@ -3576,8 +3635,12 @@ func TestMutationCLI_JSONValidation(t *testing.T) {
 			dir, runtimeDir := t.TempDir(), testTempDir(t)
 			args := append([]string{"--file", filepath.Join(dir, "not-created.yml")}, tc.args...)
 			stdout, stderr, code := runVerifyCLIIn(t, bin, dir, runtimeDir, args...)
-			if code != 1 {
-				t.Fatalf("exit=%d, want 1; stdout=%q stderr=%q", code, stdout, stderr)
+			want := 1
+			if tc.code != 0 {
+				want = tc.code
+			}
+			if code != want {
+				t.Fatalf("exit=%d, want %d; stdout=%q stderr=%q", code, want, stdout, stderr)
 			}
 			if tc.plain {
 				if stdout != "" || !strings.Contains(stderr, tc.message) {

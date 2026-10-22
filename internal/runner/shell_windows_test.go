@@ -2,78 +2,216 @@
 
 package runner
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/windows"
+)
+
+// shellCases is the Windows shell contract, read by both TestShellTranslation and
+// TestShellExec: a configured command, the script cmd /c runs for it, and what
+// running that script prints on Windows — or, when file is set, the bytes it
+// writes to that file. A case with fails set is malformed, and cmd reports it on
+// stderr with a non-zero exit. A case with wait set takes at least that long to
+// run, and at most sleepSlack longer.
+//
+// TestShellExec runs the commands with PORT=3000, DB_HOST=db and HOME=C:\home,
+// and with %ARGV% expanding to a program that prints each argument it receives
+// as [arg] on its own line.
+var shellCases = []struct {
+	name   string
+	cmd    string
+	script string
+	out    string
+	file   string
+	fails  bool
+	wait   time.Duration
+}{
+	{name: "plain command uses cmd", cmd: "echo hello", script: "echo hello", out: "hello\r\n"},
+	{name: "cmd env syntax is native", cmd: "echo %PORT%", script: "echo %PORT%", out: "3000\r\n"},
+	{name: "posix env remains best effort compatibility", cmd: "echo $PORT", script: "echo %PORT%", out: "3000\r\n"},
+	{name: "braced posix env remains best effort compatibility", cmd: "echo ${DB_HOST}", script: "echo %DB_HOST%", out: "db\r\n"},
+	{name: "path text is not normalized", cmd: "echo go run ./cmd/server", script: "echo go run ./cmd/server", out: "go run ./cmd/server\r\n"},
+	{name: "env var in path is best effort compatibility", cmd: "echo $HOME/bin/app", script: "echo %HOME%/bin/app", out: `C:\home/bin/app` + "\r\n"},
+	// cmd leaves an undefined variable as written.
+	{name: "cmd substitution is best effort compatibility", cmd: "echo $(date)", script: "echo %(date)%", out: "%(date)%\r\n"},
+	{name: "unbalanced substitution uses the cmd path", cmd: "echo $(date", script: "echo $(date", out: "$(date\r\n"},
+
+	// Quotes reach cmd as written, so a program receives what the C runtime's
+	// argument parser makes of them, and a command can start with a quoted path.
+	{name: "double quotes reach the program", cmd: `%ARGV% "a b" c`, script: `%ARGV% "a b" c`, out: "[a b]\n[c]\n"},
+	{name: "quoted program path runs", cmd: `"%ARGV_EXE%" -test.run=TestShellArgvHelper -- "a b"`, script: `"%ARGV_EXE%" -test.run=TestShellArgvHelper -- "a b"`, out: "[a b]\n"},
+	{name: "explicit powershell remains user command text", cmd: `powershell -NoProfile -Command "Write-Output $env:PORT"`, script: `powershell -NoProfile -Command "Write-Output $env:PORT"`, out: "3000\r\n"},
+	{name: "explicit powershell keeps its inner quotes", cmd: `powershell -NoProfile -Command "Write-Host 'hello from proc-compose'"`, script: `powershell -NoProfile -Command "Write-Host 'hello from proc-compose'"`, out: "hello from proc-compose\n"},
+
+	// Every operator is cmd's own. cmd's echo prints the space before an
+	// operator, and cmd ends each line with CRLF.
+	{name: "and command uses the cmd path", cmd: "echo a && echo b", script: "echo a && echo b", out: "a \r\nb\r\n"},
+	{name: "or command uses the cmd path", cmd: "cd nosuchdir 2>nul || echo fallback", script: "cd nosuchdir 2>nul || echo fallback", out: "fallback\r\n"},
+	{name: "piped command uses the cmd path", cmd: "echo a | findstr a", script: "echo a | findstr a", out: "a \r\n"},
+	{name: "multiple pipes use the cmd path", cmd: "echo a | findstr a | findstr a", script: "echo a | findstr a | findstr a", out: "a \r\n"},
+	{name: "mixed and and pipe uses the cmd path", cmd: "echo a && echo b | findstr b", script: "echo a && echo b | findstr b", out: "a \r\nb \r\n"},
+	{name: "mixed pipe and and uses the cmd path", cmd: "echo a | findstr a && echo c", script: "echo a | findstr a && echo c", out: "a \r\nc\r\n"},
+	{name: "mixed or and pipe uses the cmd path", cmd: "cd nosuchdir 2>nul || echo b | findstr b", script: "cd nosuchdir 2>nul || echo b | findstr b", out: "b \r\n"},
+	{name: "redirect command uses the cmd path", cmd: "echo hi > out.txt", script: "echo hi > out.txt", out: "hi \r\n", file: "out.txt"},
+	{name: "append redirect uses the cmd path", cmd: "echo a>out.txt&& echo b>>out.txt", script: "echo a>out.txt&& echo b>>out.txt", out: "a\r\nb\r\n", file: "out.txt"},
+	{name: "input redirect uses the cmd path", cmd: "echo hi>in.txt&& findstr hi < in.txt", script: "echo hi>in.txt&& findstr hi < in.txt", out: "hi\r\n"},
+	{name: "stderr redirect uses the cmd path", cmd: "echo hi 2>&1", script: "echo hi 2>&1", out: "hi \r\n"},
+
+	// The sh -c shim removes the quoting sh would, then requotes what it can.
+	{name: "sh -c drops single quotes around plain text", cmd: `sh -c "echo 'x'"`, script: "echo x", out: "x\r\n"},
+	{name: "sh -c drops double quotes around plain text", cmd: `sh -c 'echo "x"'`, script: "echo x", out: "x\r\n"},
+	{name: "sh -c unescapes quotes as sh does", cmd: `sh -c "echo \"hello\""`, script: "echo hello", out: "hello\r\n"},
+	{name: "sh -c without inner quotes is unchanged", cmd: "sh -c echo hello", script: "echo hello", out: "hello\r\n"},
+	{name: "sh -c with a quoted inner command drops only that pair", cmd: `sh -c "echo hello"`, script: "echo hello", out: "hello\r\n"},
+	{name: "sh -c still translates posix env", cmd: `sh -c "echo $PORT"`, script: "echo %PORT%", out: "3000\r\n"},
+	{name: "sh -c double quotes single-quoted text for a program", cmd: `sh -c "%ARGV% 'a b' 'c&d' x"`, script: `%ARGV% "a b" "c&d" x`, out: "[a b]\n[c&d]\n[x]\n"},
+	{name: "sh -c passes an escaped quote to a program", cmd: `sh -c '%ARGV% "say \"hi\""'`, script: `%ARGV% "say \"hi\""`, out: "[say \"hi\"]\n"},
+	// The C runtime keeps a backslash sh would drop, and $VAR is translated.
+	{name: "sh -c keeps other escapes in double quotes", cmd: `sh -c '%ARGV% "a\\b" "\$PORT"'`, script: `%ARGV% "a\\b" "\%PORT%"`, out: `[a\\b]` + "\n" + `[\3000]` + "\n"},
+	// cmd's echo prints the quotes a program would not receive.
+	{name: "sh -c echo prints the double quotes", cmd: `sh -c "echo 'a b'"`, script: `echo "a b"`, out: "\"a b\"\r\n"},
+	// cmd would expand or re-split these, so they keep their single quotes.
+	{name: "sh -c keeps single quotes around a double quote", cmd: `sh -c "%ARGV% 'say \"hi\"'"`, script: `%ARGV% 'say "hi"'`, out: "['say]\n[hi']\n"},
+	{name: "sh -c keeps single quotes around a percent sign", cmd: `sh -c "%ARGV% '%PORT%'"`, script: `%ARGV% '%PORT%'`, out: "['3000']\n"},
+	{name: "sh -c keeps single quotes around a trailing backslash", cmd: `sh -c "%ARGV% 'C:\dir\'"`, script: `%ARGV% 'C:\dir\'`, out: `['C:\dir\']` + "\n"},
+	{name: "sh -c keeps single quotes around a dollar sign", cmd: `sh -c "echo '\$PORT'"`, script: "echo '%PORT%'", out: "'3000'\r\n"},
+	{name: "sh -c with mismatched outer quotes is untouched", cmd: `sh -c "echo 'x'`, script: `"echo 'x'`, fails: true},
+	{name: "sh -c with a single quote byte is untouched", cmd: `sh -c "`, script: `"`, fails: true},
+
+	// sleep is translated wherever cmd runs it as a command. timeout /t needs a
+	// console as its input, which a managed process does not have, so the wait is
+	// ping's, in whole seconds: a fraction is rounded up.
+	{name: "sleep waits whole seconds", cmd: "sleep 1", script: "ping -n 2 127.0.0.1 >nul", wait: time.Second},
+	{name: "sleep rounds a fraction up to whole seconds", cmd: "sleep 1.5", script: "ping -n 3 127.0.0.1 >nul", wait: 2 * time.Second},
+	{name: "sleep with a zero fraction waits whole seconds", cmd: "sleep 1.0", script: "ping -n 2 127.0.0.1 >nul", wait: time.Second},
+	{name: "sleep rounds a tiny fraction up to a second", cmd: "sleep 0.0001", script: "ping -n 2 127.0.0.1 >nul", wait: time.Second},
+	{name: "sleep zero does not wait", cmd: "sleep 0", script: "ping -n 1 127.0.0.1 >nul"},
+	{name: "sleep before another command", cmd: "sleep 1 && echo done", script: "ping -n 2 127.0.0.1 >nul && echo done", out: "done\r\n", wait: time.Second},
+	{name: "sleep between commands in sh -c", cmd: `sh -c 'echo a && sleep .5 && echo b'`, script: "echo a && ping -n 2 127.0.0.1 >nul && echo b", out: "a \r\nb\r\n", wait: time.Second},
+	{name: "sleep in parentheses", cmd: "(sleep 1) && echo done", script: "(ping -n 2 127.0.0.1 >nul) && echo done", out: "done\r\n", wait: time.Second},
+	{name: "sleep as text is not translated", cmd: "echo sleep 1", script: "echo sleep 1", out: "sleep 1\r\n"},
+	// cmd has no ; operator, so this is one command whose argument sleep cannot
+	// read. It reaches cmd as written and fails, as does a number sh's sleep
+	// refuses.
+	{name: "sleep before a semicolon is not translated", cmd: "sleep 1; echo hi", script: "sleep 1; echo hi", fails: true},
+	{name: "sleep with an invalid number is not translated", cmd: "sleep 1.2.3", script: "sleep 1.2.3", fails: true},
+}
+
+// sleepSlack is how much longer than its wait a shellCases sleep may take. cmd
+// and ping start and exit around the wait, which takes under a tenth of a
+// second on an idle machine, but a CI runner can be loaded, and the other cases
+// run in parallel.
+const sleepSlack = 3 * time.Second
 
 func TestShellTranslation(t *testing.T) {
-	tests := []struct {
-		name      string
-		cmd       string
-		wantShell string
-		wantArgs  []string
-	}{
-		{"plain command uses cmd", "echo hello", "cmd", []string{"/c", "echo hello"}},
-		{"cmd env syntax is native", "echo %PORT%", "cmd", []string{"/c", "echo %PORT%"}},
-		{"posix env remains best effort compatibility", "echo $PORT", "cmd", []string{"/c", "echo %PORT%"}},
-		{"braced posix env remains best effort compatibility", "echo ${DB_HOST}", "cmd", []string{"/c", "echo %DB_HOST%"}},
-		{"path text is not normalized", "go run ./cmd/server", "cmd", []string{"/c", "go run ./cmd/server"}},
-		{"explicit powershell remains user command text", `powershell -NoProfile -Command "Write-Output $env:PORT"`, "cmd", []string{"/c", `powershell -NoProfile -Command "Write-Output $env:PORT"`}},
-		{"piped command uses existing powershell path", "cat a | grep b", "powershell", []string{"-Command", "cat a | grep b"}},
-		{"and command uses existing powershell path", "npm run dev && npm run build", "powershell", []string{"-Command", "npm run dev && npm run build"}},
-		{"redirect command uses existing powershell path", "echo hi > out.txt", "powershell", []string{"-Command", "echo hi > out.txt"}},
-		{"or command uses existing powershell path", "cmd1 || cmd2", "powershell", []string{"-Command", "cmd1 || cmd2"}},
-		{"multiple pipes use existing powershell path", "a | b | c", "powershell", []string{"-Command", "a | b | c"}},
-		{"env var in path is best effort compatibility", "$HOME/bin/app", "cmd", []string{"/c", "%HOME%/bin/app"}},
-		{"cmd substitution is best effort compatibility", "echo $(date)", "cmd", []string{"/c", "echo %(date)%"}},
-	}
-
-	for _, tt := range tests {
+	for _, tt := range shellCases {
 		t.Run(tt.name, func(t *testing.T) {
 			shell, args := shellCommand(tt.cmd)
-			if shell != tt.wantShell || !equalStringSlices(args, tt.wantArgs) {
-				t.Errorf("shellCommand(%q) = %q, %v; want %q, %v", tt.cmd, shell, args, tt.wantShell, tt.wantArgs)
+			if want := []string{"/c", tt.script}; shell != "cmd" || !slices.Equal(args, want) {
+				t.Errorf("shellCommand(%q) = %q, %q; want %q, %q", tt.cmd, shell, args, "cmd", want)
 			}
 		})
 	}
 }
 
-func equalStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
+// TestShellExec runs every shellCases command the way the runner launches it and
+// checks what cmd really does with it, so the table states cmd's behaviour and
+// not only the translation.
+func TestShellExec(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+	env := append(os.Environ(),
+		"PORT=3000", "DB_HOST=db", `HOME=C:\home`,
+		"ARGV_EXE="+exe, `ARGV="`+exe+`" -test.run=TestShellArgvHelper --`,
+		shellArgvHelperEnv+"=1")
+	for _, tt := range shellCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			dir := t.TempDir()
+			cmd := shellExec(ctx, tt.cmd)
+			cmd.Dir = dir
+			cmd.Env = env
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			start := time.Now()
+			err := cmd.Run()
+			took := time.Since(start)
+			if tt.wait > 0 {
+				t.Logf("%q took %v", tt.cmd, took)
+				if took < tt.wait || took > tt.wait+sleepSlack {
+					t.Errorf("%q took %v; want %v to %v", tt.cmd, took, tt.wait, tt.wait+sleepSlack)
+				}
+			}
+			if tt.fails {
+				if err == nil {
+					t.Errorf("%q succeeded; want a non-zero exit", tt.cmd)
+				}
+			} else if err != nil || stderr.Len() > 0 {
+				t.Fatalf("%q: %v, stderr %q", tt.cmd, err, stderr.String())
+			}
+			got := stdout.String()
+			if tt.file != "" {
+				if got != "" {
+					t.Errorf("%q printed %q; want nothing", tt.cmd, got)
+				}
+				b, err := os.ReadFile(filepath.Join(dir, tt.file))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got = string(b)
+			}
+			if got != tt.out {
+				t.Errorf("%q gave %q; want %q", tt.cmd, got, tt.out)
+			}
+		})
+	}
+}
+
+// TestShellExecKeepsCmdLineThroughSetup pins the order shellExec relies on: the
+// process group's Setup runs after it and must add its creation flag without
+// dropping the command line shellExec wrote.
+func TestShellExecKeepsCmdLineThroughSetup(t *testing.T) {
+	cmd := shellExec(context.Background(), `echo "a b"`)
+	pg := newProcessGroup()
+	defer pg.Close()
+	pg.Setup(cmd)
+	if got, want := cmd.SysProcAttr.CmdLine, `cmd /s /c "echo "a b""`; got != want {
+		t.Errorf("CmdLine = %q; want %q", got, want)
+	}
+	if cmd.SysProcAttr.CreationFlags&windows.CREATE_SUSPENDED == 0 {
+		t.Errorf("CreationFlags = %#x; want CREATE_SUSPENDED", cmd.SysProcAttr.CreationFlags)
+	}
+}
+
+const shellArgvHelperEnv = "PROC_COMPOSE_TEST_PRINT_ARGV"
+
+// TestShellArgvHelper is not a test of its own. TestShellExec runs this binary
+// through cmd, as %ARGV%, to print each argument after -- as [arg].
+func TestShellArgvHelper(t *testing.T) {
+	if os.Getenv(shellArgvHelperEnv) != "1" {
+		return
+	}
+	for i, arg := range os.Args {
+		if arg == "--" {
+			for _, a := range os.Args[i+1:] {
+				fmt.Printf("[%s]\n", a)
+			}
+			break
 		}
 	}
-	return true
-}
-
-func TestNeedsPowerShell(t *testing.T) {
-	tests := []struct {
-		cmd  string
-		want bool
-	}{
-		{"echo hello", false},
-		{"echo $PORT", false},
-		{"echo ${VAR}", false},
-		{`powershell -NoProfile -Command "Write-Output $env:PORT"`, false},
-		{"cat a | grep b", true},
-		{"cmd && other", true},
-		{"cmd || other", true},
-		{"echo hi > out.txt", true},
-		{"echo hi 2>&1", true},
-		{"$(echo $(date))", false},
-		{"$(cmd)", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.cmd, func(t *testing.T) {
-			got := needsPowerShell(tt.cmd)
-			if got != tt.want {
-				t.Errorf("needsPowerShell(%q) = %v; want %v", tt.cmd, got, tt.want)
-			}
-		})
-	}
+	os.Exit(0)
 }
 
 func TestTranslateToCMD(t *testing.T) {

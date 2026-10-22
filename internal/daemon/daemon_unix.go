@@ -26,6 +26,17 @@ func IsAlive(pid int) bool {
 	return proc.Signal(syscall.Signal(0)) == nil
 }
 
+// IsRunning is IsAlive without the exited processes it counts: a zombie still
+// answers signal 0. Off Linux, where no process state can be read, it is
+// IsAlive.
+func IsRunning(pid int) bool {
+	if !IsAlive(pid) {
+		return false
+	}
+	info, err := ProcStat(pid)
+	return err != nil || !ExitedState(info.State)
+}
+
 // StopProcess sends SIGTERM to the given process for graceful shutdown.
 func StopProcess(proc *os.Process) error {
 	return proc.Signal(syscall.SIGTERM)
@@ -98,6 +109,23 @@ func ProcStat(pid int) (ProcInfo, error) {
 		return ProcInfo{}, fmt.Errorf("unexpected /proc/%d/stat starttime: %w", pid, err)
 	}
 	return ProcInfo{State: rest[0][0], PGID: pgid, StartTime: start}, nil
+}
+
+// syncDirectory flushes a directory's entries so the ones created inside it —
+// such as the rename that installs an atomically written file — survive a
+// machine-level failure. Not every filesystem supports flushing a directory;
+// the caller discards the error, so an unsupported platform only loses the
+// extra durability, never the write.
+//
+// A slow directory flush is possible too (NFS and FUSE mounts): swallowing
+// errors does not bound that latency.
+func syncDirectory(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // HostIdentity returns the current boot id and the pid and time namespaces of

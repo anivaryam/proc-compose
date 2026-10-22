@@ -7,7 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -15,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -28,6 +33,8 @@ import (
 	"github.com/anivaryam/proc-compose/internal/config"
 	"github.com/anivaryam/proc-compose/internal/daemon"
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/paths"
+	"github.com/anivaryam/proc-compose/internal/session"
 )
 
 func TestRestart_RecoversFailedServiceInLiveDaemon(t *testing.T) {
@@ -286,14 +293,12 @@ const helperSentinel = "__PROC_COMPOSE_TEST_HELPER__"
 
 // helperCmd builds a shell command that re-invokes this test binary in
 // helper mode. Args are base64-encoded into a single shell-safe token so
-// quoting hell across sh, cmd, PowerShell, and Go's exec-arg escaping
-// never matters.
+// quoting across sh and cmd never matters.
 func helperCmd(args ...string) string {
 	payload := base64.RawURLEncoding.EncodeToString([]byte(strings.Join(args, "\x00")))
 	if runtime.GOOS == "windows" {
-		// Leave path bare on Windows: Go's CreateProcess arg escaping
-		// turns any quotes we add into literal \" inside cmd /c.
-		// CI temp paths have no spaces.
+		// Leave path bare on Windows: posixQuote's single quotes mean
+		// nothing to cmd. CI temp paths have no spaces.
 		return os.Args[0] + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel + " " + payload
 	}
 	return posixQuote(os.Args[0]) + " -test.run=^TestRunnerHelperProcess$ -- " + helperSentinel + " " + payload
@@ -321,11 +326,8 @@ func serviceHelperCmd(args ...string) string {
 // forked shell holding the pipe and EOF would not arrive until the command had
 // already finished.
 //
-// It is also placed inside a script rather than inline in the command string.
-// Windows shell selection routes any command containing a redirection operator to
-// PowerShell, where a null redirect is not the same syntax at all; keeping the
-// operators out of the configured command means the shell decision is made on the
-// command alone, which is what the product does for real configurations.
+// It is also placed inside a script rather than inline in the command string, so
+// the configured command stays a plain invocation on every platform.
 func discardOutputScript(t *testing.T, command string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -525,6 +527,59 @@ func TestRunnerHelperProcess(t *testing.T) {
 		}
 		_, _ = os.Stdout.WriteString(args[1] + "\n")
 		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	case "fail-once-ready":
+		// fail-once-ready <marker> <line>: the first incarnation fails
+		// before it is ready (exit 1) and every later incarnation prints
+		// <line> and stays alive. It models a dependency the restart policy
+		// retries, so a dependent must wait for the second incarnation
+		// instead of being failed by the first one's failure.
+		if len(args) != 3 {
+			os.Exit(2)
+		}
+		if _, err := os.Stat(args[1]); os.IsNotExist(err) {
+			if err := os.WriteFile(args[1], []byte("failed"), 0o644); err != nil {
+				os.Exit(2)
+			}
+			os.Exit(1)
+		}
+		_, _ = os.Stdout.WriteString(args[2] + "\n")
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	case "lifecycle-stamps":
+		// lifecycle-stamps <file> <sleeps>: record the start and the end of
+		// every incarnation in <file>, one "start <unixnano>" and one
+		// "end <unixnano>" line each. <sleeps> is a comma-separated list of
+		// durations, one per incarnation; the last one repeats.
+		//
+		// The stamps make the restart backoff observable without a timing
+		// loop: the wait between two incarnations is the distance from the
+		// previous incarnation's end to the next one's start.
+		if len(args) != 3 {
+			os.Exit(2)
+		}
+		sleeps := strings.Split(args[2], ",")
+		index := 0
+		if data, err := os.ReadFile(args[1]); err == nil {
+			index = strings.Count(string(data), "start ")
+		}
+		delay, err := time.ParseDuration(sleeps[min(index, len(sleeps)-1)])
+		if err != nil {
+			os.Exit(2)
+		}
+		record := func(kind string) {
+			f, err := os.OpenFile(args[1], os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				os.Exit(2)
+			}
+			fmt.Fprintf(f, "%s %d\n", kind, time.Now().UnixNano())
+			f.Close()
+		}
+		record("start")
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		record("end")
 		os.Exit(0)
 	case "quiet-loop":
 		// quiet-loop <pidfile> <ready> <release>: record the PID, close both
@@ -1086,6 +1141,517 @@ func TestRun_DependsOn_FailedDependency(t *testing.T) {
 	if !strings.Contains(err.Error(), "app") {
 		t.Errorf("expected error to mention 'app', got: %v", err)
 	}
+}
+
+// TestRun_DependsOn_RestartedDependencyDoesNotFailDependent is the regression
+// for the readiness latch that could not tell "the dependency failed" from
+// "the dependency's incarnation ended and another one follows".
+//
+// The dependency fails once before it is ready and the restart policy retries
+// it, so it becomes ready on its second incarnation. The dependent must start
+// instead of being failed by the first incarnation's failure.
+func TestRun_DependsOn_RestartedDependencyDoesNotFailDependent(t *testing.T) {
+	dir := t.TempDir()
+	failureMarker := filepath.Join(dir, "db-failed-once")
+	appMarker := filepath.Join(dir, "app-started")
+
+	r := makeRunner(map[string]config.Process{
+		"db": {
+			Cmd:       helperCmd("fail-once-ready", failureMarker, "READY"),
+			Restart:   "on-failure",
+			ReadyWhen: &config.ReadyWhen{Log: "READY"},
+		},
+		"app": {
+			Cmd:       helperCmd("touch-block", appMarker),
+			Restart:   "never",
+			DependsOn: []string{"db"},
+		},
+	})
+	journal := &synchronizedBuffer{}
+	r.Journal = journal
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	waitForFilePresent(t, appMarker, 30*time.Second)
+	if got := snapshotOf(r, "app"); got.State != "running" {
+		t.Fatalf("dependent state = %q, want running", got.State)
+	}
+	if got := snapshotOf(r, "db"); got.State != "running" || !got.Ready {
+		t.Fatalf("dependency state = %q ready=%t, want running and ready", got.State, got.Ready)
+	}
+	if strings.Contains(journal.String(), "dependency.failed") {
+		t.Fatalf("a restarted dependency was reported as a dependency failure:\n%s", journal.String())
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run reported %v, want no failure", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("runner did not stop after cancel")
+	}
+}
+
+// TestRun_DependsOn_TerminallyFailedDependencyStillFailsDependent pins the
+// other half of the contract: a dependency whose lifecycle is over — here
+// because it reached max_restarts — must still fail its dependent.
+func TestRun_DependsOn_TerminallyFailedDependencyStillFailsDependent(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"db": {
+			Cmd:         helperCmd("exit", "1"),
+			Restart:     "on-failure",
+			MaxRestarts: 1,
+			// The dependency never becomes ready, so the dependent is still
+			// waiting when the dependency's lifecycle ends.
+			ReadyWhen: &config.ReadyWhen{Log: "READY"},
+		},
+		"app": {
+			Cmd:       helperCmd("log", "should-not-run"),
+			Restart:   "never",
+			DependsOn: []string{"db"},
+		},
+	})
+	journal := &synchronizedBuffer{}
+	r.Journal = journal
+
+	err := r.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected a non-nil error when the dependency reached max_restarts, got nil")
+	}
+	if !strings.Contains(err.Error(), "app") {
+		t.Fatalf("error = %v, want it to name the dependent", err)
+	}
+	if !strings.Contains(journal.String(), "dependency.failed") {
+		t.Fatalf("no dependency.failed event was logged:\n%s", journal.String())
+	}
+	if got := snapshotOf(r, "app"); got.State != "failed" {
+		t.Fatalf("dependent state = %q, want failed", got.State)
+	}
+}
+
+// TestRun_DependsOn_EndlessRestartDoesNotStrandDependent pins that a
+// dependency which restarts forever cannot strand its dependent: while the
+// dependency keeps restarting the dependent waits (it is not failed), and the
+// cancellation ends the dependent in a terminal state.
+func TestRun_DependsOn_EndlessRestartDoesNotStrandDependent(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"db": {
+			Cmd:     helperCmd("exit", "1"),
+			Restart: "always",
+			// The dependency never becomes ready, so the dependent keeps
+			// waiting for a readiness only a later cycle could carry.
+			ReadyWhen: &config.ReadyWhen{Log: "READY"},
+		},
+		"app": {
+			Cmd:       helperCmd("log", "should-not-run"),
+			Restart:   "never",
+			DependsOn: []string{"db"},
+		},
+	})
+	journal := &synchronizedBuffer{}
+	r.Journal = journal
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	// The dependency restarts; the dependent must still be waiting.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if snapshotOf(r, "db").Restarts >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the dependency never restarted: %+v", snapshotOf(r, "db"))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := snapshotOf(r, "app"); got.State != "starting" {
+		t.Fatalf("dependent state = %q while its dependency restarted, want starting (waiting)", got.State)
+	}
+	if strings.Contains(journal.String(), "dependency.failed") {
+		t.Fatalf("a restarting dependency was reported as a dependency failure:\n%s", journal.String())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runner did not stop after cancel")
+	}
+	if got := snapshotOf(r, "app"); got.State != "exited" {
+		t.Fatalf("dependent state = %q after the cancellation, want exited", got.State)
+	}
+}
+
+// TestRun_DependsOn_StoppedStackEndsDependentExited is the regression for the
+// dependent that never left "starting": a stack that is stopped while the
+// dependent waits must leave it in the terminal state "exited", the value the
+// sibling path uses, and must not report a dependency failure.
+func TestRun_DependsOn_StoppedStackEndsDependentExited(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"db": {
+			Cmd:       helperCmd("log-block", "not-ready"),
+			Restart:   "never",
+			ReadyWhen: &config.ReadyWhen{Log: "NEVER-MATCHES"},
+		},
+		"app": {
+			Cmd:       helperCmd("log", "should-not-run"),
+			Restart:   "never",
+			DependsOn: []string{"db"},
+		},
+	})
+	journal := &synchronizedBuffer{}
+	r.Journal = journal
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	// The dependent is waiting for a dependency that never becomes ready.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if snapshotOf(r, "app").State == "starting" && snapshotOf(r, "db").State == "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the dependent never started waiting: %+v", snapshotOf(r, "app"))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run reported %v, want no failure for an operator-requested stop", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("runner did not stop after cancel")
+	}
+
+	if got := snapshotOf(r, "app"); got.State != "exited" {
+		t.Fatalf("dependent state = %q after the stop, want exited", got.State)
+	}
+	events := journal.String()
+	if strings.Contains(events, "dependency.failed") {
+		t.Fatalf("a shutdown was reported as a dependency failure:\n%s", events)
+	}
+	if !strings.Contains(events, `"code":"process.stopped"`) {
+		t.Fatalf("no process.stopped event was logged for the dependent:\n%s", events)
+	}
+}
+
+// TestRun_DependsOn_TerminalDependencyStillFailsDependentOnStop pins that a
+// dependency that genuinely failed still fails its dependent even when the
+// stack is stopped at the same time: the dependency's disposition is published
+// with its own terminal transition, so the dependent's gate cannot miss it.
+func TestRun_DependsOn_TerminalDependencyStillFailsDependentOnStop(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"db": {
+			Cmd:     helperCmd("exit", "1"),
+			Restart: "never",
+			// The dependency never becomes ready, so the dependent is still
+			// waiting when the dependency fails.
+			ReadyWhen: &config.ReadyWhen{Log: "READY"},
+		},
+		"app": {
+			Cmd:       helperCmd("log", "should-not-run"),
+			Restart:   "never",
+			DependsOn: []string{"db"},
+		},
+	})
+	journal := &synchronizedBuffer{}
+	r.Journal = journal
+
+	err := r.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected a non-nil error when the dependency failed, got nil")
+	}
+	if !strings.Contains(journal.String(), "dependency.failed") {
+		t.Fatalf("no dependency.failed event was logged:\n%s", journal.String())
+	}
+	if got := snapshotOf(r, "app"); got.State != "failed" {
+		t.Fatalf("dependent state = %q, want failed", got.State)
+	}
+}
+
+// TestNextBackoff_SequenceReachesTheDocumentedCeiling pins the one restart
+// backoff step both restart paths use: the wait doubles and is clamped to the
+// documented ceiling of 30 seconds, so the reachable sequence is exactly
+// 1, 2, 4, 8, 16, 30, 30 seconds and no reachable gap exceeds 30 seconds.
+func TestNextBackoff_SequenceReachesTheDocumentedCeiling(t *testing.T) {
+	want := []time.Duration{
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		30 * time.Second,
+		30 * time.Second,
+	}
+	cur := time.Second
+	for i, w := range want {
+		if i > 0 {
+			cur = nextBackoff(cur)
+		}
+		if cur != w {
+			t.Fatalf("backoff step %d = %s, want %s", i, cur, w)
+		}
+		if cur > 30*time.Second {
+			t.Fatalf("backoff step %d = %s, want no gap above the 30s ceiling", i, cur)
+		}
+	}
+}
+
+// TestRun_RestartAlwaysBacksOff pins that the `restart: always` path applies
+// the same clamped backoff as the failure path: the wait after the first
+// restart doubles instead of staying at one second.
+//
+// The measured gap also carries the incarnation's teardown and the next
+// process's startup, so what the test pins is the growth of the gap: the
+// second wait is a second longer than the first. The exact sequence is pinned
+// by the nextBackoff unit test.
+func TestRun_RestartAlwaysBacksOff(t *testing.T) {
+	dir := t.TempDir()
+	stamps := filepath.Join(dir, "stamps")
+
+	r := makeRunner(map[string]config.Process{
+		"always": {Cmd: helperCmd("lifecycle-stamps", stamps, "0s"), Restart: "always"},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	waits := waitForRestartWaits(t, stamps, 2, 30*time.Second)
+	if growth := waits[1] - waits[0]; growth < 800*time.Millisecond {
+		t.Fatalf("the second restart wait grew by %s over the first (%s then %s), want the doubled backoff", growth, waits[0], waits[1])
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runner did not stop after cancel")
+	}
+}
+
+// TestRun_RestartAlwaysResetsBackoffAfterALongIncarnation pins that an
+// incarnation that outlived the current backoff still restarts after about a
+// second: the backoff is reset to one second, so the wait does not keep
+// growing while the process is healthy.
+//
+// The measured gap also carries the incarnation's teardown and the next
+// process's startup, so what the test pins is that the gap does not grow:
+// without the reset the second wait would be a second longer than the first.
+func TestRun_RestartAlwaysResetsBackoffAfterALongIncarnation(t *testing.T) {
+	dir := t.TempDir()
+	stamps := filepath.Join(dir, "stamps")
+
+	// The first incarnation ends at once, so the backoff grows to two
+	// seconds; the second one lives three seconds, which outlives it and
+	// resets the backoff to one second.
+	r := makeRunner(map[string]config.Process{
+		"always": {Cmd: helperCmd("lifecycle-stamps", stamps, "0s,3s"), Restart: "always"},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	waits := waitForRestartWaits(t, stamps, 2, 30*time.Second)
+	if growth := waits[1] - waits[0]; growth > 400*time.Millisecond {
+		t.Fatalf("the restart wait grew by %s after a long incarnation (%s then %s), want the reset to about 1s", growth, waits[0], waits[1])
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runner did not stop after cancel")
+	}
+}
+
+// TestRun_StopEndsTheRestartBackoff is the regression for a stop that waited
+// out the restart backoff. The `restart: always` path slept through it, so
+// once the backoff had grown a stop took up to 30 seconds; the failure path
+// returned at once but left the process in "restarting".
+//
+// Both restart paths must end the wait at once and leave the process in the
+// terminal state "exited" with a process.stopped event, and a dependent still
+// waiting for it must end as stopped, not failed. The stop lands in the second
+// restart's two-second wait, so a wait that ignored it would hold Run open for
+// about two seconds.
+func TestRun_StopEndsTheRestartBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		proc config.Process
+	}{
+		{"clean exit under restart always", config.Process{Cmd: helperCmd("exit", "0"), Restart: "always"}},
+		{"failure under restart on-failure", config.Process{Cmd: helperCmd("exit", "1"), Restart: "on-failure"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			svc := tc.proc
+			// Never ready, so the dependent is still waiting at the stop.
+			svc.ReadyWhen = &config.ReadyWhen{Log: "NEVER-MATCHES"}
+			r := makeRunner(map[string]config.Process{
+				"svc": svc,
+				"app": {Cmd: helperCmd("log", "should-not-run"), Restart: "never", DependsOn: []string{"svc"}},
+			})
+			journal := &synchronizedBuffer{}
+			r.Output, r.Journal = io.Discard, journal
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- r.Run(ctx) }()
+
+			inSecondWait := func(s ipc.ProcState) bool { return s.Restarts >= 2 && s.State == "restarting" }
+			if !waitForProcState(t, r, "svc", inSecondWait, 20*time.Second) {
+				t.Fatalf("svc never reached its second restart wait: %+v", snapshotOf(r, "svc"))
+			}
+			stopped := time.Now()
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("Run = %v, want no failure for an operator-requested stop", err)
+				}
+			case <-time.After(20 * time.Second):
+				t.Fatal("runner did not stop after cancel")
+			}
+			if took := time.Since(stopped); took > time.Second {
+				t.Fatalf("Run returned %s after the stop, want the restart backoff to end at once", took)
+			}
+
+			if got := snapshotOf(r, "svc"); got.State != "exited" {
+				t.Fatalf("svc state = %q after a stop during its restart backoff, want exited", got.State)
+			}
+			if got := snapshotOf(r, "app"); got.State != "exited" {
+				t.Fatalf("dependent state = %q after the stop, want exited", got.State)
+			}
+			var last string
+			for _, event := range journalEvents(t, bytes.NewBufferString(journal.String())) {
+				if event.Code == "dependency.failed" {
+					t.Fatalf("a stop was reported as a dependency failure: %+v", event)
+				}
+				if event.Process == "svc" && event.Code != "" {
+					last = event.Code
+				}
+			}
+			if last != "process.stopped" {
+				t.Fatalf("svc's last event = %q, want process.stopped", last)
+			}
+		})
+	}
+}
+
+// TestRun_RestartRequestEndsTheRestartAlwaysBackoff pins that a restart
+// requested while a `restart: always` process waits out its backoff skips the
+// wait, as it does on the failure path. The request used to stay queued until
+// the backoff ran out and then cancelled the incarnation that had just
+// started, so the requested restart came late and replaced the wrong
+// incarnation.
+func TestRun_RestartRequestEndsTheRestartAlwaysBackoff(t *testing.T) {
+	stamps := filepath.Join(t.TempDir(), "stamps")
+	// Two incarnations end at once, so the second wait is two seconds; the
+	// third one stays up.
+	r := makeRunner(map[string]config.Process{
+		"svc": {Cmd: helperCmd("lifecycle-stamps", stamps, "0s,0s,30s"), Restart: "always"},
+	})
+	r.Output = io.Discard
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	inSecondWait := func(s ipc.ProcState) bool { return s.Restarts >= 2 && s.State == "restarting" }
+	if !waitForProcState(t, r, "svc", inSecondWait, 20*time.Second) {
+		t.Fatalf("svc never reached its second restart wait: %+v", snapshotOf(r, "svc"))
+	}
+	if result := r.requestRestart(r.store.Load().get("svc")); result.Status != "ok" {
+		t.Fatalf("restart request = %+v, want ok", result)
+	}
+
+	waits := waitForRestartWaits(t, stamps, 2, 20*time.Second)
+	if waits[1] >= waits[0] {
+		t.Fatalf("the requested restart waited %s, longer than the first one-second wait (%s): the backoff was not skipped", waits[1], waits[0])
+	}
+	if !waitForProcState(t, r, "svc", func(s ipc.ProcState) bool { return s.State == "running" }, 20*time.Second) {
+		t.Fatalf("the requested incarnation never ran: %+v", snapshotOf(r, "svc"))
+	}
+	if got := snapshotOf(r, "svc").Restarts; got != 2 {
+		t.Fatalf("restarts = %d, want 2: the request during the wait replaced no further incarnation", got)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("runner did not stop after cancel")
+	}
+}
+
+// waitForRestartWaits waits until the stamp file records at least count
+// incarnations and returns the waits between them: the distance from one
+// incarnation's end to the next one's start.
+func waitForRestartWaits(t *testing.T, path string, count int, timeout time.Duration) []time.Duration {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		waits := restartWaits(t, path)
+		if len(waits) >= count {
+			return waits
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %s waiting for %d restart waits (%d recorded)", timeout, count, len(waits))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// restartWaits reads the incarnation stamps and returns the wait between each
+// pair of consecutive incarnations.
+func restartWaits(t *testing.T, path string) []time.Duration {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var starts, ends []time.Time
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		ns, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch fields[0] {
+		case "start":
+			starts = append(starts, time.Unix(0, ns))
+		case "end":
+			ends = append(ends, time.Unix(0, ns))
+		}
+	}
+	var waits []time.Duration
+	for i := 0; i+1 < len(starts) && i < len(ends); i++ {
+		waits = append(waits, starts[i+1].Sub(ends[i]))
+	}
+	return waits
 }
 
 func TestRun_ReadyWhen_Log(t *testing.T) {
@@ -2163,8 +2729,7 @@ func TestServeHealth_FailedTaskIsUnhealthy(t *testing.T) {
 
 	st := store.get("migrate")
 	st.state = "failed"
-	st.readyClosed = true
-	st.readyOK = false
+	st.markReady(false)
 
 	go r.serveHealth(ln, store)
 
@@ -2531,8 +3096,7 @@ func TestReload_SkipsCompletedTaskRestart(t *testing.T) {
 	// Simulate task completing
 	st := store.get("migrate")
 	st.state = "completed"
-	st.readyClosed = true
-	st.readyOK = true
+	st.markReady(true)
 
 	// Change config - modify the cmd
 	newCfg := *cfg
@@ -3000,75 +3564,6 @@ func (g *uncontainedProcessGroup) Seal() (SealObservation, error) {
 }
 func (g *uncontainedProcessGroup) Close() error { return nil }
 
-// startTrackedGroup starts cmdStr in its own process group and returns the
-// concrete group plus the Cmd, so a test can drive the group's own mutex. The
-// Cmd's process is registered for cleanup immediately after creation, before any
-// assertion, so no path leaks it.
-func startTrackedGroup(t *testing.T, cmdStr string) (ProcessGroup, *exec.Cmd) {
-	t.Helper()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
-	pg := newProcessGroup()
-	pg.Setup(cmd)
-	if err := cmd.Start(); err != nil {
-		cancel()
-		t.Fatalf("start: %v", err)
-	}
-	if err := pg.Track(cmd); err != nil {
-		cancel()
-		t.Fatalf("track: %v", err)
-	}
-	t.Cleanup(func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			// Reap it. A zombie leader keeps its process-group ID allocated,
-			// which both leaks the fixture and makes the group probe keep
-			// succeeding for a group nothing is running in.
-			_, _ = cmd.Process.Wait()
-		}
-		cancel()
-		_ = pg.Close()
-	})
-	return pg, cmd
-}
-
-// startGroupWithSurvivor starts cmdStr in its own process group and returns the
-// group, the Cmd, and the descendant's PID. It blocks until the descendant has
-// recorded its PID, so the caller never observes the group mid-fork.
-//
-// The Cmd's process is registered for cleanup immediately after creation, before
-// the wait, so no path leaks it.
-func startGroupWithSurvivor(t *testing.T, cmdStr, pidFile string) (ProcessGroup, *exec.Cmd, int) {
-	t.Helper()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
-	pg := newProcessGroup()
-	pg.Setup(cmd)
-	if err := cmd.Start(); err != nil {
-		cancel()
-		t.Fatalf("start: %v", err)
-	}
-	if err := pg.Track(cmd); err != nil {
-		cancel()
-		t.Fatalf("track: %v", err)
-	}
-	t.Cleanup(func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		cancel()
-		_ = pg.Close()
-	})
-
-	descendant, ok := waitForPIDFile(t, pidFile, 20*time.Second)
-	if !ok {
-		t.Fatal("descendant never recorded its PID; the fixture proves nothing")
-	}
-	return pg, cmd, descendant
-}
-
 // TestShutdown_ForceKillsManagedProcessGroupWithoutGrace proves the forced path
 // skips the graceful wait and still verifies termination: the group is killed up
 // front, but it stays registered so the final sweep can confirm the kill.
@@ -3175,8 +3670,11 @@ type gatedSealGroup struct {
 	mu          sync.Mutex
 	signalStart chan struct{}
 	signalGate  chan struct{}
+	signalOnce  sync.Once
 	sealed      bool
 	closed      bool
+	terminated  int
+	killed      int
 }
 
 func (g *gatedSealGroup) Setup(_ *exec.Cmd)       {}
@@ -3187,11 +3685,26 @@ func (g *gatedSealGroup) Terminate() error {
 	if g.sealed {
 		return os.ErrProcessDone
 	}
-	close(g.signalStart)
+	// The sweep force-kills the group before it seals it, so this group can be
+	// signalled twice: once by the signal that is already in flight, and once
+	// by the sweep's forced kill. Announcing the start of a signal must
+	// therefore happen only once.
+	g.signalOnce.Do(func() { close(g.signalStart) })
 	<-g.signalGate
+	g.terminated++
 	return nil
 }
-func (g *gatedSealGroup) Kill() error       { return g.Terminate() }
+func (g *gatedSealGroup) Kill() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.sealed {
+		return os.ErrProcessDone
+	}
+	g.signalOnce.Do(func() { close(g.signalStart) })
+	<-g.signalGate
+	g.killed++
+	return nil
+}
 func (g *gatedSealGroup) State() GroupState { return GroupOwned }
 func (g *gatedSealGroup) Identify() string  { return "gated" }
 func (g *gatedSealGroup) Withdraw() {
@@ -3212,6 +3725,10 @@ func (g *gatedSealGroup) Close() error { _, err := g.Seal(); return err }
 // shared-runner boundary: a signal already holding the group lock completes
 // before sealing returns, and sealing an owned group remains a failed verdict
 // even while its independent reap is still blocked.
+//
+// The sweep force-kills the still-owned group before it seals it, so the group
+// is signalled twice: the signal that is already in flight, and the sweep's
+// forced kill, which waits behind it.
 func TestRunnerSweep_SealWaitsForSignalAndPreservesUnverifiedResult(t *testing.T) {
 	r := &Runner{}
 	pg := &gatedSealGroup{signalStart: make(chan struct{}), signalGate: make(chan struct{})}
@@ -3247,6 +3764,15 @@ func TestRunnerSweep_SealWaitsForSignalAndPreservesUnverifiedResult(t *testing.T
 	case <-time.After(time.Second):
 		t.Fatal("seal did not finish after the in-flight signal completed")
 	}
+	pg.mu.Lock()
+	terminated, killed := pg.terminated, pg.killed
+	pg.mu.Unlock()
+	if killed != 1 {
+		t.Fatalf("forced kills sent by the sweep = %d, want exactly 1", killed)
+	}
+	if terminated != 1 {
+		t.Fatalf("graceful signals = %d, want only the one that was already in flight", terminated)
+	}
 	if err := r.ShutdownResult(); err == nil || !strings.Contains(err.Error(), "could not terminate") {
 		t.Fatalf("shutdown verdict = %v, want owned group reported unverified", err)
 	}
@@ -3260,6 +3786,182 @@ func TestRunnerSweep_SealWaitsForSignalAndPreservesUnverifiedResult(t *testing.T
 		t.Fatal("seal did not close the group")
 	}
 	reapRelease()
+}
+
+// countingSealGroup counts the signals the sweep sends to a still-owned
+// group.
+type countingSealGroup struct {
+	mu         sync.Mutex
+	terminated int
+	killed     int
+}
+
+func (g *countingSealGroup) Setup(_ *exec.Cmd)       {}
+func (g *countingSealGroup) Track(_ *exec.Cmd) error { return nil }
+
+func (g *countingSealGroup) Terminate() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.terminated++
+	return nil
+}
+
+func (g *countingSealGroup) Kill() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.killed++
+	return nil
+}
+
+func (g *countingSealGroup) State() GroupState { return GroupOwned }
+func (g *countingSealGroup) Identify() string  { return "counted" }
+func (g *countingSealGroup) Withdraw()         {}
+
+func (g *countingSealGroup) Seal() (SealObservation, error) {
+	return SealObservation{State: GroupOwned, Identity: "counted"}, nil
+}
+
+func (g *countingSealGroup) Close() error { return nil }
+
+// TestRunnerSweep_ForceKillsTheStillOwnedGroup pins the sweep's contract: it
+// terminates every still-tracked process group before it seals it.
+//
+// Sealing withdraws signalling authority, so a group that is sealed while it
+// still has live members is never signalled again — the escalation is skipped,
+// not refused. The sweep therefore force-kills the group while the authority
+// is still held, and it does so exactly once and without a graceful signal
+// first: the budget the sweep runs under is already spent.
+func TestRunnerSweep_ForceKillsTheStillOwnedGroup(t *testing.T) {
+	r := &Runner{}
+	pg := &countingSealGroup{}
+	r.trackGroup("counted", pg, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.sweepGroups(ctx)
+
+	pg.mu.Lock()
+	terminated, killed := pg.terminated, pg.killed
+	pg.mu.Unlock()
+	if killed != 1 {
+		t.Fatalf("forced kills sent to a still-owned group = %d, want exactly 1", killed)
+	}
+	if terminated != 0 {
+		t.Fatalf("graceful signals sent to a still-owned group = %d, want none", terminated)
+	}
+}
+
+// unenumerableGroup models a process group whose membership cannot be
+// enumerated: it reports GroupUnavailable until the sweep's forced kill has
+// emptied it.
+type unenumerableGroup struct {
+	mu      sync.Mutex
+	killed  int
+	drained bool
+}
+
+func (g *unenumerableGroup) Setup(_ *exec.Cmd)       {}
+func (g *unenumerableGroup) Track(_ *exec.Cmd) error { return nil }
+func (g *unenumerableGroup) Terminate() error        { return nil }
+
+func (g *unenumerableGroup) Kill() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.killed++
+	g.drained = true
+	return nil
+}
+
+func (g *unenumerableGroup) State() GroupState {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.drained {
+		return GroupEmpty
+	}
+	return GroupUnavailable
+}
+
+func (g *unenumerableGroup) Identify() string { return "unenumerable" }
+func (g *unenumerableGroup) Withdraw()        {}
+
+func (g *unenumerableGroup) Seal() (SealObservation, error) {
+	return SealObservation{State: g.State(), Identity: g.Identify()}, nil
+}
+
+func (g *unenumerableGroup) Close() error { return nil }
+
+// TestRunnerSweep_ForceKillsTheGroupWithUnknownMembership pins the sweep's
+// kill gate: signalling authority decides, not membership.
+//
+// A group whose members cannot be enumerated reports GroupUnavailable. It is
+// not empty, so it is still killed — sealing it without a kill would withdraw
+// the signalling authority and let the tree survive the sweep, which is the
+// defect class the cleanup handoff exists to prevent. The kill happens exactly
+// once.
+func TestRunnerSweep_ForceKillsTheGroupWithUnknownMembership(t *testing.T) {
+	r := &Runner{}
+	pg := &unenumerableGroup{}
+	r.trackGroup("unenumerable", pg, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.sweepGroups(ctx)
+
+	pg.mu.Lock()
+	killed := pg.killed
+	pg.mu.Unlock()
+	if killed != 1 {
+		t.Fatalf("forced kills sent to a group with unknown membership = %d, want exactly 1", killed)
+	}
+}
+
+// TestRunnerCleanupHandoff_SweepTerminatesTheStubbornTree is the end-to-end
+// regression for the cleanup-handoff sweep: a managed tree that ignores
+// SIGTERM must not outlive the shutdown meant to stop it.
+//
+// The handoff path is the one that matters. The sweep runs while the worker is
+// still inside its own teardown, and the sweep is what seals the group. Before
+// the fix the sweep only sealed, and sealing withdraws signalling authority —
+// so the worker's own escalation was skipped rather than refused, and the tree
+// survived the shutdown.
+func TestRunnerCleanupHandoff_SweepTerminatesTheStubbornTree(t *testing.T) {
+	if !ignoresTermination() {
+		t.Skip("Windows has no SIGTERM for console apps; termination is Job Object based")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "descendant.pid")
+	stubborn := writeScript(t, dir, "stubborn.sh", stubbornScript)
+	stay := writeScript(t, dir, "stay.sh", stayScript)
+
+	r := makeRunner(map[string]config.Process{
+		"worker": {
+			Cmd: stay + " " + stubborn + " " + pidFile,
+			// Long enough that only the sweep's forced kill can end the tree in
+			// the handoff budget.
+			ShutdownTimeout: 1,
+			Restart:         "never",
+		},
+	})
+	r.CleanupHandoffTimeout = 200 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	descendant, ok := waitForPIDFile(t, pidFile, 20*time.Second)
+	if !ok {
+		cancel()
+		t.Fatal("descendant never recorded its PID; the fixture proves nothing")
+	}
+	trackProcessForCleanup(t, descendant, "descendant")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return after the cleanup handoff")
+	}
+	assertTerminated(t, descendant, "descendant", 10*time.Second)
 }
 
 // TestShutdown_ReportsSurvivorItCannotTerminate covers the reporting
@@ -3688,6 +4390,81 @@ func TestShutdown_IPCPathReleasesTheAckBarrier(t *testing.T) {
 			"held (flush timeout is %s)", elapsed, shutdownFlushTimeout)
 	}
 	assertTerminated(t, pid, "svc", 15*time.Second)
+}
+
+// TestShutdown_UndeliveredVerdictIsJournaled is the #31 consumer regression.
+// The client that asked for the shutdown is gone before its verdict can be
+// written. The server reports the failed write through WaitFlushed, and the
+// runner records the verdict in the event journal as
+// shutdown.verdict_undelivered, the only place it is still found. It used to
+// be released exactly as for a delivered verdict, and nothing recorded that
+// the client never saw it. Run still exits without waiting out the barrier's
+// timeout.
+//
+// The command is queued and its client closed before Run starts, so the ack
+// write is certain to find the client gone.
+func TestShutdown_UndeliveredVerdictIsJournaled(t *testing.T) {
+	r := makeRunner(map[string]config.Process{
+		"svc": {
+			Cmd:             helperCmd("sleep", "120s"),
+			Restart:         "never",
+			ShutdownTimeout: shutdownGraceForTest,
+		},
+	})
+	var journal bytes.Buffer
+	r.Output, r.Journal = io.Discard, &journal
+	socketPath, server, stopServer := ipcServerForTest(t)
+	defer stopServer()
+	r.IPC = server
+
+	client, err := ipc.Dial(socketPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if _, err := client.Recv(); err != nil {
+		t.Fatalf("snapshot recv: %v", err)
+	}
+	if err := client.Send(ipc.Command{Action: "shutdown", Force: true}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	start := time.Now()
+	go func() { runDone <- r.Run(ctx) }()
+	select {
+	case <-runDone:
+	case <-time.After(shutdownFlushTimeout + 30*time.Second):
+		t.Fatal("Run did not exit after a shutdown whose client went away")
+	}
+	if elapsed := time.Since(start); elapsed > shutdownFlushTimeout {
+		t.Fatalf("Run took %s to exit; the ack barrier looks held to its timeout (%s) for a client that is gone",
+			elapsed, shutdownFlushTimeout)
+	}
+	if verdict := r.ShutdownResult(); verdict != nil {
+		t.Fatalf("ShutdownResult = %v, want a verified stop", verdict)
+	}
+
+	var undelivered []ipc.LogEntry
+	for _, event := range journalEvents(t, &journal) {
+		if event.Code == "shutdown.verdict_undelivered" {
+			undelivered = append(undelivered, event)
+		}
+	}
+	if len(undelivered) != 1 {
+		t.Fatalf("%d shutdown.verdict_undelivered events, want 1: the undelivered verdict was not recorded",
+			len(undelivered))
+	}
+	event := undelivered[0]
+	if event.Process != "proc-compose" || event.Level != "error" {
+		t.Fatalf("event = %s/%s, want a proc-compose error", event.Process, event.Level)
+	}
+	if !strings.Contains(event.Line, "verdict: ok") {
+		t.Fatalf("event message = %q, want it to carry the verdict", event.Line)
+	}
+	t.Logf("journal: %s", event.Line)
 }
 
 // ── output EOF is not command exit ───────────────────────────────────────────
@@ -4215,18 +4992,22 @@ func (g *admissionGateProcessGroup) Close() error {
 
 type signalSealGateProcessGroup struct {
 	ProcessGroup
-	mu              sync.Mutex
-	signalStarted   chan struct{}
-	signalRelease   chan struct{}
-	sealStarted     chan struct{}
-	sealReturned    chan struct{}
-	signalOnce      sync.Once
-	sealOnce        sync.Once
-	sealed          bool
-	cmd             *exec.Cmd
-	observation     SealObservation
-	sealErr         error
-	delegateSignals int
+	mu                sync.Mutex
+	signalStarted     chan struct{}
+	killStarted       chan struct{}
+	signalRelease     chan struct{}
+	sealStarted       chan struct{}
+	sealReturned      chan struct{}
+	signalOnce        sync.Once
+	killOnce          sync.Once
+	sealOnce          sync.Once
+	sealed            bool
+	cmd               *exec.Cmd
+	observation       SealObservation
+	sealErr           error
+	delegateSignals   int
+	forcedKills       int
+	sealSawForcedKill bool
 }
 
 func (g *signalSealGateProcessGroup) Setup(cmd *exec.Cmd) {
@@ -4239,11 +5020,20 @@ func (g *signalSealGateProcessGroup) Track(cmd *exec.Cmd) error {
 	return g.ProcessGroup.Track(cmd)
 }
 
-func (g *signalSealGateProcessGroup) signal(fn func() error) error {
+func (g *signalSealGateProcessGroup) signal(fn func() error, forced bool) error {
+	if forced {
+		// Announce the attempt before taking the lock. The sweep's forced kill
+		// waits behind the signal that is already in flight, and a test has to
+		// be able to see that it is waiting.
+		g.killOnce.Do(func() { close(g.killStarted) })
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.sealed {
 		return os.ErrProcessDone
+	}
+	if forced {
+		g.forcedKills++
 	}
 	g.signalOnce.Do(func() {
 		close(g.signalStarted)
@@ -4254,17 +5044,21 @@ func (g *signalSealGateProcessGroup) signal(fn func() error) error {
 }
 
 func (g *signalSealGateProcessGroup) Terminate() error {
-	return g.signal(g.ProcessGroup.Terminate)
+	return g.signal(g.ProcessGroup.Terminate, false)
 }
 
 func (g *signalSealGateProcessGroup) Kill() error {
-	return g.signal(g.ProcessGroup.Kill)
+	return g.signal(g.ProcessGroup.Kill, true)
 }
 
 func (g *signalSealGateProcessGroup) Seal() (SealObservation, error) {
 	g.sealOnce.Do(func() { close(g.sealStarted) })
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	// The sweep force-kills the group before it seals it, so a seal that
+	// follows a forced kill is the order this double has to be able to
+	// report.
+	g.sealSawForcedKill = g.forcedKills > 0
 	if g.sealed {
 		return g.observation, g.sealErr
 	}
@@ -4387,6 +5181,266 @@ func TestRunnerCleanupHandoff_DeadlineReadWhenStackStopsItself(t *testing.T) {
 	releaseReap()
 }
 
+// TestRunnerCleanupHandoff_DeadlineAloneEnablesTheHandoff pins that supplying
+// only CleanupHandoffDeadline opts into the cleanup handoff. The deadline is
+// the budget in that case: the run must return within it instead of waiting
+// for every lifecycle worker, and the deadline is consulted exactly once.
+func TestRunnerCleanupHandoff_DeadlineAloneEnablesTheHandoff(t *testing.T) {
+	dir := t.TempDir()
+	apiPID, trigger := filepath.Join(dir, "api.pid"), filepath.Join(dir, "fail")
+	apiCmd := serviceHelperCmd("pid-block", apiPID)
+	r := makeRunner(map[string]config.Process{
+		"api":  {Cmd: apiCmd, ShutdownTimeout: shutdownGraceForTest},
+		"seed": {Cmd: helperCmd("fail-after-file", trigger, "30s"), Mode: config.ProcessModeTask},
+	})
+	r.Output = io.Discard
+	// Only the deadline is supplied; the timeout stays unset.
+	var calls atomic.Int32
+	r.CleanupHandoffDeadline = func() time.Time {
+		calls.Add(1)
+		return time.Now().Add(300 * time.Millisecond)
+	}
+	reapRelease := make(chan struct{})
+	releaseReap := sync.OnceFunc(func() { close(reapRelease) })
+	t.Cleanup(releaseReap)
+	r.waitProcess = func(cmd *exec.Cmd) error {
+		if strings.Contains(strings.Join(cmd.Args, " "), apiCmd) {
+			<-reapRelease
+		}
+		return cmd.Wait()
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background()) }()
+	pid, ok := waitForPIDFile(t, apiPID, 10*time.Second)
+	if !ok {
+		releaseReap()
+		t.Fatal("api never started")
+	}
+	trackProcessForCleanup(t, pid, "api")
+	if err := os.WriteFile(trigger, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		releaseReap()
+		t.Fatal("Run ignored CleanupHandoffDeadline when CleanupHandoffTimeout was unset")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("handoff took %s, want it bounded by the deadline", elapsed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("CleanupHandoffDeadline called %d times, want once when cancellation was observed", got)
+	}
+	r.lifecycleMu.Lock()
+	handoff := r.checkHandoff
+	r.lifecycleMu.Unlock()
+	if handoff == nil {
+		t.Fatal("a deadline-only caller received no cleanup handoff, so its checks get none either")
+	}
+	// The seal ended api although its reap is still held.
+	assertTerminated(t, pid, "api", 2*time.Second)
+	releaseReap()
+}
+
+// TestRunnerCleanupHandoff_NoBudgetKeepsLegacyWait pins that a caller that
+// supplies neither budget gets no cleanup handoff at all: the run waits for
+// every lifecycle worker, as it always did.
+func TestRunnerCleanupHandoff_NoBudgetKeepsLegacyWait(t *testing.T) {
+	r := makeRunner(map[string]config.Process{"api": {Cmd: helperCmd("exit", "0"), Restart: "never"}})
+	r.Output = io.Discard
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatalf("run reported %v, want no failure", err)
+	}
+	r.lifecycleMu.Lock()
+	handoff := r.checkHandoff
+	r.lifecycleMu.Unlock()
+	if handoff != nil {
+		t.Fatal("a run without a cleanup budget received a cleanup handoff")
+	}
+}
+
+// nonAnsweringListener starts a listener that accepts connections and never
+// answers them, so a readiness probe against it blocks until its own deadline.
+func nonAnsweringListener(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		for _, conn := range held {
+			_ = conn.Close()
+		}
+		mu.Unlock()
+	})
+	return ln
+}
+
+// TestBuildReadinessCallbacks_ProbeGoroutinesAreJoined pins that every probe
+// goroutine is counted in the probes WaitGroup the lifecycle joins before the
+// incarnation ends: an http or tcp probe and the log readiness timeout must
+// not outlive the incarnation they belong to.
+func TestBuildReadinessCallbacks_ProbeGoroutinesAreJoined(t *testing.T) {
+	cases := []struct {
+		name  string
+		ready *config.ReadyWhen
+	}{
+		{"http", &config.ReadyWhen{HTTP: "http://127.0.0.1:1/"}},
+		{"tcp", &config.ReadyWhen{TCP: "127.0.0.1:1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Runner{Output: io.Discard}
+			p := procInfo{name: "web", proc: config.Process{Cmd: "true", ReadyWhen: tc.ready}}
+			st := &procState{readyCycle: newReadyCycle(), generation: 1, state: "running"}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var probes sync.WaitGroup
+			onStart, _ := r.buildReadinessCallbacks(p, 0, st, 1, nil, 30*time.Second, ctx, cancel, nil, &probes, nil)
+			onStart()
+
+			waited := make(chan struct{})
+			go func() {
+				probes.Wait()
+				close(waited)
+			}()
+			select {
+			case <-waited:
+				t.Fatalf("the %s probe goroutine was not counted in the probes WaitGroup", tc.name)
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// TestBuildReadinessCallbacks_LogTimeoutIsJoined pins that the log readiness
+// timeout goroutine is counted in the probes WaitGroup too.
+func TestBuildReadinessCallbacks_LogTimeoutIsJoined(t *testing.T) {
+	r := &Runner{Output: io.Discard}
+	p := procInfo{name: "web", proc: config.Process{Cmd: "true", ReadyWhen: &config.ReadyWhen{Log: "READY"}}}
+	st := &procState{readyCycle: newReadyCycle(), generation: 1, state: "running"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var probes sync.WaitGroup
+	_, _ = r.buildReadinessCallbacks(p, 0, st, 1, regexp.MustCompile("READY"), 30*time.Second, ctx, cancel, nil, &probes, nil)
+
+	waited := make(chan struct{})
+	go func() {
+		probes.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+		t.Fatal("the log readiness timeout goroutine was not counted in the probes WaitGroup")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestRun_NoJournalEntryAfterRunReturnsWithANonAnsweringProbe measures the
+// invariant the probe join protects: no probe event may be written to the
+// journal after Run returns.
+//
+// The probe never gets an answer, so it is still running when the stack is
+// stopped. The check is a measurement over a bounded window rather than a
+// proof: the window in which an unjoined probe could still write is short.
+func TestRun_NoJournalEntryAfterRunReturnsWithANonAnsweringProbe(t *testing.T) {
+	ln := nonAnsweringListener(t)
+	journal := &afterRunJournal{}
+	r := makeRunner(map[string]config.Process{
+		"svc": {
+			Cmd:       helperCmd("sleep", "120s"),
+			Restart:   "never",
+			ReadyWhen: &config.ReadyWhen{HTTP: "http://" + ln.Addr().String() + "/"},
+		},
+	})
+	r.Output = io.Discard
+	r.Journal = journal
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	// Let the probe make its first attempt.
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("runner did not stop after cancel")
+	}
+	journal.runDone.Store(true)
+	time.Sleep(500 * time.Millisecond)
+	if got := journal.afterRun.Load(); got != 0 {
+		t.Fatalf("%d journal entries were written after Run returned", got)
+	}
+}
+
+// TestRun_CleanupHandoffCompletesWithANonAnsweringProbe pins that the cleanup
+// handoff still completes within its budget when a readiness probe never gets
+// an answer: the joined probe must not hold the handoff open.
+func TestRun_CleanupHandoffCompletesWithANonAnsweringProbe(t *testing.T) {
+	ln := nonAnsweringListener(t)
+	r := makeRunner(map[string]config.Process{
+		"svc": {
+			Cmd:       helperCmd("sleep", "120s"),
+			Restart:   "never",
+			ReadyWhen: &config.ReadyWhen{HTTP: "http://" + ln.Addr().String() + "/"},
+		},
+	})
+	r.Output = io.Discard
+	r.CleanupHandoffTimeout = 500 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	start := time.Now()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cleanup handoff did not complete")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("the cleanup handoff took %s, want it bounded by the handoff budget", elapsed)
+	}
+}
+
+// afterRunJournal counts the journal entries written after the run returned.
+type afterRunJournal struct {
+	mu       sync.Mutex
+	buf      bytes.Buffer
+	runDone  atomic.Bool
+	afterRun atomic.Int64
+}
+
+func (j *afterRunJournal) Write(p []byte) (int, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.runDone.Load() {
+		j.afterRun.Add(1)
+	}
+	return j.buf.Write(p)
+}
+
 func TestRunnerCleanupHandoff_SealsBeforeReturningAndQuiescesWorker(t *testing.T) {
 	command := serviceHelperCmd("sleep", "120s")
 	configPath := filepath.Join(t.TempDir(), "proc-compose.yml")
@@ -4412,6 +5466,7 @@ func TestRunnerCleanupHandoff_SealsBeforeReturningAndQuiescesWorker(t *testing.T
 	group := &signalSealGateProcessGroup{
 		ProcessGroup:  newProcessGroup(),
 		signalStarted: make(chan struct{}),
+		killStarted:   make(chan struct{}),
 		signalRelease: make(chan struct{}),
 		sealStarted:   make(chan struct{}),
 		sealReturned:  make(chan struct{}),
@@ -4464,17 +5519,25 @@ func TestRunnerCleanupHandoff_SealsBeforeReturningAndQuiescesWorker(t *testing.T
 	case <-time.After(5 * time.Second):
 		t.Fatal("production cancellation did not enter the delayed signal")
 	}
+	// The sweep force-kills the still-owned group before it seals it. That
+	// forced kill waits behind the signal that is already in flight, so the
+	// seal cannot start while the signal is blocked.
+	select {
+	case <-group.killStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bounded production Run did not force-kill the still-owned group")
+	}
+	select {
+	case <-group.sealStarted:
+		t.Fatal("group sealing started before the delayed in-flight signal completed")
+	default:
+	}
+	signalReleased()
 	select {
 	case <-group.sealStarted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("bounded production Run did not reach group sealing")
 	}
-	select {
-	case <-group.sealReturned:
-		t.Fatal("seal returned before the delayed in-flight signal completed")
-	default:
-	}
-	signalReleased()
 	select {
 	case <-group.sealReturned:
 	case <-time.After(5 * time.Second):
@@ -4504,11 +5567,17 @@ func TestRunnerCleanupHandoff_SealsBeforeReturningAndQuiescesWorker(t *testing.T
 		t.Fatalf("signal after seal = %v, want os.ErrProcessDone", err)
 	}
 	group.mu.Lock()
-	if !group.sealed || group.delegateSignals == 0 {
-		group.mu.Unlock()
-		t.Fatalf("signal/seal observation: sealed=%t delegated=%d", group.sealed, group.delegateSignals)
-	}
+	sealed, delegated, forcedKills, sealSawForcedKill := group.sealed, group.delegateSignals, group.forcedKills, group.sealSawForcedKill
 	group.mu.Unlock()
+	if !sealed || delegated == 0 {
+		t.Fatalf("signal/seal observation: sealed=%t delegated=%d", sealed, delegated)
+	}
+	if forcedKills == 0 {
+		t.Fatal("the sweep did not force-kill the still-owned group before sealing it")
+	}
+	if !sealSawForcedKill {
+		t.Fatal("the group was sealed before the sweep's forced kill")
+	}
 
 	stateBefore := r.store.Load().snapshot()
 	processBefore := r.Config.Processes["api"]
@@ -5073,4 +6142,278 @@ func TestFormatRecovery_StableEvidenceLines(t *testing.T) {
 	if got := FormatRecovery([]RecoveredGroup{{GroupResult: GroupResult{Name: "my api", PGID: 7}, Outcome: OutcomeEmpty, Reason: "no_members"}}); got != `recovered group="my api" pgid=7 outcome=empty reason=no_members` {
 		t.Fatalf("a name with a space must stay one field: %s", got)
 	}
+}
+
+// TestReload_AcceptsReorderedResourceLabels pins that reordering the resource
+// labels is not a resource-set change: the leases are taken over the sorted
+// labels, so the reload applies instead of failing with "resources changed;
+// restart the session".
+func TestReload_AcceptsReorderedResourceLabels(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	write := func(resources string) {
+		t.Helper()
+		body := fmt.Sprintf("processes:\n  server:\n    cmd: %q\n    ready_when:\n      log: \"^READY$\"\nresources: [%s]\n", helperCmd("log-block", "READY"), resources)
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("alpha, beta")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := paths.FromConfig(path, "reload-order")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := session.Acquire(cfg, path, hash, "reload-order", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	r := &Runner{Config: plan.Config, ConfigPath: path, NoColor: true, ResolveConfig: plan.Resolve}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	}()
+	if !waitForProcState(t, r, "server", func(s ipc.ProcState) bool { return s.Ready }, 5*time.Second) {
+		t.Fatal("initial readiness failed")
+	}
+	write("beta, alpha")
+	if result := r.Reload(); result.Status != "ok" {
+		t.Fatalf("reload: %+v", result)
+	}
+}
+
+// TestRun_BeforeStartHandsTheHeldPortToTheProcess pins the launch hook a
+// session plan releases its held ports through: BeforeStart runs with the
+// process's name before the command starts, so the process binds the port the
+// plan held since Acquire. Without the hook the port is still bound and the
+// process cannot serve it.
+func TestRun_BeforeStartHandsTheHeldPortToTheProcess(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := filepath.Join(t.TempDir(), "proc-compose.yml")
+	cfg := &config.Config{Processes: map[string]config.Process{"api": {
+		Cmd: "serve", Ports: map[string]int{"http": 0}, ReadyWhen: &config.ReadyWhen{HTTP: "${urls.api.http}/"},
+	}}}
+	plan, err := session.Acquire(cfg, path, "before-start", "before-start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	resolved := *plan.Config
+	resolved.Processes = maps.Clone(resolved.Processes)
+	api := resolved.Processes["api"]
+	api.Cmd = serviceHelperCmd("serve-http", "127.0.0.1:"+strconv.Itoa(plan.Project.Ports["api"]["http"]))
+	resolved.Processes["api"] = api
+	var mu sync.Mutex
+	var launched []string
+	r := &Runner{Config: &resolved, NoColor: true, BeforeStart: func(name string) {
+		mu.Lock()
+		launched = append(launched, name)
+		mu.Unlock()
+		plan.ReleasePorts(name)
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Error("runner did not stop")
+		}
+	}()
+	if !waitForProcState(t, r, "api", func(s ipc.ProcState) bool { return s.Ready }, 10*time.Second) {
+		t.Fatal("the process never served the port the plan held")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(launched, []string{"api"}) {
+		t.Fatalf("BeforeStart saw %q, want one call for api", launched)
+	}
+}
+
+// TestSetup_RequiresCommandContext pins the constraint ProcessGroup.Setup
+// places on its caller.
+//
+// Setup assigns cmd.Cancel, and Go treats a non-nil Cancel on a command that
+// was not created with exec.CommandContext as a mistake: it refuses to start
+// it. The failure appears at Start, far from the cause, so the constraint is
+// documented on Setup and pinned here.
+func TestSetup_RequiresCommandContext(t *testing.T) {
+	name, args := "sh", []string{"-c", "exit 0"}
+	if runtime.GOOS == "windows" {
+		name, args = "cmd", []string{"/c", "exit", "0"}
+	}
+	cmd := exec.Command(name, args...)
+	pg := newProcessGroup()
+	pg.Setup(cmd)
+	err := cmd.Start()
+	if err == nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal("Start accepted a command that was not created with CommandContext")
+	}
+	if !strings.Contains(err.Error(), "exec: command with a non-nil Cancel was not created with CommandContext") {
+		t.Fatalf("Start error = %v, want Go's non-CommandContext error", err)
+	}
+}
+
+// ── observation failure: pipe cleanup ────────────────────────────────────────
+
+// TestObservationFailure_ClosesBothPipesOnEveryReturn pins the cleanup on the
+// path where the observation of the command leader's exit fails.
+//
+// os/exec closes the read ends only once cmd.Wait has collected the command,
+// and the handoff arm returns before that, so the read ends are the runner's
+// to close, and every return from that path has to close them: two leaked
+// descriptors per occurrence, on every launch on the platforms where the
+// observation is unavailable.
+//
+// The check is a source-level one on purpose. The runtime tests of this path
+// drive it through the observeExit seam, but a descriptor count could not tell
+// the arms apart: on the two reap arms cmd.Wait has already closed the read
+// ends. What is pinned here is the shape the fix introduced: the shared close
+// helper is invoked on each of the three arms of the failure block, and the
+// block returns an error naming the observation failure.
+func TestObservationFailure_ClosesBothPipesOnEveryReturn(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "lifecycle.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse lifecycle.go: %v", err)
+	}
+	exec := funcDeclByName(file, "exec")
+	if exec == nil {
+		t.Fatal("lifecycle.go has no exec function")
+	}
+	failure := observationFailureBlock(exec)
+	if failure == nil {
+		t.Fatal("lifecycle.go's exec has no observation-failure block")
+	}
+
+	arms := observationFailureArms(failure)
+	if len(arms) != 3 {
+		t.Fatalf("observation-failure arms = %d, want 3 (the reap arm, the handoff arm and the no-handoff arm)", len(arms))
+	}
+	for i, arm := range arms {
+		if !callsCloseStdout(arm) {
+			t.Fatalf("observation-failure arm %d does not close both pipes through the shared helper", i+1)
+		}
+	}
+	if !namesObservationFailure(failure) {
+		t.Fatal("the observation-failure path does not return an error naming the observation failure")
+	}
+}
+
+// funcDeclByName returns the function declaration with the given name.
+func funcDeclByName(file *ast.File, name string) *ast.FuncDecl {
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name.Name == name {
+			return fn
+		}
+	}
+	return nil
+}
+
+// observationFailureBlock returns the body of the block that handles a failed
+// observation of the command leader's exit.
+func observationFailureBlock(fn *ast.FuncDecl) *ast.BlockStmt {
+	var found *ast.BlockStmt
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		stmt, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		bin, ok := stmt.Cond.(*ast.BinaryExpr)
+		if !ok || bin.Op != token.NEQ {
+			return true
+		}
+		left, ok := bin.X.(*ast.Ident)
+		if !ok || left.Name != "obsErr" {
+			return true
+		}
+		found = stmt.Body
+		return false
+	})
+	return found
+}
+
+// observationFailureArms returns the statement lists of the three arms of the
+// observation-failure block: the two cases of its select and its else branch.
+func observationFailureArms(block *ast.BlockStmt) [][]ast.Stmt {
+	var arms [][]ast.Stmt
+	for _, stmt := range block.List {
+		ifstmt, ok := stmt.(*ast.IfStmt)
+		if !ok {
+			continue
+		}
+		if ifstmt.Else == nil {
+			continue
+		}
+		for _, inner := range ifstmt.Body.List {
+			sel, ok := inner.(*ast.SelectStmt)
+			if !ok {
+				continue
+			}
+			for _, comm := range sel.Body.List {
+				switch clause := comm.(type) {
+				case *ast.CommClause:
+					arms = append(arms, clause.Body)
+				case *ast.CaseClause:
+					arms = append(arms, clause.Body)
+				}
+			}
+		}
+		if elseBlock, ok := ifstmt.Else.(*ast.BlockStmt); ok {
+			arms = append(arms, elseBlock.List)
+		}
+	}
+	return arms
+}
+
+// callsCloseStdout reports whether the statements call the shared close
+// helper.
+func callsCloseStdout(stmts []ast.Stmt) bool {
+	found := false
+	for _, stmt := range stmts {
+		ast.Inspect(stmt, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "closeStdout" {
+				found = true
+			}
+			return true
+		})
+	}
+	return found
+}
+
+// namesObservationFailure reports whether the block returns an error that
+// names the observation failure.
+func namesObservationFailure(block *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(block, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		if strings.Contains(lit.Value, "observe leader exit") {
+			found = true
+		}
+		return true
+	})
+	return found
 }

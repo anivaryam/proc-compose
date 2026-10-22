@@ -42,6 +42,30 @@ const (
 	StatusNotConfig   = "not_configured"
 )
 
+// recordedVerdict reports whether a receipt can record this state, overall
+// status and exit code together. A receipt records one of two states: active,
+// written before the attempt has a verdict (status not_run, exit code 0;
+// earlier releases seeded status failed there), and completed, with the
+// verdict finishVerdict applies. abandoned and indeterminate are what Classify
+// derives from an active receipt; no receipt records them. The phase statuses
+// are not attempt verdicts.
+func recordedVerdict(state, status string, exitCode int) bool {
+	switch state {
+	case StateActive:
+		return exitCode == 0 && (status == StatusNotRun || status == StatusFailed)
+	case StateCompleted:
+		switch status {
+		case StatusPassed:
+			return exitCode == ExitPassed
+		case StatusFailed:
+			return exitCode == ExitFailed
+		case StatusInterrupted:
+			return exitCode == ExitInterrupted
+		}
+	}
+	return false
+}
+
 // Phases.
 const (
 	PhaseValidation = "validation"
@@ -106,12 +130,14 @@ const (
 	ExitInterrupted = 130
 )
 
-// Precedence bases.
+// Precedence bases: the rule that decided an attempt's status and exit code.
 const (
 	PrecedencePassed         = "all_required_phases_passed"
 	PrecedenceFailure        = "failure_without_interruption"
 	PrecedenceInterrupted    = "interruption"
 	PrecedencePreAcquisition = "pre_acquisition_failure"
+	// PrecedenceNoVerdict is the active receipt's: no rule has decided yet.
+	PrecedenceNoVerdict = "no_verdict"
 )
 
 // ErrorRecord is a stable machine code and its positive occurrence count.
