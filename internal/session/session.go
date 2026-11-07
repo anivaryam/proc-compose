@@ -370,10 +370,21 @@ func leasePath(label string) string {
 // lock file that holds it; closing the file releases it. A lease another owner
 // holds is a *LeaseError.
 func acquireLease(label string) (*os.File, error) {
-	if err := os.MkdirAll(paths.LeaseDir(), 0700); err != nil {
+	return openLease(leasePath(label), label)
+}
+
+// LeaseFile acquires an exclusive, nonblocking lease at a persistent path.
+// The file must never be unlinked while a lease may be held. Closing it releases
+// the lease, including on process exit. Jobs use this outside the runtime dir.
+func LeaseFile(path string) (*os.File, error) {
+	return openLease(path, path)
+}
+
+func openLease(path, label string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(leasePath(label), os.O_CREATE|os.O_RDWR, 0600)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -410,7 +421,13 @@ func LeaseInstance(hash string) (release func(), err error) {
 // When the lease is free it is taken and released immediately; this is an
 // observation for classification, never an acquisition that outlives the call.
 func InstanceHeld(hash string) (bool, error) {
-	file, err := os.OpenFile(leasePath("instance:"+hash), os.O_RDWR, 0600)
+	return FileLeaseHeld(leasePath("instance:" + hash))
+}
+
+// FileLeaseHeld observes a lease without leaving it held. Failure to prove it
+// free is conservative: an unreadable file is an error, a lock failure is held.
+func FileLeaseHeld(path string) (bool, error) {
+	file, err := os.OpenFile(path, os.O_RDWR, 0600)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}

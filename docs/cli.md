@@ -20,6 +20,7 @@ proc-compose stop [--timeout N] [--force]               Stop daemon and verify i
 proc-compose list                                       List config processes
 proc-compose verify [processes...] -- PROGRAM [ARG...]  Owned stack + check + verified cleanup + receipt
 proc-compose run -- PROGRAM [ARG...]                    Standalone command + verified cleanup + receipt
+proc-compose jobs list|show|logs|wait|cancel              Retained background jobs by immutable ID
 proc-compose attempts [id|latest] [--json]              List or show verification receipts
 proc-compose agent-guide                                Print the offline operating guide for coding agents
 proc-compose why <process> | --attempt <id|latest>      Bounded failure evidence (live, retained, or one attempt)
@@ -91,6 +92,7 @@ printed on stderr.
 | `PORT` | merge-port config | Used as `merge.port` when not set explicitly (cloud platforms) |
 | `XDG_RUNTIME_DIR` | daemon | Preferred runtime directory; otherwise uses the per-user cache's `proc-compose` directory, then the OS temporary directory if the cache is unavailable |
 | `PROC_COMPOSE_INSTALL_DIR` | `install.sh` | Override install target (default `~/.local/bin`) |
+| `PROC_COMPOSE_JOB_DIR` | background jobs and `jobs` | Absolute persistent job root; default OS user config directory + `proc-compose/jobs` |
 | `PROC_COMPOSE_VERSION` | `install.sh` | Pin a specific release tag (e.g. `v1.2.3`) |
 
 ## Daemon file paths
@@ -168,8 +170,48 @@ reuses the `verify.response` / `verify.receipt` contract with `standalone: true`
 `config_path` is the session identity anchor, not evidence of a loaded config.
 Exit codes are 0 passed, 1 failed, 2 refused before starting, 130 interrupted;
 the command's original exit code is in `check.exit_code`. Receipts have the same
-runtime-directory retention as verification attempts. This command currently
-runs in the foreground.
+runtime-directory retention as verification attempts in foreground mode.
+
+### Background development jobs
+
+```sh
+proc-compose run --background --json -- go test ./...
+proc-compose verify --background --json api -- npm run test:integration
+proc-compose jobs list --json
+proc-compose jobs show JOB_ID --json
+proc-compose jobs wait JOB_ID --timeout 30s --json
+proc-compose jobs logs JOB_ID --json --after start -n 50 --max-bytes 8192
+proc-compose jobs cancel JOB_ID --timeout 1m --json
+```
+
+`run` and `verify` accept `--background`. They return a `job.response` with a
+`job_id` once a detached worker owns the job and has recorded its acknowledgement.
+Launch exit 0 means accepted, not passed. Without `--session`, a job-specific
+session is assigned. The existing argv, readiness, timeout and cleanup contracts
+still apply; explicitly occupied sessions are refused rather than reused.
+
+Job evidence is in the OS user config directory under `proc-compose/jobs`, or
+the absolute `PROC_COMPOSE_JOB_DIR` override. It survives normal logout/reboot
+and runtime-directory removal; commands themselves do not survive reboot. Use
+the same override when reconnecting. Background receipts are retrieved through
+`jobs`, not `attempts`. Journals rotate at 10 MiB with three retained rotations.
+
+| Command | Contract |
+|---|---|
+| `jobs list [--limit 20] [--before ID]` | Newest first; 1..100 summaries; `has_more` and `next_before` enable paging. |
+| `jobs show ID` | One retained result; query exit 0 is not a test verdict. |
+| `jobs logs ID [--after CURSOR] [-n 50] [--max-bytes 65536]` | Usual bounded event pages; use `next_cursor` to resume, `start` for oldest retained events. |
+| `jobs wait ID [--timeout 1m]` | Finite wait (1ms..10m); terminal result exit 0/1/2/130, or exit 3 and `wait_timed_out: true`. Timing out leaves the job running. |
+| `jobs cancel ID [--timeout 1m]` | Request cancellation of only this job, then wait for its result; interrupted jobs return 130. Inspect `result.cleanup` to prove termination. |
+
+All accept `--json`. `terminal: true`, `state: passed`, and the passing `result`
+mean a completed check with verified cleanup. `queued` and `running` are not
+verdicts; `abandoned` means the worker lease was released without a terminal
+record, and `indeterminate` means its lease/record could not be established.
+Neither proves cleanup. `owner_pid` is descriptive, never signalling authority.
+Cancellation uses the job's own mailbox; it never kills a stored PID or stops
+an unrelated session. An early worker failure can have `state: failed` and a
+`message` without a verification result. Flag parsing errors may be plain text.
 
 ### Start all processes
 

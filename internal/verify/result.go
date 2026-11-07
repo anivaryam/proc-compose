@@ -66,6 +66,17 @@ func recordedVerdict(state, status string, exitCode int) bool {
 	return false
 }
 
+// ValidTerminalResult recognizes a completed response, including refusals that
+// happen before an attempt receipt exists. Persistent job readers use the same
+// verdict contract as receipt readers rather than inferring success from exit 0.
+func ValidTerminalResult(r *Result) bool {
+	if r == nil || r.SchemaVersion != SchemaVersion || r.Kind != KindResponse || r.State != StateCompleted || r.FinishedAt == nil {
+		return false
+	}
+	return recordedVerdict(r.State, r.Status, r.ExitCode) ||
+		(r.Status == StatusFailed && r.ExitCode == ExitUsage && r.Precedence == PrecedencePreAcquisition)
+}
+
 // Phases.
 const (
 	PhaseValidation = "validation"

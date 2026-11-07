@@ -1024,6 +1024,7 @@ See: https://github.com/anivaryam/proc-compose/blob/main/docs/cli.md#diagnose-or
 		fmt.Fprintf(os.Stderr, "warning: failed to mark --name as required: %v\n", err)
 	}
 	rootCmd.AddCommand(upCmd, monitorCmd, stopCmd, listCmd, initCmd, restartCmd, reloadCmd, uninstallCmd, logsCmd, manCmd, statusCmd, validateCmd, bootstrapCmd, doctorCmd, newWhyCommand(&configFile), newAgentGuideCommand(), newVerifyCommand(&configFile), newRunCommand(&configFile), newConfigCommand(&configFile), newAttemptsCommand(&configFile), newSessionsCommand(), newCompareCommand(&configFile))
+	rootCmd.AddCommand(newJobsCommand())
 
 	// The update notice runs before every command's own work, so it is
 	// printed above the output it refers to and never after a TUI has taken

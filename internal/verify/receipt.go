@@ -195,6 +195,11 @@ func WriteReceipt(path string, result *Result) error {
 // validAttemptID reports whether id has the shape NewAttemptID gives every
 // attempt: 26 Crockford base32 digits.
 func validAttemptID(id string) bool {
+	return ValidAttemptID(id)
+}
+
+// ValidAttemptID checks the ULID format shared by attempts and persistent jobs.
+func ValidAttemptID(id string) bool {
 	if len(id) != 26 {
 		return false
 	}

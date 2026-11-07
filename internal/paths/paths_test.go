@@ -25,6 +25,23 @@ func TestFromConfig_Deterministic(t *testing.T) {
 	}
 }
 
+func TestJobs_IndependentOfRuntimeAndAbsoluteOverride(t *testing.T) {
+	t.Setenv("PROC_COMPOSE_JOB_DIR", "")
+	first, err := Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	second, err := Jobs()
+	if err != nil || first != second {
+		t.Fatalf("job storage changed with runtime: %s -> %s (%v)", first, second, err)
+	}
+	t.Setenv("PROC_COMPOSE_JOB_DIR", "relative")
+	if _, err := Jobs(); err == nil {
+		t.Fatal("relative job root accepted")
+	}
+}
+
 func TestFromConfig_DifferentPathsDifferentHashes(t *testing.T) {
 	a, _ := FromConfig("/tmp/a.yml")
 	b, _ := FromConfig("/tmp/b.yml")

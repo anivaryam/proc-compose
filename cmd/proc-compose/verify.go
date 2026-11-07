@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/jobs"
 	"github.com/anivaryam/proc-compose/internal/verify"
 	"github.com/spf13/cobra"
 )
@@ -51,6 +52,7 @@ func newRunCommand(configFile *string) *cobra.Command {
 func newExecutionCommand(configFile *string, standalone bool) *cobra.Command {
 	var (
 		machine        bool
+		background     bool
 		streamLogs     bool
 		requireEnv     bool
 		allowCross     bool
@@ -146,6 +148,25 @@ Default budgets (unmeasured policy): startup 120s (1s-10m), check 10m
 			if parseErr == nil && standalone && len(selectors) != 0 {
 				parseErr = fmt.Errorf("run accepts only a command after --, not process selectors")
 			}
+			if parseErr == nil && background && streamLogs {
+				parseErr = fmt.Errorf("--background cannot stream logs; retrieve them with jobs logs")
+			}
+			if parseErr == nil && background {
+				store, err := jobs.Open()
+				if err != nil {
+					return jobFailure(cmd, machine, err)
+				}
+				ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+				defer stop()
+				ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				view, err := store.Launch(ctx, opts)
+				code := 0 // launch acknowledgement, never a check verdict
+				if err != nil {
+					code = 1
+				}
+				return renderJob(cmd, view, machine, err, code)
+			}
 			var result *verify.Result
 			if parseErr != nil {
 				fmt.Fprintf(stderr, "Error: %v\n", parseErr)
@@ -177,8 +198,17 @@ Receipts are retained in the runtime directory and may disappear at logout/reboo
 		command.Example = `  proc-compose run --json -- go test ./...
   proc-compose --session lint run --dir web -- npm run lint`
 	}
+	command.Long += `
+
+With --background, return a persistent job ID after worker acknowledgement.
+Launch exit 0 means accepted, not passed. Use jobs wait JOB_ID --json for the
+terminal verdict, jobs logs for retained output, and jobs cancel for cleanup.
+Without --session each background job gets a unique session. Job evidence lives
+under the user config directory's proc-compose/jobs, or PROC_COMPOSE_JOB_DIR,
+independently of runtime cleanup; use jobs rather than attempts to retrieve it.`
 	usageFlagErrors(command)
 	command.Flags().BoolVar(&machine, "json", false, "emit exactly one JSON result object on stdout")
+	command.Flags().BoolVar(&background, "background", false, "detach with a persistent job ID; use jobs wait for the verdict")
 	command.Flags().BoolVar(&streamLogs, "stream-logs", false, "with --json, also stream process output to stderr (default: journal only)")
 	addRequireEnvironmentFlag(command, &requireEnv)
 	if !standalone {

@@ -61,6 +61,7 @@ uses it. The `references/` files hold the details.
 | Run tests while developing | test watcher process, or tests against a running stack | [testing](references/testing.md#local-development-loop) |
 | One owned check with a receipt | `verify`, `attempts`, `why --attempt` | [testing](references/testing.md#verify) |
 | Standalone unit tests, lint, builds, code generation | `run`, `attempts`, `why --attempt` | [testing](references/testing.md#standalone-checks) |
+| Background tests and later result retrieval | `--background`, `jobs list/show/logs/wait/cancel` | [testing](references/testing.md#background-jobs) |
 | Same check on two worktrees | `compare` | [testing](references/testing.md#compare) |
 | Logs and failure evidence | `logs`, `why` | [sessions and logs](references/sessions-and-logs.md#logs) |
 | Parallel copies per branch or worktree | `--session`, `ports`, `${urls...}`, `resources`, `sessions` | [sessions and logs](references/sessions-and-logs.md#sessions) |
@@ -139,8 +140,10 @@ proc-compose stop                         # stop everything and verify it ended
 `verify` requires at least one service. For a standalone unit test, lint, or
 build, use `proc-compose run --json -- PROGRAM [ARG...]` with the project's
 existing command. It requires no config and starts no services. Both commands
-currently run in the foreground; use the harness's managed background execution
-when needed. Check the installed CLI's help before assuming detached jobs exist.
+accept `--background`: save the returned job ID, continue other work, then use
+`jobs wait` to retrieve the terminal verdict and `jobs logs` for evidence.
+Launch exit 0 is acceptance, not a pass. Check the installed CLI's help before
+using these features with older versions.
 
 See [testing](references/testing.md) for all three, `compare`, environment
 reports, and CI recipes.

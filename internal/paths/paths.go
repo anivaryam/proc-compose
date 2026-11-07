@@ -76,6 +76,23 @@ func CacheFile(name string) string {
 	return filepath.Join(dir, name)
 }
 
+// Jobs returns persistent per-user job storage, independent of runtime and
+// cache cleanup. An explicit override must be absolute and is also inherited
+// by detached workers. Never fall back to a shared temporary directory.
+func Jobs() (string, error) {
+	if dir := os.Getenv("PROC_COMPOSE_JOB_DIR"); dir != "" {
+		if !filepath.IsAbs(dir) {
+			return "", fmt.Errorf("PROC_COMPOSE_JOB_DIR must be absolute")
+		}
+		return filepath.Clean(dir), nil
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "proc-compose", "jobs"), nil
+}
+
 // Socket returns the socket path for the daemon.
 // On Windows, named pipes are used (\\.\pipe\pc-<hash>).
 // On Unix, a Unix socket is placed in the per-user runtime dir.

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `run --background` and `verify --background` return a persistent job ID after
+  detached worker acknowledgement. `jobs list/show/logs/wait/cancel` retrieves
+  bounded results and logs across directories and runtime cleanup, waits with
+  a finite budget, and cancels only the owned job. Launch acceptance is distinct
+  from a terminal verdict; worker lease loss never reports success.
 - `run -- PROGRAM [ARG...]` executes standalone tests, lint, builds, and other
   existing commands without requiring or starting services. It reuses the
   verification runner's process-tree ownership, bounded output, timeouts,

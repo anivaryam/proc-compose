@@ -48,7 +48,10 @@ type Options struct {
 	ConfigPath string // absolute config path
 	// Standalone runs only Argv, without reading or starting the config.
 	// ConfigPath still supplies the session identity and default working directory.
-	Standalone     bool
+	Standalone bool
+	// EvidenceDir retains the receipt and journal outside ephemeral runtime
+	// storage. Session/resource leases and process records remain runtime-owned.
+	EvidenceDir    string
 	Session        string // session name; empty is the default session
 	Hash           string // runtime hash for (config, session)
 	Selectors      []string
@@ -280,6 +283,12 @@ func Run(ctx context.Context, opts Options) *Result {
 	result.Source = sourceBefore.source
 
 	// ── acquisition ─────────────────────────────────────────────────────────
+	if ctx.Err() != nil {
+		result.Status, result.ExitCode, result.Precedence = StatusInterrupted, ExitInterrupted, PrecedenceInterrupted
+		result.Errors = []ErrorRecord{{Code: CodeInterrupted, Count: 1}}
+		result.FinishedAt = timestamp(opts.now())
+		return result
+	}
 	result.Phase = PhaseAcquiring
 	plan, err := session.Acquire(cfg, opts.ConfigPath, opts.Hash, opts.Session, opts.Selectors)
 	if err != nil {
@@ -349,9 +358,15 @@ func (a *attempt) run(ctx context.Context) *Result {
 	for _, name := range a.selected {
 		res.SelectedProcesses = append(res.SelectedProcesses, ProcessGeneration{Name: name})
 	}
-	receiptPath := filepath.Join(AttemptsDir(plan.Project.Directory), attemptID+".json")
-	res.ReceiptPath = &receiptPath
+	evidenceDir := plan.Project.Directory
 	res.Retention = Retention
+	if opts.EvidenceDir != "" {
+		evidenceDir = opts.EvidenceDir
+		plan.Project.JournalPath = filepath.Join(evidenceDir, "events.jsonl")
+		res.Retention = "persistent job directory; retained until explicitly pruned"
+	}
+	receiptPath := filepath.Join(AttemptsDir(evidenceDir), attemptID+".json")
+	res.ReceiptPath = &receiptPath
 	journalPath := plan.Project.JournalPath
 	res.Evidence.Journal = &journalPath
 
@@ -388,7 +403,7 @@ func (a *attempt) run(ctx context.Context) *Result {
 		res.ReceiptPersisted = false
 		a.errs.Add(CodeReceiptPersistence)
 		a.finishVerdict()
-	} else if err := Prune(plan.Project.Directory, receiptPath); err != nil {
+	} else if err := Prune(evidenceDir, receiptPath); err != nil {
 		fmt.Fprintf(opts.Log, "verify: prune receipts: %v\n", err)
 	}
 	if res.Cleanup.SignalingAuthority == "withdrawn" {

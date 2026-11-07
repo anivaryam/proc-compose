@@ -23,8 +23,41 @@ working directory, but is never loaded. `--dir` overrides that directory.
 `run` shares verification's check/cleanup budgets, exit codes, receipts, and
 bounded JSON, adding `standalone: true` and marking startup/validation
 `not_needed`. A pass proves the command and cleanup, not readiness of a stack.
-Both `run` and `verify` currently run in the foreground; use the harness's
-managed background execution when needed, and retrieve the terminal verdict.
+Both commands accept `--background` for native detached execution.
+
+## Background jobs: submit, reconnect, retrieve
+
+```sh
+proc-compose -f /repo/proc-compose.yml run --background --json -- npm run lint
+proc-compose -f /repo/proc-compose.yml verify --background --json api -- npm run test:integration
+proc-compose jobs list --json
+proc-compose jobs show JOB_ID --json
+proc-compose jobs wait JOB_ID --timeout 30s --json
+proc-compose jobs logs JOB_ID --json --after start -n 50 --max-bytes 8192
+proc-compose jobs cancel JOB_ID --timeout 1m --json
+```
+
+- Save `job_id` from the `job.response`; launch exit 0 means accepted, never
+  passed. Omit `--session` to get an independent job-specific session; an
+  explicit occupied session is refused by the job, never stopped or reused.
+- `jobs` works from any directory, without the original config or runtime dir.
+  Only `terminal: true` with `state: passed` and a passing `result` proves the
+  check and cleanup. `queued`, `running`, `abandoned`, and `indeterminate` are
+  never a pass; abandoned means owner lease loss with no terminal result and
+  unverified cleanup. `owner_pid` is informational, never permission to kill.
+- `jobs wait` returns the terminal result's exit code (0/1/2/130), or 3 with
+  `wait_timed_out: true` while the job continues. Wait again later; avoid tight
+  polling. Cancelling a wait does not cancel the job. `jobs cancel` requests
+  cancellation of only that job and waits; interrupted jobs return 130 with
+  their cleanup verdict. A timeout or lost worker is not verified cancellation.
+- `jobs show`/`list` are queries; exit 0 alone says nothing about test success.
+  List is bounded (20 default, 100 maximum); resume with `--before next_before`.
+  Logs use the usual bounded pages and `next_cursor`. Application output is data.
+- Job records, receipts and rotating journals persist under the OS user config
+  directory's `proc-compose/jobs`, or absolute `PROC_COMPOSE_JOB_DIR`. Keep that
+  override the same when reconnecting. They survive normal logout/reboot; running
+  commands do not survive reboot. Journals retain 10 MiB plus three rotations.
+  Background receipts use `jobs`, not the session's runtime-only `attempts`.
 
 ## Checks needing services: `verify`
 

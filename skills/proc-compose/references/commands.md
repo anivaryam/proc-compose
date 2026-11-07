@@ -136,6 +136,11 @@ that `up --survive --install` created. Linux only.
 |---|---|---|
 | `proc-compose verify [processes...] -- PROGRAM [ARG...]` | Fresh owned session, readiness, one check, verified cleanup, receipt | [testing](testing.md#verify) |
 | `proc-compose run -- PROGRAM [ARG...]` | Standalone command, verified cleanup, receipt; no services or config required | [testing](testing.md#standalone-checks) |
+| `proc-compose jobs list --json` | Bounded global job summaries; `--limit`, `--before` | [testing](testing.md#background-jobs) |
+| `proc-compose jobs show JOB_ID --json` | Retrieve state and retained result by immutable ID | [testing](testing.md#background-jobs) |
+| `proc-compose jobs logs JOB_ID --json` | Bounded retained logs; `--after`, `-n`, `--max-bytes` | [testing](testing.md#background-jobs) |
+| `proc-compose jobs wait JOB_ID --timeout 30s --json` | Terminal verdict exit code; exit 3 means still incomplete | [testing](testing.md#background-jobs) |
+| `proc-compose jobs cancel JOB_ID --timeout 1m --json` | Cancel only this job and wait for cleanup evidence | [testing](testing.md#background-jobs) |
 | `proc-compose attempts [id\|latest] [--json]` | Verification receipts for this session, newest first | [testing](testing.md#receipts-and-attempt-evidence) |
 | `proc-compose compare --baseline DIR --candidate DIR -- PROGRAM` | Same check against two worktrees | [testing](testing.md#compare) |
 | `proc-compose logs [processes...]` | Bounded, structured event queries; `--follow` streams | [sessions and logs](sessions-and-logs.md#logs) |
@@ -164,6 +169,7 @@ that `up --survive --install` created. Linux only.
 | `PORT` | Used as `merge.port` when it is not set (cloud platforms). |
 | `XDG_RUNTIME_DIR` | Runtime directory for sockets, PID files, journals, and receipts; otherwise the per-user cache directory. |
 | `PROC_COMPOSE_OWNER` | Owner label shown by `sessions`. |
+| `PROC_COMPOSE_JOB_DIR` | Absolute persistent job root; keep the same override when reconnecting. |
 | `PROC_COMPOSE_INSTALL_DIR`, `PROC_COMPOSE_VERSION` | `install.sh` target directory and release tag. |
 
 Runtime files are `<runtime-dir>/pc-<hash>.sock` (a named pipe on Windows),

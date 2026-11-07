@@ -20,6 +20,35 @@ sets `config_sha256: null`, and marks startup and its validation `not_needed`.
 A pass proves the command and cleanup, not stack readiness. No dummy service is
 needed. A live session is refused rather than shared or stopped.
 
+## Background jobs
+
+```sh
+proc-compose run --background --json -- go test ./...
+proc-compose verify --background --json api -- npm run test:integration
+proc-compose jobs wait JOB_ID --timeout 30s --json
+proc-compose jobs logs JOB_ID --json --after start -n 30 --max-bytes 8192
+proc-compose jobs cancel JOB_ID --timeout 1m --json
+```
+
+Save `job_id`, not a PID. Launch exit 0 means the detached worker acknowledged
+ownership, not that tests passed. Without `--session`, jobs get unique sessions.
+Retrieve from any working directory using the ID; background evidence uses
+`jobs`, while foreground evidence uses `attempts` and `why --attempt`.
+
+`jobs wait` returns the terminal result's exit code (0/1/2/130). Exit 3 with
+`wait_timed_out: true` leaves the job running; continue other work and wait again
+later. `jobs show` and `jobs list` only query; their exit 0 is not a test verdict.
+Report success only with `terminal: true`, `state: passed`, and a passing result.
+`abandoned`/`indeterminate` are never success and do not prove cleanup. Cancel
+through `jobs cancel`, never by killing `owner_pid`; an interrupted job returns
+130, and its result includes the cleanup verdict.
+
+Records, receipts, and rotating journals live under the OS user config directory
+in `proc-compose/jobs`, or absolute `PROC_COMPOSE_JOB_DIR`, outside runtime/cache
+cleanup. They survive normal logout/reboot; the running commands do not survive
+reboot. Keep the same job-root override when reconnecting. Journals are bounded
+at 10 MiB plus three rotations; resume with `next_cursor` and respect `gap`.
+
 ## Local development loop
 
 ### Test watcher as a process
@@ -84,10 +113,9 @@ One owned operation: validate the config, acquire a fresh session, start the
 selected processes, wait for readiness, run the check, stop everything it
 started, and write a receipt.
 
-The selection must include a service; use `run` for standalone tests. Both
-commands run in the foreground; use the agent harness's managed background-command facility for
-asynchronous execution, and retrieve its terminal result before reporting a
-pass. Do not infer success from an active receipt or a successful launch.
+The selection must include a service; use `run` for standalone tests. Use
+`--background` for asynchronous execution and retrieve the terminal job result
+before reporting a pass. An active receipt or a successful launch is not a pass.
 
 ```sh
 proc-compose verify -- npm test
