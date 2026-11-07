@@ -4427,6 +4427,16 @@ func TestShutdown_UndeliveredVerdictIsJournaled(t *testing.T) {
 	if err := client.Send(ipc.Command{Action: "shutdown", Force: true}); err != nil {
 		t.Fatalf("send: %v", err)
 	}
+	// Send only writes to the socket. Wait for server admission before closing
+	// the client: otherwise Run's first broadcast can close the connection
+	// before readCommands consumes the shutdown request.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(server.Commands()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(server.Commands()) == 0 {
+		t.Fatal("shutdown command was not queued")
+	}
 	client.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())

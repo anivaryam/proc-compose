@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-11-07
+
+### Fixed
+
+- `up --silent --wait-ready` and `restart --wait-ready` recover when startup
+  log bursts disconnect their IPC subscriber while the daemon remains alive.
+  Recovery checks a fresh snapshot from the same daemon run, keeps the original
+  timeout and restart-generation requirement, and never reuses stale readiness.
+
 ## [1.12.0] - 2026-10-22
 
 ### Fixed
@@ -900,7 +909,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policies, readiness probes, dependencies, background daemon, monitor TUI,
   and merge-port integration.
 
-[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.12.0...HEAD
+[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.12.1...HEAD
+[1.12.1]: https://github.com/anivaryam/proc-compose/compare/v1.12.0...v1.12.1
 [1.12.0]: https://github.com/anivaryam/proc-compose/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/anivaryam/proc-compose/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/anivaryam/proc-compose/compare/v1.9.0...v1.10.0

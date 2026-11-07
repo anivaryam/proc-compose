@@ -267,17 +267,23 @@ auto-injection — see:
 				if err := waitForDaemonReady(pid, socketPath, paths.BootLog(hash), 10*time.Second, pidPath); err != nil {
 					return err
 				}
+				var project *ipc.Project
+				if waitReady || upJSON {
+					project, err = session.Read(paths.Metadata(hash))
+					if err != nil {
+						return err
+					}
+					if project.Owner == nil || project.Owner.PID != pid {
+						return fmt.Errorf("startup lost session ownership to another daemon; this invocation did not start that session")
+					}
+				}
 				if waitReady {
 					expected := waitReadyProcessNames(cfg, args)
-					if err := waitForProcessesReady(socketPath, expected, time.Duration(waitTimeout)*time.Second); err != nil {
+					if err := waitForProcessesReady(socketPath, expected, time.Duration(waitTimeout)*time.Second, project.RunID); err != nil {
 						return err
 					}
 				}
 				if upJSON {
-					project, err := session.Read(paths.Metadata(hash))
-					if err != nil {
-						return err
-					}
 					return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{"operation": "up", "pid": pid, "ready": waitReady, "project": project})
 				}
 				fmt.Printf("proc-compose daemon started\n")
@@ -694,8 +700,13 @@ Flag-parsing errors remain plain text and exit 1.`,
 			// Read the snapshot the daemon writes first before sending. An
 			// older daemon reads nothing until it is out, and a Windows named
 			// pipe does not buffer, so a command sent first would wait for it.
-			if _, err := client.Recv(); err != nil {
+			snapshot, err := client.Recv()
+			if err != nil {
 				return fmt.Errorf("no response from daemon: %w", err)
+			}
+			runID := ""
+			if snapshot.Project != nil {
+				runID = snapshot.Project.RunID
 			}
 			if err := client.Send(ipc.Command{Action: "restart", Process: args[0]}); err != nil {
 				return fmt.Errorf("failed to send restart command: %w", err)
@@ -715,7 +726,7 @@ Flag-parsing errors remain plain text and exit 1.`,
 							if ev.AckGeneration == 0 {
 								return fmt.Errorf("daemon does not expose process generations; restart it with the current proc-compose")
 							}
-							if err := waitForProcessesReady(socketPath, map[string]struct{}{args[0]: {}}, time.Duration(restartTimeout)*time.Second, map[string]uint64{args[0]: ev.AckGeneration}); err != nil {
+							if err := waitForProcessesReady(socketPath, map[string]struct{}{args[0]: {}}, time.Duration(restartTimeout)*time.Second, runID, map[string]uint64{args[0]: ev.AckGeneration}); err != nil {
 								return err
 							}
 							*restartResult.Ready = true

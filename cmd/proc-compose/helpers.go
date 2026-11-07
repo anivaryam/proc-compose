@@ -847,21 +847,31 @@ func waitReadyProcessNames(cfg *config.Config, filter []string) map[string]struc
 // until every name in `want` has been observed in a "ready" state, or until
 // timeout elapses (whichever comes first). Used by `up --silent --wait-ready`
 // to give scripts a hard guarantee that probes have passed before the next
-// step runs.
-func waitForProcessesReady(socketPath string, want map[string]struct{}, timeout time.Duration, minimum ...map[string]uint64) error {
+// step runs. runID pins the operation's daemon; when empty, the first snapshot
+// supplies it. Only an identified run can recover a disconnected log stream.
+func waitForProcessesReady(socketPath string, want map[string]struct{}, timeout time.Duration, runID string, minimum ...map[string]uint64) error {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	deadline := time.Now().Add(timeout)
 
-	client, err := ipc.Dial(socketPath)
+	dialTimeout := remainingUntil(deadline, connectBudget)
+	if dialTimeout <= 0 {
+		return fmt.Errorf("wait-ready: timed out after %s; not ready: %s", timeout, strings.Join(notReadyNames(want, nil), ", "))
+	}
+	client, err := ipc.DialTimeout(socketPath, dialTimeout)
 	if err != nil {
 		return fmt.Errorf("wait-ready: cannot dial daemon: %w", err)
 	}
-	defer client.Close()
+	defer func() {
+		if client != nil {
+			client.Close()
+		}
+	}()
 
 	ready := make(map[string]struct{}, len(want))
 	failed := make([]string, 0)
+	needSnapshot := runID != ""
 
 	// satisfied reports whether a state event should count towards the
 	// waiter. Readiness is a per-cycle latch, so it is only honoured while
@@ -931,10 +941,42 @@ func waitForProcessesReady(socketPath string, want map[string]struct{}, timeout 
 			if errors.Is(err, ipc.ErrRecvTimeout) {
 				return fmt.Errorf("wait-ready: timed out after %s; not ready: %s", timeout, strings.Join(notReadyNames(want, ready), ", "))
 			}
-			return fmt.Errorf("wait-ready: lost daemon connection: %w", err)
+			if !errors.Is(err, ipc.ErrDisconnected) || runID == "" {
+				return fmt.Errorf("wait-ready: lost daemon connection: %w", err)
+			}
+			// Log bursts can fill the subscriber's queue while the daemon
+			// remains healthy. Reconnect without extending the original budget,
+			// then require a complete snapshot from that same run. Cached ready
+			// flags cannot bridge the gap: a process may have exited meanwhile.
+			client.Close()
+			clear(ready)
+			needSnapshot = true
+			time.Sleep(min(100*time.Millisecond, time.Until(deadline)))
+			dialTimeout = remainingUntil(deadline, connectBudget)
+			if dialTimeout <= 0 {
+				continue
+			}
+			client, err = ipc.DialTimeout(socketPath, dialTimeout)
+			if err != nil {
+				return fmt.Errorf("wait-ready: lost daemon connection: %w", err)
+			}
+			continue
+		}
+		if needSnapshot && ev.Type != ipc.TypeSnapshot {
+			continue
 		}
 		switch ev.Type {
 		case ipc.TypeSnapshot:
+			observedRunID := ""
+			if ev.Project != nil {
+				observedRunID = ev.Project.RunID
+			}
+			if runID != "" && observedRunID != runID {
+				return fmt.Errorf("wait-ready: daemon identity changed; refusing another run's readiness")
+			}
+			runID = observedRunID
+			needSnapshot = false
+			clear(ready)
 			for _, p := range ev.Processes {
 				check(p)
 			}
