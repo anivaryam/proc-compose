@@ -172,6 +172,8 @@ that `up --survive --install` created. Linux only.
 | `XDG_RUNTIME_DIR` | Runtime directory for sockets, PID files, journals, and receipts; otherwise the per-user cache directory. |
 | `PROC_COMPOSE_OWNER` | Owner label shown by `sessions`. |
 | `PROC_COMPOSE_JOB_DIR` | Absolute persistent job root; keep the same override when reconnecting. |
+| `PROC_COMPOSE_ARTIFACT_DIR` | Injected per-attempt output directory for raw files retained with the result. |
+| `PROC_COMPOSE_JUNIT_REPORT` | Injected optional JUnit XML path; supplied failures or invalid reports prevent a pass. |
 | `PROC_COMPOSE_INSTALL_DIR`, `PROC_COMPOSE_VERSION` | `install.sh` target directory and release tag. |
 
 Runtime files are `<runtime-dir>/pc-<hash>.sock` (a named pipe on Windows),

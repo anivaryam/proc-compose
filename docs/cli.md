@@ -220,6 +220,40 @@ Cancellation uses the job's own mailbox; it never kills a stored PID or stops
 an unrelated session. An early worker failure can have `state: failed` and a
 `message` without a verification result. Flag parsing errors may be plain text.
 
+### Retained artifacts and JUnit
+
+Every owned check receives `PROC_COMPOSE_ARTIFACT_DIR`, an existing directory
+for report files, screenshots, traces and other output, and
+`PROC_COMPOSE_JUNIT_REPORT`, the optional `junit.xml` path inside it. For example:
+
+```sh
+proc-compose run --background --json -- sh -c 'pytest --junitxml "$PROC_COMPOSE_JUNIT_REPORT"'
+proc-compose jobs wait JOB_ID --json --timeout 30s
+proc-compose jobs show JOB_ID --json
+```
+
+The verification result/receipt exposes `artifacts.directory`, `files` (relative
+names and byte sizes), and `junit` (report path, status, testcase counts, up to
+five failure examples). `jobs show` includes this in its retained `result`.
+Raw files are preserved unchanged, including malformed and oversized reports.
+Background evidence survives runtime cleanup; foreground artifact directories
+have runtime-directory durability and are pruned with old verified receipts.
+Unverified cleanup retains the files without scanning them.
+
+JUnit counts come from `testcase` elements under `testsuite`/`testsuites`, avoiding
+double-counting aggregate suite attributes. UTF-8 reports are limited to 1 MiB
+and 64 XML nesting levels. Invalid/oversized reports, XML directives and positive
+summary-only reports fail with `test_report_invalid`. A report with testcase
+failures or errors fails with `test_report_failed` even if the check exits 0.
+Missing reports are optional; zero cases are labeled `empty`. Report text is
+untrusted application output; counts are the test tool's claims.
+
+The file index contains at most 64 entries, scans at most 256 entries and 16
+directory levels, and skips symlinks, special files and names over 512 bytes.
+Failure names/classes are bounded to 256 bytes, messages to 512 bytes, and the
+combined metadata to 8 KiB. `truncated` and `skipped` expose omitted evidence.
+These limits do not impose a disk quota on the check's artifact writes.
+
 ### Start all processes
 
 ```sh

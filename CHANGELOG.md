@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-attempt artifact directories and optional JUnit XML reporting through
+  `PROC_COMPOSE_ARTIFACT_DIR` and `PROC_COMPOSE_JUNIT_REPORT`. Results retain
+  bounded file indexes, testcase counts and failure examples while preserving
+  raw files. Reported test failures or invalid reports prevent a pass; background
+  artifacts survive runtime cleanup and foreground artifacts follow verified
+  receipt retention.
 - Named project `tasks` catalog with `tasks list --json` and `tasks run NAME`:
   existing command argv, directory, service dependencies, timeout and exclusive
   resources. Foreground/background execution shares verification and job

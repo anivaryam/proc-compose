@@ -71,6 +71,20 @@ func helper(mode, arg string) int {
 			return 5
 		}
 		return 0
+	case "artifacts":
+		dir := os.Getenv("PROC_COMPOSE_ARTIFACT_DIR")
+		if err := os.MkdirAll(filepath.Join(dir, "diagnostics"), 0700); err != nil {
+			return 5
+		}
+		if err := os.WriteFile(filepath.Join(dir, "diagnostics", "output.txt"), []byte("diagnostic evidence"), 0600); err != nil {
+			return 5
+		}
+		if arg != "missing" {
+			if err := os.WriteFile(os.Getenv("PROC_COMPOSE_JUNIT_REPORT"), []byte(arg), 0600); err != nil {
+				return 5
+			}
+		}
+		return 0
 	case "rep":
 		// The first repetition is the same on both sides, the second differs:
 		// a cross-side difference at a later repetition only.
@@ -352,6 +366,45 @@ func TestRun_StandaloneWithoutConfig(t *testing.T) {
 			}
 			if held, err := session.InstanceHeld(opts.Hash); err != nil || held {
 				t.Fatalf("standalone retained lease: held=%t err=%v", held, err)
+			}
+		})
+	}
+}
+
+func TestRun_ArtifactsAndJUnitVerdicts(t *testing.T) {
+	for _, tc := range []struct{ name, report, status, code string }{
+		{"pass", `<testsuite><testcase name="unit"/></testsuite>`, "parsed", ""},
+		{"missing", "missing", "missing", ""},
+		{"failure", `<testsuite><testcase name="unit"><failure message="bad result"/></testcase></testsuite>`, "parsed", CodeTestReportFailed},
+		{"invalid", `<testsuite><testcase/>`, "invalid", CodeTestReportInvalid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, serviceConfig)
+			withHelper(t, "artifacts")
+			opts := f.options(t, "artifacts", checkArgv("artifacts", tc.report)...)
+			opts.Standalone, opts.EvidenceDir = true, t.TempDir()
+			result := Run(context.Background(), opts)
+			assertComplete(t, result)
+			if result.Artifacts == nil || result.Artifacts.Status != "collected" || result.Artifacts.JUnit.Status != tc.status || result.Check.ExitCode == nil || *result.Check.ExitCode != 0 {
+				t.Fatalf("artifact result: %+v", result)
+			}
+			if tc.code == "" {
+				if result.ExitCode != ExitPassed {
+					t.Fatalf("unexpected failure: %+v", result)
+				}
+			} else if result.ExitCode != ExitFailed || len(result.Errors) != 1 || result.Errors[0].Code != tc.code {
+				t.Fatalf("JUnit did not fail an exit-zero check: %+v", result)
+			}
+			if err := os.RemoveAll(os.Getenv("XDG_RUNTIME_DIR")); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(result.Artifacts.Directory, "diagnostics", "output.txt")
+			if data, err := os.ReadFile(path); err != nil || string(data) != "diagnostic evidence" {
+				t.Fatalf("retained artifact: %q %v", data, err)
+			}
+			receipt, err := ReadReceipt(*result.ReceiptPath)
+			if err != nil || receipt.Artifacts == nil || receipt.Artifacts.JUnit.Status != tc.status {
+				t.Fatalf("retained summary: %+v %v", receipt, err)
 			}
 		})
 	}
@@ -1507,6 +1560,54 @@ func TestPrune_KeepsRecentTerminalAndAllNonterminal(t *testing.T) {
 	}
 	if _, err := os.Stat(activeOld); err != nil {
 		t.Fatal("active receipt was pruned")
+	}
+}
+
+func TestPrune_ArtifactsFollowVerifiedReceiptsOnly(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	external := filepath.Join(outside, "keep")
+	if err := os.WriteFile(external, []byte("external"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var last string
+	var old []string
+	for i := 0; i < RetainedTerminalReceipts+5; i++ {
+		state := StateCompleted
+		if i == 0 {
+			state = StateActive
+		}
+		last = writeTestReceipt(t, dir, i, state)
+		receipt, err := ReadReceipt(last)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt.Artifacts = &Artifacts{Directory: outside} // not deletion authority
+		receipt.Cleanup.TerminationVerified = ptr(i != 1)
+		if err := WriteReceipt(last, receipt); err != nil {
+			t.Fatal(err)
+		}
+		path := artifactDirectory(dir, *receipt.AttemptID)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "raw"), []byte("raw"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		old = append(old, path)
+	}
+	if err := Prune(dir, last); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{old[0], old[1], old[len(old)-1], outside} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("protected artifacts removed: %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(old[2]); !os.IsNotExist(err) {
+		t.Fatalf("old verified artifacts retained: %v", err)
+	}
+	if data, err := os.ReadFile(external); err != nil || string(data) != "external" {
+		t.Fatal("pruning trusted stored artifact path")
 	}
 }
 

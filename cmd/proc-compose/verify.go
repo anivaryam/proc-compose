@@ -225,6 +225,13 @@ terminal verdict, jobs logs for retained output, and jobs cancel for cleanup.
 Without --session each background job gets a unique session. Job evidence lives
 under the user config directory's proc-compose/jobs, or PROC_COMPOSE_JOB_DIR,
 independently of runtime cleanup; use jobs rather than attempts to retrieve it.`
+	command.Long += `
+
+Checks receive PROC_COMPOSE_ARTIFACT_DIR for retained files and
+PROC_COMPOSE_JUNIT_REPORT for an optional junit.xml. Results include a bounded
+file index and testcase-based JUnit counts/failure examples after cleanup.
+A supplied failing or invalid report fails the operation even if the command
+exits 0; missing reports do not change the verdict. Raw files are preserved.`
 	usageFlagErrors(command)
 	command.Flags().BoolVar(&machine, "json", false, "emit exactly one JSON result object on stdout")
 	command.Flags().BoolVar(&background, "background", false, "detach with a persistent job ID; use jobs wait for the verdict")
@@ -314,6 +321,12 @@ func printVerifyHuman(w io.Writer, r *verify.Result) {
 	}
 	fmt.Fprintf(w, "  %s\n", strings.Join(r.Check.Argv, " "))
 	printEnvironmentHuman(w, r.Environment)
+	if a := r.Artifacts; a != nil {
+		fmt.Fprintf(w, "  artifacts: %s (%s)\n", a.Directory, a.Status)
+		if a.JUnit.Status != "missing" && a.JUnit.Status != verify.StatusNotRun {
+			fmt.Fprintf(w, "  junit:    %s; %d tests, %d failures, %d errors, %d skipped\n", a.JUnit.Status, a.JUnit.Tests, a.JUnit.Failures, a.JUnit.Errors, a.JUnit.Skipped)
+		}
+	}
 	fmt.Fprintf(w, "  cleanup:  %s (signalling authority %s)\n", r.Cleanup.Status, r.Cleanup.SignalingAuthority)
 	for _, u := range r.Cleanup.UnresolvedProcesses {
 		fmt.Fprintf(w, "    unresolved: %s (%s)\n", u.Name, u.Identity)

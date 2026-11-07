@@ -140,3 +140,76 @@ func TestReadEnvironmentReport_RefusesNonRegularFiles(t *testing.T) {
 		}
 	}
 }
+
+func TestArtifacts_RefusesSymlinksAndFIFOs(t *testing.T) {
+	dir := t.TempDir()
+	external := t.TempDir()
+	if err := os.WriteFile(filepath.Join(external, "secret"), []byte("outside"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, JUnitFile)
+	if err := syscall.Mkfifo(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *Artifacts, 1)
+	go func() { done <- collectArtifacts(dir) }()
+	select {
+	case a := <-done:
+		if a.JUnit.Status != "invalid" || len(a.Files) != 0 || a.Skipped != 2 {
+			t.Fatalf("special artifacts accepted: %+v", a)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("artifact indexing blocked on a FIFO")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(external, "secret"), path); err != nil {
+		t.Fatal(err)
+	}
+	if s := readJUnit(path); s.Status != "invalid" {
+		t.Fatalf("followed report symlink: %+v", s)
+	}
+	if a := collectArtifacts(filepath.Join(dir, "link")); a.Status != "unavailable" {
+		t.Fatalf("followed artifact root symlink: %+v", a)
+	}
+}
+
+func TestPrune_RefusesArtifactParentSymlink(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(dir, "artifacts")); err != nil {
+		t.Fatal(err)
+	}
+	var oldest, last string
+	for i := 0; i <= RetainedTerminalReceipts; i++ {
+		last = writeTestReceipt(t, dir, i, StateCompleted)
+		if i == 0 {
+			oldest = last
+		}
+		receipt, err := ReadReceipt(last)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt.Artifacts = &Artifacts{Directory: outside}
+		receipt.Cleanup.TerminationVerified = ptr(true)
+		if err := WriteReceipt(last, receipt); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(outside, *receipt.AttemptID), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Prune(dir, last); err == nil {
+		t.Fatal("pruning followed a symlink parent")
+	}
+	if _, err := ReadReceipt(oldest); err != nil {
+		t.Fatalf("refused pruning deleted the receipt: %v", err)
+	}
+	entries, err := os.ReadDir(outside)
+	if err != nil || len(entries) != RetainedTerminalReceipts+1 {
+		t.Fatalf("external directories changed: %d %v", len(entries), err)
+	}
+}

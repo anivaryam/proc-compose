@@ -35,6 +35,51 @@ func cleanupJob(t *testing.T, store *jobs.Store, id string) {
 	})
 }
 
+func TestJobArtifactHelper(t *testing.T) {
+	path := os.Getenv("PROC_COMPOSE_JUNIT_REPORT")
+	if path == "" {
+		return
+	}
+	if err := os.WriteFile(path, []byte(`<testsuite><testcase name="regression"><failure message="expected 2, got 1"/></testcase></testsuite>`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(os.Getenv("PROC_COMPOSE_ARTIFACT_DIR"), "trace.txt"), []byte("raw trace"), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJobsCLI_RetainedArtifactsAndJUnitFailure(t *testing.T) {
+	bin := buildTestBinary(t)
+	dir, runtimeDir := t.TempDir(), t.TempDir()
+	t.Setenv("PROC_COMPOSE_JOB_DIR", t.TempDir())
+	store, err := jobs.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := runVerifyCLIIn(t, bin, dir, runtimeDir, "run", "--background", "--json", "--", os.Args[0], "-test.run=^TestJobArtifactHelper$")
+	if code != 0 {
+		t.Fatalf("launch: %d %s %s", code, stdout, stderr)
+	}
+	job := decodeJob(t, stdout)
+	cleanupJob(t, store, job.ID)
+	stdout, stderr, code = runVerifyCLI(t, bin, dir, "jobs", "wait", job.ID, "--json", "--timeout", "10s")
+	job = decodeJob(t, stdout)
+	if code != 1 || !job.Terminal || job.Result == nil || job.Result.Artifacts == nil || job.Result.Artifacts.JUnit.Failures != 1 || *job.Result.Check.ExitCode != 0 || job.Result.Cleanup.Status != "passed" {
+		t.Fatalf("retained report failure: %d %s %s", code, stdout, stderr)
+	}
+	if err := os.RemoveAll(runtimeDir); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code = runVerifyCLI(t, bin, t.TempDir(), "jobs", "show", job.ID, "--json")
+	job = decodeJob(t, stdout)
+	if code != 0 || len(job.Result.Artifacts.Files) != 2 || job.Result.Artifacts.JUnit.Examples[0].Name != "regression" {
+		t.Fatalf("reconnect: %d %s %s", code, stdout, stderr)
+	}
+	if data, err := os.ReadFile(filepath.Join(job.Result.Artifacts.Directory, "trace.txt")); err != nil || string(data) != "raw trace" {
+		t.Fatalf("retained raw file: %q %v", data, err)
+	}
+}
+
 func TestJobsCLI_BackgroundReconnectFailureAndCancel(t *testing.T) {
 	bin := buildTestBinary(t)
 	dir, runtimeDir := t.TempDir(), t.TempDir()

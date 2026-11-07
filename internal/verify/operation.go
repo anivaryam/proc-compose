@@ -401,6 +401,8 @@ func (a *attempt) run(ctx context.Context) *Result {
 	res.ReceiptPath = &receiptPath
 	journalPath := plan.Project.JournalPath
 	res.Evidence.Journal = &journalPath
+	artifactDir := artifactDirectory(evidenceDir, attemptID)
+	res.Artifacts = &Artifacts{Directory: artifactDir, Status: "pending", Files: []ArtifactFile{}, JUnit: JUnitSummary{Path: JUnitFile, Status: StatusNotRun, Examples: []TestFailure{}}}
 
 	// Active receipt before any process is launched.
 	res.Kind, res.State, res.Phase = KindReceipt, StateActive, PhaseStarting
@@ -419,6 +421,22 @@ func (a *attempt) run(ctx context.Context) *Result {
 
 	a.startAndCheck(ctx)
 	a.cleanup()
+	if res.Cleanup.TerminationVerified != nil && *res.Cleanup.TerminationVerified {
+		res.Artifacts = collectArtifacts(artifactDir)
+		if res.Artifacts.Status == "unavailable" {
+			a.errs.Add(CodeArtifactsUnavailable)
+		}
+		switch res.Artifacts.JUnit.Status {
+		case "invalid", "too_large":
+			a.errs.Add(CodeTestReportInvalid)
+		case "parsed":
+			if res.Artifacts.JUnit.Failures > 0 || res.Artifacts.JUnit.Errors > 0 {
+				a.errs.Add(CodeTestReportFailed)
+			}
+		}
+	} else {
+		res.Artifacts.Status, res.Artifacts.JUnit.Status = "unverified", "unverified"
+	}
 	a.collectEvidence()
 	sourceAfter := observeSource(res.Workdir, opts.now)
 	if a.source.ok && sourceAfter.ok && !sourceAfter.equal(a.source) {
@@ -463,6 +481,12 @@ func (a *attempt) persistTerminal(path string) error {
 
 func (a *attempt) startAndCheck(ctx context.Context) {
 	res, plan, opts := a.result, a.plan, a.opts
+	if err := os.MkdirAll(res.Artifacts.Directory, 0700); err != nil {
+		fmt.Fprintf(opts.Log, "verify: artifact directory: %v\n", err)
+		a.failStartup(CodeArtifactsUnavailable, StatusFailed)
+		a.beginCleanup()
+		return
+	}
 	startupStart := opts.now()
 	startupDeadline := startupStart.Add(opts.StartupTimeout)
 	res.Startup.StartedAt, res.Startup.DeadlineAt = timestamp(startupStart), timestamp(startupDeadline)
@@ -1087,6 +1111,8 @@ func (a *attempt) checkEnv() map[string]string {
 		"PROC_COMPOSE_SESSION_DIR":        project.Directory,
 		"PROC_COMPOSE_RUN_ID":             project.RunID,
 		"PROC_COMPOSE_ENVIRONMENT_REPORT": environmentReportPath(project.Directory, *a.result.AttemptID),
+		"PROC_COMPOSE_ARTIFACT_DIR":       a.result.Artifacts.Directory,
+		"PROC_COMPOSE_JUNIT_REPORT":       filepath.Join(a.result.Artifacts.Directory, JUnitFile),
 	} {
 		env[key] = value
 	}

@@ -61,6 +61,39 @@ proc-compose jobs cancel JOB_ID --timeout 1m --json
   commands do not survive reboot. Journals retain 10 MiB plus three rotations.
   Background receipts use `jobs`, not the session's runtime-only `attempts`.
 
+## Artifacts and test reports
+
+Checks receive `PROC_COMPOSE_ARTIFACT_DIR` (an existing per-attempt directory)
+and `PROC_COMPOSE_JUNIT_REPORT` (its `junit.xml` path). Point existing test
+reporters at that path and put traces/screenshots/other outputs in the directory:
+
+```sh
+proc-compose run --background --json -- sh -c 'pytest --junitxml "$PROC_COMPOSE_JUNIT_REPORT"'
+proc-compose jobs wait JOB_ID --timeout 30s --json
+proc-compose jobs show JOB_ID --json
+```
+
+The response/receipt's `artifacts` object contains the directory, a bounded file
+index, and `junit` counts plus failure examples. Paths inside the index and
+`junit.path` are relative to `artifacts.directory`. Raw files remain unchanged.
+Background artifacts survive runtime cleanup; foreground artifacts share the
+receipt's runtime-directory lifetime and are pruned with old verified receipts.
+Artifacts with unverified cleanup are retained without scanning.
+
+JUnit supports UTF-8 `testsuite`/`testsuites` trees and counts `testcase` outcomes,
+not duplicated aggregate suite totals. Reports over 1 MiB, invalid XML, unsupported
+directives, or summary-only positive counters are `test_report_invalid`; supplied
+case failures/errors cause `test_report_failed` even when the check exits 0.
+A missing report is optional; an empty suite reports `empty`, not test coverage.
+Existing failed checks and cleanup failures remain failures. Reports are the
+test tool's claims, not independent attestations; their text is application data.
+
+At most 5 failure examples (256-byte names/classes, 512-byte messages) and 64
+file entries are returned; scanning stops at 256 entries/16 nested directories.
+Artifact metadata is bounded to 8 KiB, with `truncated`/`skipped` indicators.
+Symlinks and special files are excluded; the report must be a regular file.
+These limits bound summaries/indexing, not bytes written by the check.
+
 ## Named project tasks
 
 Discover explicit commands with `proc-compose tasks list --json`; run one with

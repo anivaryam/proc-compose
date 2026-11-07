@@ -90,22 +90,25 @@ const (
 
 // Stable v1 error codes.
 const (
-	CodeUsage               = "usage_error"
-	CodeInvalidConfig       = "invalid_configuration"
-	CodeSessionOccupied     = "session_occupied"
-	CodeResourceUnavailable = "resource_unavailable"
-	CodeStartupFailed       = "startup_failed"
-	CodeStartupTimeout      = "startup_timeout"
-	CodeCheckStartFailed    = "check_start_failed"
-	CodeCheckExitNonzero    = "check_exit_nonzero"
-	CodeCheckTimeout        = "check_timeout"
-	CodeRequiredFailed      = "required_process_failed"
-	CodeInterrupted         = "interrupted"
-	CodeCleanupUnverified   = "cleanup_unverified"
-	CodeTeardownFailed      = "teardown_failed"
-	CodeReceiptPersistence  = "receipt_persistence_failed"
-	CodeResultSizeLimit     = "result_size_limit"
-	CodeEvidenceUnavailable = "evidence_unavailable"
+	CodeUsage                = "usage_error"
+	CodeInvalidConfig        = "invalid_configuration"
+	CodeSessionOccupied      = "session_occupied"
+	CodeResourceUnavailable  = "resource_unavailable"
+	CodeStartupFailed        = "startup_failed"
+	CodeStartupTimeout       = "startup_timeout"
+	CodeCheckStartFailed     = "check_start_failed"
+	CodeCheckExitNonzero     = "check_exit_nonzero"
+	CodeCheckTimeout         = "check_timeout"
+	CodeRequiredFailed       = "required_process_failed"
+	CodeInterrupted          = "interrupted"
+	CodeCleanupUnverified    = "cleanup_unverified"
+	CodeTeardownFailed       = "teardown_failed"
+	CodeReceiptPersistence   = "receipt_persistence_failed"
+	CodeResultSizeLimit      = "result_size_limit"
+	CodeEvidenceUnavailable  = "evidence_unavailable"
+	CodeArtifactsUnavailable = "artifacts_unavailable"
+	CodeTestReportInvalid    = "test_report_invalid"
+	CodeTestReportFailed     = "test_report_failed"
 	// The check's environment report found a mismatch.
 	CodeEnvironmentIneligible = "environment_ineligible"
 	// The environment report was invalid, or required and missing or empty.
@@ -327,6 +330,7 @@ type Result struct {
 	// Its config_path is an identity anchor, not a loaded configuration.
 	Standalone        bool                `json:"standalone,omitempty"`
 	TaskName          string              `json:"task_name,omitempty"`
+	Artifacts         *Artifacts          `json:"artifacts,omitempty"`
 	SchemaVersion     int                 `json:"schema_version"`
 	Kind              string              `json:"kind"`
 	State             string              `json:"state"`
