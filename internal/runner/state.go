@@ -27,9 +27,14 @@ type procState struct {
 	// Readiness signaling for depends_on.
 	// All fields below are guarded by mu so that resetReady (called between
 	// run iterations) cannot race with markReady or with depends_on waiters.
-	readyCh     chan struct{} // closed once the process is ready (or exits before becoming ready)
-	readyClosed bool          // true once readyCh has been closed for the current cycle
-	readyOK     bool          // true if the process actually became ready (vs exiting before ready)
+	readyCycle *readyCycle // the current readiness cycle
+	// readyDisposition is the process's final lifecycle verdict: readyTerminal
+	// once its lifecycle is over and it will not run again, readyStopped once
+	// the run is stopping. It is published together with the state transition
+	// it belongs to, so a dependent can ask what became of the dependency
+	// without racing that transition. A new incarnation clears it, because that
+	// incarnation can run again.
+	readyDisposition readyOutcome
 
 	// probeFailed records that this incarnation was cancelled because its
 	// readiness probe failed. The cancel alone is not a verdict: a command that
@@ -74,7 +79,7 @@ func newStateStore(infos []procInfo) *stateStore {
 			state:      "starting",
 			active:     true,
 			colorIndex: p.colorIndex,
-			readyCh:    make(chan struct{}),
+			readyCycle: newReadyCycle(),
 			restartCh:  make(chan struct{}, 1),
 		}
 		s.infoByName[p.name] = p
@@ -82,28 +87,74 @@ func newStateStore(infos []procInfo) *stateStore {
 	return s
 }
 
-// markReady closes readyCh so that any depends_on waiters unblock.
-// ok=true means the process became genuinely ready; ok=false means it
-// exited/failed before becoming ready (waiters should treat this as failure).
+// readyOutcome is the verdict a readiness cycle settles with.
+//
+// A cycle is the unit a depends_on waiter waits on. A cycle that ends without
+// a verdict (readyAgain) is not the end of the wait: the dependency's
+// incarnation ended and another one follows, so the next cycle carries the
+// readiness.
+type readyOutcome int
+
+const (
+	// readyUnset means the cycle has not settled yet.
+	readyUnset readyOutcome = iota
+	// readySatisfied means the process became ready.
+	readySatisfied
+	// readyTerminal means the process's lifecycle is over and it will not run
+	// again, so a dependent must fail rather than wait for a readiness that
+	// will never come.
+	readyTerminal
+	// readyAgain means the cycle ended without a verdict; a later cycle may
+	// carry the readiness.
+	readyAgain
+	// readyStopped means the run is stopping; no verdict will come.
+	readyStopped
+)
+
+// readyCycle is one readiness cycle.
+//
+// The channel is closed when the cycle settles, and the outcome is written
+// before the close, so a waiter that wakes on the channel reads the verdict of
+// the cycle it waited for. The outcome is guarded by the owning procState's
+// mutex, like the pointer to the cycle itself.
+type readyCycle struct {
+	ch      chan struct{}
+	outcome readyOutcome
+}
+
+// newReadyCycle returns an unsettled readiness cycle.
+func newReadyCycle() *readyCycle { return &readyCycle{ch: make(chan struct{})} }
+
+// neverReadyCycle is the fallback a process without a cycle waits on. Its
+// channel is never closed, so the wait ends on cancellation alone.
+var neverReadyCycle = &readyCycle{ch: make(chan struct{})}
+
+// markReady settles the current readiness cycle.
+// ok=true means the process became genuinely ready; ok=false means its
+// lifecycle is over and waiters must treat this as a failure (readyTerminal).
 // Safe to call multiple times within a cycle; only the first call has any
 // effect. After resetReady the cycle is renewed and markReady can fire again.
 func (st *procState) markReady(ok bool) bool {
-	return st.latchReady(ok, nil)
+	if ok {
+		return st.latchReady(readySatisfied, nil)
+	}
+	return st.latchReady(readyTerminal, nil)
 }
 
-// latchReady closes the current cycle's readyCh. admit, when set, is evaluated
-// under st.mu and can refuse the latch.
-func (st *procState) latchReady(ok bool, admit func() bool) bool {
+// latchReady settles the current cycle with outcome. admit, when set, is
+// evaluated under st.mu and can refuse the latch.
+func (st *procState) latchReady(outcome readyOutcome, admit func() bool) bool {
 	st.mu.Lock()
-	if st.readyClosed || (admit != nil && !admit()) {
-		st.mu.Unlock()
+	defer st.mu.Unlock()
+	cycle := st.readyCycle
+	if cycle == nil || cycle.outcome != readyUnset {
 		return false
 	}
-	st.readyClosed = true
-	st.readyOK = ok
-	ch := st.readyCh
-	st.mu.Unlock()
-	close(ch)
+	if admit != nil && !admit() {
+		return false
+	}
+	cycle.outcome = outcome
+	close(cycle.ch)
 	return true
 }
 
@@ -117,7 +168,11 @@ func (st *procState) latchReady(ok bool, admit func() bool) bool {
 // set, is recorded in the same critical section, so no snapshot shows the
 // readiness without who answered it.
 func (st *procState) markReadyFor(ctx context.Context, gen uint64, ok bool, owner *ipc.EndpointOwner) bool {
-	return st.latchReady(ok, func() bool {
+	outcome := readyTerminal
+	if ok {
+		outcome = readySatisfied
+	}
+	return st.latchReady(outcome, func() bool {
 		if st.probeFailed || ctx.Err() != nil || st.generation != gen {
 			return false
 		}
@@ -137,7 +192,7 @@ func (st *procState) markReadyFor(ctx context.Context, gen uint64, ok bool, owne
 func (st *procState) recordRefusedOwner(gen uint64, owner *ipc.EndpointOwner) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.generation != gen || (st.readyClosed && st.readyOK) {
+	if st.generation != gen || st.readySettled() {
 		return false
 	}
 	st.readinessOwner = owner
@@ -167,7 +222,7 @@ func (st *procState) recordHealthOwner(ctx context.Context, gen uint64, owner *i
 func (st *procState) failReadinessFor(ctx context.Context, gen uint64, msg string) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if ctx.Err() != nil || st.generation != gen || (st.readyClosed && st.readyOK) {
+	if ctx.Err() != nil || st.generation != gen || st.readySettled() {
 		return false
 	}
 	st.probeFailed = true
@@ -259,7 +314,7 @@ func (st *procState) recordHealthSkipped(ctx context.Context, gen uint64, detail
 // service is no longer ready, while a task that completed successfully
 // stays ready. Callers must hold st.mu.
 func (st *procState) currentlyReady() bool {
-	if !st.readyClosed || !st.readyOK {
+	if !st.readySettled() {
 		return false
 	}
 	switch st.state {
@@ -268,6 +323,12 @@ func (st *procState) currentlyReady() bool {
 	default:
 		return false
 	}
+}
+
+// readySettled reports whether the current cycle already settled with the
+// ready verdict. Callers must hold st.mu.
+func (st *procState) readySettled() bool {
+	return st.readyCycle != nil && st.readyCycle.outcome == readySatisfied
 }
 
 // currentHealth is the health verdict to advertise right now. A verdict
@@ -294,20 +355,110 @@ func (st *procState) requestRestart() {
 }
 
 // resetReady prepares readiness state for a new run cycle (e.g., after restart).
+//
+// The cycle a depends_on waiter may already be holding is settled with
+// readyAgain and never replaced silently: the waiter is woken with a verdict
+// it can act on, and only then does the fresh cycle become current. A cycle
+// that already settled keeps its verdict — a published outcome is immutable —
+// and only the fresh cycle is installed.
+//
+// The lifecycle verdict is cleared with it: the cycle that ends here is not the
+// end of the process's life, so the previous verdict no longer describes what
+// became of it. A dependent cancelled before the next incarnation starts must
+// end as "exited", not be failed by a verdict that belongs to the cycle that
+// just ended.
 func (st *procState) resetReady() {
 	st.mu.Lock()
-	st.readyCh = make(chan struct{})
-	st.readyClosed = false
-	st.readyOK = false
-	st.mu.Unlock()
+	defer st.mu.Unlock()
+	st.settleLocked(readyAgain)
+	st.readyCycle = newReadyCycle()
+	st.readyDisposition = readyUnset
 }
 
-// readyChannel returns the current readiness channel under lock so callers
-// see a coherent view that resetReady cannot tear out from under them.
-func (st *procState) readyChannel() chan struct{} {
+// settleLocked publishes outcome on the current cycle, unless it already
+// settled: a published outcome is never overwritten. Callers must hold st.mu.
+func (st *procState) settleLocked(outcome readyOutcome) {
+	cycle := st.readyCycle
+	if cycle == nil || cycle.outcome != readyUnset {
+		return
+	}
+	cycle.outcome = outcome
+	close(cycle.ch)
+}
+
+// currentReadyCycle returns the cycle a depends_on waiter must wait on.
+func (st *procState) currentReadyCycle() *readyCycle {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return st.readyCh
+	if st.readyCycle == nil {
+		return neverReadyCycle
+	}
+	return st.readyCycle
+}
+
+// outcomeOf returns the verdict the given cycle settled with.
+func (st *procState) outcomeOf(cycle *readyCycle) readyOutcome {
+	if cycle == nil {
+		return readyUnset
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return cycle.outcome
+}
+
+// disposition returns the process's final lifecycle verdict: readyTerminal
+// once its lifecycle is over, readyStopped once the run is stopping, and
+// readyUnset while it can still run again.
+func (st *procState) disposition() readyOutcome {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.readyDisposition
+}
+
+// failProcess transitions the process to the failed state, records msg as the
+// last error and publishes the terminal readiness verdict.
+//
+// The transition and the verdict are one atomic step, so a dependent that asks
+// what became of the dependency can never see the verdict before the
+// transition it belongs to.
+func (st *procState) failProcess(msg string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.state = "failed"
+	if msg != "" {
+		st.lastError = msg
+	}
+	st.readyDisposition = readyTerminal
+	st.settleLocked(readyTerminal)
+}
+
+// endProcess transitions the process to the exited state and publishes the
+// terminal readiness verdict: the lifecycle is over and the process will not
+// run again, so a dependent must fail rather than wait for a readiness that
+// will never come.
+//
+// The state stays "exited": a clean exit is not a failure of the process
+// itself, only of the dependent that can no longer start.
+func (st *procState) endProcess() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.state = "exited"
+	st.readyDisposition = readyTerminal
+	st.settleLocked(readyTerminal)
+}
+
+// stopProcess transitions the process to the exited state and publishes the
+// stopped readiness verdict: the run is stopping, so no verdict about
+// readiness will come. msg, when set, becomes the last error.
+func (st *procState) stopProcess(msg string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.state = "exited"
+	if msg != "" {
+		st.lastError = msg
+	}
+	st.readyDisposition = readyStopped
+	st.settleLocked(readyStopped)
 }
 
 func (s *stateStore) get(name string) *procState {

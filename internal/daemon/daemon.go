@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/anivaryam/proc-compose/internal/sharedfile"
 )
 
 // Record is the PID file's content: the daemon's own identity and, on Unix,
@@ -63,7 +65,12 @@ func ExitedState(state byte) bool {
 
 // Reexec re-executes the current binary with args, fully detached from the
 // terminal (new session, stdin closed, stdout+stderr → logPath).
-// Returns as soon as the child is launched; does NOT wait.
+// Returns as soon as the child is launched.
+//
+// The child is reaped in the background once it exits, so an exited daemon
+// does not linger as a zombie for as long as the starter lives: a zombie
+// keeps its pid and still answers signal 0, which would make a dead daemon
+// look alive.
 func Reexec(args []string, logPath string) (int, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -87,7 +94,15 @@ func Reexec(args []string, logPath string) (int, error) {
 	}
 
 	pid := cmd.Process.Pid
-	cmd.Process.Release()
+	// Wait for the child in the background: the wait reaps it when it exits.
+	// The error is irrelevant here — the daemon's exit status is the child's
+	// own business, and the starter is already gone by then. cmd.Wait closes
+	// only the descriptors it created itself; stdout and stderr are the *os.File
+	// lf, which exec uses directly and never closes, so lf.Close below stays
+	// responsible for it.
+	go func() {
+		_ = cmd.Wait()
+	}()
 	lf.Close()
 	return pid, nil
 }
@@ -104,6 +119,12 @@ func WritePID(pidPath string, pid int, addr string) error {
 // ErrNotOwner reports a PID file that now names another process, such as a
 // second daemon that recreated it after the first one's file was deleted.
 var ErrNotOwner = errors.New("PID file belongs to another process")
+
+// syncDir flushes the directory a file was renamed into, so the directory
+// entry survives a machine-level failure. It is a package-level var so the
+// error path can be exercised; the platform implementation lives next to the
+// other platform code.
+var syncDir = syncDirectory
 
 // WriteGroups replaces the process-group record in an existing PID file,
 // keeping the daemon's pid, address and start time and stamping the current
@@ -139,6 +160,17 @@ func writeRecord(pidPath string, rec Record) error {
 // WriteFileAtomic writes data to path through a temporary file in the same
 // directory that is synced and then renamed over path, so a reader never
 // observes a partial file. The directory must already exist.
+//
+// The rename goes through sharedfile.Replace: on Windows a rename over a file
+// that a reader has open fails unless the reader allows delete sharing and the
+// rename uses POSIX semantics, so readers of these files read through
+// sharedfile as well.
+//
+// After the rename the parent directory is flushed as well, so the directory
+// entry the rename created survives a machine-level failure and not only the
+// file's contents. That step is best-effort hardening: this helper promises
+// reader-atomicity, not durability, and the artifacts it writes live in a
+// runtime directory that is documented as ephemeral.
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -160,13 +192,22 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := sharedfile.Replace(tmp.Name(), path); err != nil {
+		return err
+	}
+	// Flush the directory entry the rename created. The error is discarded on
+	// purpose: a filesystem that cannot flush a directory (Windows, some
+	// network and FUSE mounts) must not turn a successful rename into a
+	// failed write.
+	_ = syncDir(filepath.Dir(path))
+	return nil
 }
 
 // ReadRecord reads the whole PID file. A file that does not parse is an error;
-// it is never treated as a legacy file without groups.
+// it is never treated as a legacy file without groups. It reads through
+// sharedfile, so a concurrent WriteFileAtomic still succeeds on Windows.
 func ReadRecord(pidPath string) (Record, error) {
-	data, err := os.ReadFile(pidPath)
+	data, err := sharedfile.ReadFile(pidPath)
 	if err != nil {
 		return Record{}, err
 	}

@@ -75,6 +75,40 @@ func testServer(t *testing.T, status int, body string) (*httptest.Server, func()
 	}
 }
 
+// stallingEndpoint points c at a server that accepts every request and never
+// answers while the test runs, and returns its request count.
+//
+// Cleanups run LIFO, so the one registered here runs before the server is
+// closed and before the cache directory (testChecker's t.TempDir) is removed:
+// it releases the handler and joins the refresh c scheduled. An abandoned
+// lookup therefore cannot write into the cache directory while it is being
+// removed.
+func stallingEndpoint(t *testing.T, c *Checker) func() int {
+	t.Helper()
+	release := make(chan struct{})
+	var mu sync.Mutex
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() {
+		close(release)
+		if !c.WaitRefresh(10 * time.Second) {
+			t.Error("the abandoned refresh did not finish after the endpoint was released")
+		}
+	})
+	c.endpoint = srv.URL
+	return func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits
+	}
+}
+
 func releaseJSON(tag string, draft, prerelease bool) string {
 	return `{"tag_name":"` + tag + `","draft":` + boolJSON(draft) + `,"prerelease":` + boolJSON(prerelease) + `}`
 }
@@ -768,6 +802,14 @@ func TestRefresh_UnwritableCacheIsSilent(t *testing.T) {
 	if latest := c.Notice("v1.0.0"); latest != "" {
 		t.Errorf("Notice() = %q with an unwritable cache, want \"\"", latest)
 	}
+	// An attempt that cannot be recorded has no backoff to hold, so it is not
+	// made: a caller joining it would otherwise wait on every invocation.
+	c.refreshMu.Lock()
+	scheduled := c.refreshDone != nil
+	c.refreshMu.Unlock()
+	if scheduled {
+		t.Error("an attempt that cannot be recorded scheduled a lookup")
+	}
 }
 
 func TestRefresh_ConcurrentWritesLeaveACompleteFile(t *testing.T) {
@@ -962,8 +1004,107 @@ func TestNotice_SchedulesAtMostOneRefreshPerChecker(t *testing.T) {
 	}
 }
 
-// ── defaults ─────────────────────────────────────────────────────────────────
+// TestWaitRefresh_ReturnsWhenTheRefreshFinishes proves the join can observe
+// the completion of the refresh this Checker scheduled: the result is recorded
+// and the wait reports that nothing is pending any more.
+func TestWaitRefresh_ReturnsWhenTheRefreshFinishes(t *testing.T) {
+	c, path := testChecker(t)
+	srv, _ := testServer(t, http.StatusOK, releaseJSON("v1.3.0", false, false))
+	c.endpoint = srv.URL
 
+	if got := c.Notice("v1.2.0"); got != "" {
+		t.Fatalf("Notice() = %q with no cache, want \"\"", got)
+	}
+	if !c.WaitRefresh(10 * time.Second) {
+		t.Fatal("WaitRefresh reported a pending refresh after the endpoint answered")
+	}
+	entry := readCacheFile(t, path)
+	if entry.Latest != "v1.3.0" {
+		t.Fatalf("recorded latest = %q, want v1.3.0", entry.Latest)
+	}
+}
+
+// TestWaitRefresh_ReturnsAtTheBudgetWhenTheEndpointStalls pins the bound: a
+// lookup that has not answered within the budget is abandoned, and the wait
+// returns instead of blocking past it.
+func TestWaitRefresh_ReturnsAtTheBudgetWhenTheEndpointStalls(t *testing.T) {
+	c, _ := testChecker(t)
+	stallingEndpoint(t, c)
+
+	if got := c.Notice("v1.2.0"); got != "" {
+		t.Fatalf("Notice() = %q with no cache, want \"\"", got)
+	}
+	budget := 200 * time.Millisecond
+	started := time.Now()
+	if c.WaitRefresh(budget) {
+		t.Fatal("WaitRefresh reported success while the endpoint was stalling")
+	}
+	elapsed := time.Since(started)
+	if elapsed < budget {
+		t.Fatalf("WaitRefresh returned after %s, want at least the %s budget", elapsed, budget)
+	}
+	if elapsed > budget+5*time.Second {
+		t.Fatalf("WaitRefresh returned after %s, want it bounded by the %s budget", elapsed, budget)
+	}
+}
+
+// TestWaitRefresh_AbandonedLookupKeepsTheBackoff is the stalled release API:
+// the wait gives up on a lookup that never answers, and the next invocation
+// must neither repeat the lookup nor wait for it again. The attempt was
+// recorded when the lookup was scheduled, so the wait is paid at most once
+// per CacheTTL instead of on every command.
+func TestWaitRefresh_AbandonedLookupKeepsTheBackoff(t *testing.T) {
+	c, path := testChecker(t)
+	hits := stallingEndpoint(t, c)
+
+	started := time.Now()
+	if got := c.Notice("v1.2.0"); got != "" {
+		t.Fatalf("Notice() = %q with no cache, want \"\"", got)
+	}
+	if c.WaitRefresh(100 * time.Millisecond) {
+		t.Fatal("WaitRefresh reported success while the endpoint was stalling")
+	}
+	entry := readCacheFile(t, path)
+	if entry.Latest != "" || entry.CheckedAt.Before(started.Add(-time.Second)) {
+		t.Fatalf("abandoned attempt recorded as %+v, want a failed attempt stamped now", entry)
+	}
+
+	// The next invocation gets a new Checker, just like the CLI.
+	next := New(path)
+	next.endpoint = c.endpoint
+	if got := next.Notice("v1.2.0"); got != "" {
+		t.Fatalf("Notice() = %q after an abandoned attempt, want \"\"", got)
+	}
+	t.Cleanup(func() { next.WaitRefresh(10 * time.Second) })
+	waited := time.Now()
+	if !next.WaitRefresh(10 * time.Second) {
+		t.Fatal("the next invocation is waiting for a lookup")
+	}
+	if elapsed := time.Since(waited); elapsed > time.Second {
+		t.Fatalf("the next invocation waited %s for the stalled endpoint, want an immediate return", elapsed)
+	}
+	if n := hits(); n != 1 {
+		t.Fatalf("made %d requests to the stalled endpoint, want 1", n)
+	}
+}
+
+// TestWaitRefresh_ReturnsImmediatelyWhenNothingWasScheduled pins that a
+// command with a fresh cache pays nothing: no lookup was scheduled, so the
+// wait returns at once.
+func TestWaitRefresh_ReturnsImmediatelyWhenNothingWasScheduled(t *testing.T) {
+	c, path := testChecker(t)
+	seedCache(t, path, "v1.3.0", time.Now())
+
+	started := time.Now()
+	if !c.WaitRefresh(10 * time.Second) {
+		t.Fatal("WaitRefresh reported a pending refresh although none was scheduled")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("WaitRefresh took %s with nothing scheduled, want an immediate return", elapsed)
+	}
+}
+
+// ── defaults ─────────────────────────────────────────────────────────────────
 func TestDefault_UsesSharedUserCacheDirectory(t *testing.T) {
 	// Shared across projects, never written into a project directory.
 	t.Setenv("HOME", t.TempDir())

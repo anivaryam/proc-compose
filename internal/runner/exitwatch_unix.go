@@ -53,13 +53,15 @@ func signallingEstablished(observation exitObservation, cancelled bool) bool {
 // without waiting when the group already has no live members, so a successful
 // task with no descendants does not pay the grace and settle budgets.
 //
-// Membership inspection only decides how long to wait. It never decides whether
-// signalling is permitted: that comes from signallingEstablished, because only
-// the reserved leader proves the identifier is ours.
+// Membership inspection decides how long to wait, and it excludes exactly one
+// case from signalling: an empty group is not signalled, because there is
+// nothing left in it to stop. A group whose membership is unknown IS signalled:
+// whether a signal is permitted comes from signallingEstablished, not from
+// membership, because only the reserved leader proves the identifier is ours.
 //
 // The caller must hold signalling authority.
 func terminateGroup(pg ProcessGroup, grace time.Duration) {
-	if pg.State() != GroupOwned {
+	if pg.State() == GroupEmpty {
 		return
 	}
 	_ = pg.Terminate()

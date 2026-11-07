@@ -68,6 +68,38 @@ func TestWaitForDaemonReady_DetectsDeadChild(t *testing.T) {
 	}
 }
 
+// TestWaitForDaemonReady_ReapedChildIsReportedAsDead pins the message a
+// starter shows when the daemon it launched dies. The starter reaps the
+// child, so the dead daemon stops answering signal 0 and the failure is
+// reported at once as "died during startup", instead of the starter waiting
+// out the whole readiness timeout and reporting "did not become ready".
+func TestWaitForDaemonReady_ReapedChildIsReportedAsDead(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "child.log")
+	if err := os.WriteFile(logPath, []byte("preflight failed: port 8080 busy\n"), 0644); err != nil {
+		t.Fatalf("seed log: %v", err)
+	}
+	// Reexec re-executes this test binary; "-test.run=^$" runs no test, so
+	// the child exits at once.
+	pid, err := daemon.Reexec([]string{"-test.run=^$"}, logPath)
+	if err != nil {
+		t.Fatalf("Reexec: %v", err)
+	}
+
+	socketPath := testUnixSocketPath(t, "ipc.sock")
+	started := time.Now()
+	err = waitForDaemonReady(pid, socketPath, logPath, 10*time.Second)
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("expected an error for a daemon that died during startup")
+	}
+	if !strings.Contains(err.Error(), "died during startup") {
+		t.Fatalf("expected 'died during startup' in error, got: %v", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("the dead daemon took %s to be reported, want it reported at once", elapsed)
+	}
+}
+
 // TestWaitForDaemonReady_TimesOutWithoutSocket ensures the parent fails
 // when the child stays alive but never opens the IPC socket.
 func TestWaitForDaemonReady_TimesOutWithoutSocket(t *testing.T) {

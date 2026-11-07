@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -201,8 +202,15 @@ func printVerifyHuman(w io.Writer, r *verify.Result) {
 	if len(r.Startup.UnprobedProcesses) > 0 {
 		fmt.Fprintf(w, "    started without a readiness probe: %s\n", strings.Join(r.Startup.UnprobedProcesses, ", "))
 	}
-	for name, endpoint := range r.Endpoints {
-		fmt.Fprintf(w, "  endpoint: %s %s\n", name, endpoint.URL)
+	// The endpoint names are sorted so the rendering is reproducible; the
+	// JSON path is already sorted by encoding/json.
+	endpoints := make([]string, 0, len(r.Endpoints))
+	for name := range r.Endpoints {
+		endpoints = append(endpoints, name)
+	}
+	sort.Strings(endpoints)
+	for _, name := range endpoints {
+		fmt.Fprintf(w, "  endpoint: %s %s\n", name, r.Endpoints[name].URL)
 	}
 	fmt.Fprintf(w, "  check:    %s", r.Check.Status)
 	if r.Check.ExitCode != nil {

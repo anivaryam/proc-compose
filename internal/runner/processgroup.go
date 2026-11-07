@@ -71,6 +71,11 @@ func (s GroupState) String() string {
 type ProcessGroup interface {
 	// Setup prepares the command so its process tree can be managed. It is
 	// called before the command is started.
+	//
+	// Setup assigns cmd.Cancel, so the command must have been created with
+	// exec.CommandContext. Go treats a non-nil Cancel on a command that was not
+	// created that way as a mistake and refuses to start it: "exec: command
+	// with a non-nil Cancel was not created with CommandContext".
 	Setup(cmd *exec.Cmd)
 
 	// Track records the identity of the started command. It is called once,
@@ -111,6 +116,12 @@ type ProcessGroup interface {
 type SealObservation struct {
 	State    GroupState
 	Identity string
+	// Members are the live members the seal's own observation enumerated, or
+	// nil when that observation could not enumerate them.
+	Members []string
+	// Reason explains why the group's containment could not be established,
+	// when the group knows one. It belongs to the group it was captured from.
+	Reason string
 }
 
 // GroupResult pairs a verdict about the group with the members that outlived it.
@@ -125,7 +136,17 @@ type GroupResult struct {
 	State GroupState
 	// Members describes processes that are still running and outside the
 	// runner's control.
+	//
+	// It is populated only where the platform can enumerate a group's
+	// membership, and only when the enumeration succeeded: a group whose
+	// members could not be enumerated reports no members, so the verdict can
+	// say that they could not be enumerated instead of rendering an empty
+	// list that would read as "no members".
 	Members []string
+	// Reason explains why the group's containment could not be established,
+	// when the group knows one. It belongs to the group it is reported for: a
+	// group that has no reason of its own reports none.
+	Reason string
 }
 
 // Shutdown budget. See the notes on Withdraw and on exec for why these bound
@@ -155,7 +176,7 @@ func survivorsError(results []GroupResult) error {
 		switch r.State {
 		case GroupUnavailable:
 			b.WriteString("\n    process group containment was unavailable, so termination could not be attempted")
-			if reason := unavailableReason(); reason != "" {
+			if reason := r.Reason; reason != "" {
 				fmt.Fprintf(&b, ": %s", reason)
 			}
 		case GroupOwned:
@@ -179,17 +200,45 @@ func survivorsError(results []GroupResult) error {
 	return errors.New("managed process tree could not be verified as terminated:" + b.String())
 }
 
+// groupMemberLister is implemented by a process group that can enumerate its
+// live members.
+//
+// It is an optional interface, so a group that cannot enumerate its
+// membership simply does not implement it: the verdict then says the members
+// could not be enumerated instead of naming an empty list.
+type groupMemberLister interface {
+	memberPIDs() []string
+}
+
+// groupReasonReporter is implemented by a process group that knows why its
+// containment could not be established.
+type groupReasonReporter interface {
+	failureReason() string
+}
+
+// groupMembersOf returns the live members the group enumerated, or nil when it
+// cannot enumerate them.
+func groupMembersOf(pg ProcessGroup) []string {
+	lister, ok := pg.(groupMemberLister)
+	if !ok {
+		return nil
+	}
+	return lister.memberPIDs()
+}
+
 // unavailableReason explains why a containment could not be established, when the
-// platform knows. It exists so an operator sees the actual cause instead of a bare
+// group knows. It exists so an operator sees the actual cause instead of a bare
 // "unavailable".
-func unavailableReason() string {
-	if err := lastProbeFailure(); err != nil {
-		return err.Error()
+//
+// It takes the group, so the reason belongs to the group it is reported for: a
+// group that has no reason of its own reports none, and one group's failure
+// never explains another's verdict.
+func unavailableReason(pg ProcessGroup) string {
+	reporter, ok := pg.(groupReasonReporter)
+	if !ok {
+		return ""
 	}
-	if err := lastTrackFailure(); err != nil {
-		return err.Error()
-	}
-	return ""
+	return reporter.failureReason()
 }
 
 // describeGroup renders a group's identifier for an operator-facing message,

@@ -95,6 +95,9 @@ func Run(opts Options) (*Report, error) {
 	if report.ConfigExists {
 		checkExistingConfig(report, root)
 	}
+	// The suggestion is checked unconditionally: it is what the user is told
+	// to run, whether or not a config already exists.
+	checkSuggestedConfig(report)
 	if opts.Write {
 		if report.ConfigExists {
 			return report, fmt.Errorf("%s already exists", report.ConfigPath)

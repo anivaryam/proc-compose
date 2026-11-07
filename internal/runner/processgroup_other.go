@@ -17,7 +17,10 @@ import "syscall"
 // as populated, which makes escalation wait out the full budget rather than skip
 // it. Shutdown still terminates the group; it just cannot shorten the wait, and
 // the platform is not one proc-compose claims to support.
-func groupMembers(pgid int) (int, bool) { return 0, false }
+func groupMembers(pgid int) (int, bool) {
+	pids, ok := enumerateGroupMembers(pgid)
+	return len(pids), ok
+}
 
 // groupMemberPIDs cannot enumerate membership here either; see groupMembers.
 func groupMemberPIDs(int) ([]int, bool) { return nil, false }

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -227,6 +228,63 @@ func TestStartProven_NeverFallsBackToThePID(t *testing.T) {
 	}
 	if alive, _ := IsAliveFromPIDFile(path); !alive {
 		t.Fatal("IsAliveFromPIDFile disagrees for the same live record")
+	}
+}
+
+// TestWriteFileAtomic_SyncsTheParentDirectory pins that the rename installs
+// the file durably: the directory entry it creates is flushed, so a crash
+// cannot lose a file that was reported as written.
+func TestWriteFileAtomic_SyncsTheParentDirectory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipt.json")
+
+	var synced string
+	old := syncDir
+	syncDir = func(d string) error {
+		synced = d
+		return nil
+	}
+	defer func() { syncDir = old }()
+
+	if err := WriteFileAtomic(path, []byte("{}"), 0600); err != nil {
+		t.Fatalf("WriteFileAtomic: %v", err)
+	}
+	if synced != dir {
+		t.Fatalf("synced directory = %q, want %q", synced, dir)
+	}
+}
+
+// TestWriteFileAtomic_DirectorySyncErrorDoesNotFailTheWrite pins that the
+// durability step is best-effort: a filesystem that refuses to flush a
+// directory (Windows, some network mounts) must not turn a successful write
+// into a failed one.
+func TestWriteFileAtomic_DirectorySyncErrorDoesNotFailTheWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipt.json")
+	want := []byte(`{"pid":7}`)
+
+	old := syncDir
+	syncDir = func(string) error { return errors.New("directory sync unsupported") }
+	defer func() { syncDir = old }()
+
+	if err := WriteFileAtomic(path, want, 0600); err != nil {
+		t.Fatalf("WriteFileAtomic = %v, want nil despite a failed directory sync", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("file holds %q, want %q", got, want)
+	}
+}
+
+// TestSyncDirectory_TempDirSucceeds proves the real implementation works on a
+// directory this platform can flush, so the stubbed tests above exercise the
+// seam and not a broken default.
+func TestSyncDirectory_TempDirSucceeds(t *testing.T) {
+	if err := syncDirectory(t.TempDir()); err != nil {
+		t.Fatalf("syncDirectory: %v", err)
 	}
 }
 

@@ -123,7 +123,7 @@ a daemon crash, `stop` recovers from the PID file and prints one `recovered
 group=...` line per process group; groups it cannot prove are never signalled.
 Inspect leftovers with `ps -eo pid,ppid,pgid,args` before `--force`. On macOS
 check the reported daemon PID with `ps -p <PID> -o pid,args` before retrying.
-On Windows `stop` always force-kills the tree (`taskkill /T /F`).
+On Windows managed trees are terminated through their owned Job Objects.
 
 ### uninstall
 

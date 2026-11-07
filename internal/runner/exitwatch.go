@@ -1,6 +1,9 @@
 package runner
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // exitObservation is what an exit observer concluded about the command leader.
 //
@@ -28,9 +31,14 @@ const (
 	exitOwnershipLost
 
 	// exitUnsupported means this platform cannot observe the leader's exit
-	// without reaping it. The runner falls back to detecting exit by reaping,
-	// which ends signalling authority, so a natural exit is reported rather
-	// than torn down.
+	// without reaping it.
+	//
+	// The value is unreachable on the supported platforms. Linux and macOS
+	// observe the exit without reaping it, Windows needs no observation at
+	// all, and on a platform that cannot observe it the launch fails with an
+	// error: an observation failure is fatal, not a fallback to a
+	// reap-based detection. The branch is kept so the contract stays
+	// explicit.
 	exitUnsupported
 )
 
@@ -67,9 +75,29 @@ type exitObserver interface {
 // containment survives the leader's exit, while elsewhere a nil observer means
 // the exit can only be detected by reaping, which ends signalling authority.
 //
-// An error means the leader's waitable state could not be established at all,
-// which revokes signalling authority and must not lead to a group signal.
+// An error fails the launch. Whether the group may still be signalled first is
+// leaderStillReserved's answer: a failed wait on the leader revokes signalling
+// authority and must not lead to a group signal.
 func observeLeaderExit(pid int) (exitObserver, error) { return observeLeaderExitPlatform(pid) }
+
+// errObservationUnsupported reports that this platform has no way to observe
+// the command leader's exit without reaping it. Only the platforms outside the
+// support contract return it; see exitwatch_other.go.
+var errObservationUnsupported = errors.New("exit observation without reaping is not supported on this platform")
+
+// leaderStillReserved reports whether the leader is still provably unreaped
+// after its exit could not be observed, so that its process-group ID is still
+// ours to signal.
+//
+// That holds only when the platform merely lacks a reap-free observation. Such
+// a failure says nothing about the leader, and nothing has collected it: the
+// runner performs the only reap, and that reap has not happened yet. Any other
+// failure is a failed wait on the leader itself — ECHILD means it is no longer
+// a waitable child, so something else collected it — so its identifier may
+// already have been released.
+func leaderStillReserved(obsErr error) bool {
+	return errors.Is(obsErr, errObservationUnsupported)
+}
 
 // groupPGID returns the group's numeric identifier, or 0 when it cannot be
 // resolved. On Unix it is what an operator can act on when a shutdown reports a
@@ -88,13 +116,20 @@ const memberPollInterval = 100 * time.Millisecond
 
 // waitWhileLive polls until the group has no live members left or the budget is
 // spent, reporting whether it drained.
+//
+// A group whose membership cannot be enumerated has not been proven empty, so
+// it is polled until the budget is spent, exactly like a group that is still
+// owned: treating "unknown" as "drained" would skip the escalation that
+// follows this wait. Only an empty group ends the wait immediately.
 func waitWhileLive(pg ProcessGroup, budget time.Duration) bool {
 	deadline := time.Now().Add(budget)
-	for pg.State() == GroupOwned {
+	for {
+		if pg.State() == GroupEmpty {
+			return true
+		}
 		if !time.Now().Before(deadline) {
 			return false
 		}
 		time.Sleep(memberPollInterval)
 	}
-	return true
 }

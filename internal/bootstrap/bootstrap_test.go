@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -265,5 +266,150 @@ func TestCommandVerifierReportsTemporaryFileFailure(t *testing.T) {
 	}
 	if verification.ValidationStatus != "failed" || verification.Started || verification.Ready || verification.Stopped {
 		t.Fatalf("temporary-file failure reported incorrect state: %+v", verification)
+	}
+}
+
+// stubVerifierSource is the source of the stub executable that stands in for
+// the proc-compose binary in a verification run. It succeeds silently, or
+// writes to the --log-file path when PROC_COMPOSE_STUB_LOG is set.
+const stubVerifierSource = `package main
+
+import (
+	"os"
+)
+
+func main() {
+	if os.Getenv("PROC_COMPOSE_STUB_LOG") != "" {
+		for i, arg := range os.Args[1:] {
+			if arg == "--log-file" && i+2 < len(os.Args) {
+				_ = os.WriteFile(os.Args[i+2], []byte("stub log output\n"), 0o600)
+			}
+		}
+	}
+	os.Exit(0)
+}
+`
+
+// buildStubVerifier builds the stub executable used by the verification tests.
+func buildStubVerifier(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module stub\n\ngo 1.23\n"), 0600); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(stubVerifierSource), 0600); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+	bin := filepath.Join(dir, "stub")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = dir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build stub verifier: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// countTempLogs counts the verification log files in dir.
+func countTempLogs(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read temp dir: %v", err)
+	}
+	count := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "proc-compose-bootstrap-") && strings.HasSuffix(name, ".log") {
+			count++
+		}
+	}
+	return count
+}
+
+// TestCommandVerifierRemovesEmptyLogFile: an empty log file holds no
+// diagnostics — the failure diagnostics live in the report message — so it
+// must not be left behind in the shared temp dir.
+func TestCommandVerifierRemovesEmptyLogFile(t *testing.T) {
+	bin := buildStubVerifier(t)
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	t.Setenv("TMP", tempDir)
+	t.Setenv("TEMP", tempDir)
+
+	configPath := filepath.Join(tempDir, "proc-compose.yml")
+	writeFile(t, configPath, "processes: {app: {cmd: echo hello}}\n")
+
+	before := countTempLogs(t, tempDir)
+	verification, err := commandVerifier{Executable: bin}.Verify(configPath)
+	if err != nil {
+		t.Fatalf("Verify returned error: %v", err)
+	}
+	if after := countTempLogs(t, tempDir); after != before {
+		t.Fatalf("temporary log files: before %d, after %d", before, after)
+	}
+	if verification.LogFile != "" {
+		t.Fatalf("log file = %q, want empty", verification.LogFile)
+	}
+	encoded, err := json.Marshal(verification)
+	if err != nil {
+		t.Fatalf("marshal verification: %v", err)
+	}
+	if strings.Contains(string(encoded), "log_file") {
+		t.Fatalf("verification JSON still names a log file: %s", encoded)
+	}
+}
+
+// TestCommandVerifierKeepsNonEmptyLogFile: a log file the child wrote to is
+// kept and still named by the report.
+func TestCommandVerifierKeepsNonEmptyLogFile(t *testing.T) {
+	bin := buildStubVerifier(t)
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	t.Setenv("TMP", tempDir)
+	t.Setenv("TEMP", tempDir)
+	t.Setenv("PROC_COMPOSE_STUB_LOG", "1")
+
+	configPath := filepath.Join(tempDir, "proc-compose.yml")
+	writeFile(t, configPath, "processes: {app: {cmd: echo hello}}\n")
+
+	verification, err := commandVerifier{Executable: bin}.Verify(configPath)
+	if err != nil {
+		t.Fatalf("Verify returned error: %v", err)
+	}
+	if verification.LogFile == "" {
+		t.Fatal("expected the log file to be named by the report")
+	}
+	info, err := os.Stat(verification.LogFile)
+	if err != nil {
+		t.Fatalf("log file was removed: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("expected the log file to hold the child's output")
+	}
+}
+
+// TestRemoveIfEmpty: an empty file is removed, a file with content is kept.
+func TestRemoveIfEmpty(t *testing.T) {
+	dir := t.TempDir()
+
+	empty := filepath.Join(dir, "empty.log")
+	writeFile(t, empty, "")
+	if !removeIfEmpty(empty) {
+		t.Fatal("expected the empty file to be removed")
+	}
+	if _, err := os.Stat(empty); !os.IsNotExist(err) {
+		t.Fatalf("empty file still present: %v", err)
+	}
+
+	full := filepath.Join(dir, "full.log")
+	writeFile(t, full, "diagnostics\n")
+	if removeIfEmpty(full) {
+		t.Fatal("expected the non-empty file to be kept")
+	}
+	if _, err := os.Stat(full); err != nil {
+		t.Fatalf("non-empty file was removed: %v", err)
 	}
 }

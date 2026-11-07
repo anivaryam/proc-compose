@@ -3,7 +3,9 @@ package monitor
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -52,7 +54,34 @@ func Run(socketPath string) error {
 		procOrder: []string{},
 		procs:     map[string]*ipc.ProcState{},
 	}
-	return m.run()
+	// reportExit runs after run() returned, so the terminal (raw mode and
+	// the alternate screen) is already restored when the notice is written.
+	return reportExit(os.Stderr, m.run())
+}
+
+// errKeyboardClosed reports that keyboard input ended: stdin reached EOF or
+// errored, so no further key can ever be read.
+var errKeyboardClosed = errors.New("keyboard input closed")
+
+// exitNotice is the user-visible message printed when keyboard input ends.
+const exitNotice = "keyboard input closed — exiting monitor"
+
+// printExitNotice writes the monitor's exit notice. It is a seam so the
+// notice can be asserted in a unit test; the notice is written after the
+// alternate screen has been torn down, so it stays visible.
+func printExitNotice(w io.Writer, msg string) {
+	fmt.Fprintln(w, msg)
+}
+
+// reportExit maps the monitor's exit error to the user-visible outcome. A
+// closed keyboard channel is not a failure: the monitor prints a notice and
+// exits successfully.
+func reportExit(w io.Writer, err error) error {
+	if errors.Is(err, errKeyboardClosed) {
+		printExitNotice(w, exitNotice)
+		return nil
+	}
+	return err
 }
 
 // ─── Monitor state ────────────────────────────────────────────────────────────
@@ -60,10 +89,20 @@ func Run(socketPath string) error {
 type monitor struct {
 	client *ipc.Client
 
+	// out receives the rendered frames and messages. It is os.Stdout in
+	// production; tests point it at a buffer to assert on frame bytes.
+	out io.Writer
+
 	// Process table state.
 	procOrder []string
 	procs     map[string]*ipc.ProcState
-	selected  int // index into procOrder
+	// selected is the highlighted row index. It is derived from
+	// selectedName by syncSelection — never set independently.
+	selected int
+	// selectedName is the highlighted process name. It is the source of
+	// truth for the selection so the cursor follows the process when the
+	// health-sorted order changes. Empty means "no name tracked".
+	selectedName string
 
 	// Log buffer: bounded ring of the most recent maxLogs entries. Stored
 	// as a fixed-cap slice + head index so push is O(1); previous
@@ -181,6 +220,21 @@ func (m *monitor) run() error {
 
 	m.render()
 
+	return m.eventLoop(events, keys, resize, ticker)
+}
+
+// eventLoop runs the monitor's select loop until the user quits, the daemon
+// disconnects, or keyboard input ends.
+//
+// A closed keys channel means stdin reached EOF or errored, so no further key
+// can be read. Continuing would spin: a closed channel is always ready and
+// yields the empty string, which no key handler matches — the loop would
+// render a frame per iteration. The loop therefore returns errKeyboardClosed
+// without rendering again.
+//
+// The daemon-disconnect path is unchanged: it waits for one key press and
+// then returns.
+func (m *monitor) eventLoop(events chan ipc.Event, keys chan string, resize chan struct{}, ticker *time.Ticker) error {
 	for {
 		select {
 		case ev, ok := <-events:
@@ -197,7 +251,10 @@ func (m *monitor) run() error {
 			m.applyEvent(ev)
 			m.render()
 
-		case key := <-keys:
+		case key, ok := <-keys:
+			if !ok {
+				return errKeyboardClosed
+			}
 			if done := m.handleKey(key); done {
 				return nil
 			}
@@ -277,6 +334,12 @@ func (m *monitor) applyEvent(ev ipc.Event) {
 }
 
 func (m *monitor) rebuildOrder() {
+	// Remember the highlighted process before re-sorting so the cursor keeps
+	// identifying it. The capture is skipped when the table is empty or the
+	// index is out of range — the legacy clamp path.
+	if m.selectedName == "" && m.selected >= 0 && m.selected < len(m.procOrder) {
+		m.selectedName = m.procOrder[m.selected]
+	}
 	names := make([]string, 0, len(m.procs))
 	for n := range m.procs {
 		names = append(names, n)
@@ -290,9 +353,65 @@ func (m *monitor) rebuildOrder() {
 		return names[i] < names[j]
 	})
 	m.procOrder = names
+	m.syncSelection()
+}
+
+// indexOfName returns the row index of name in the current process order, or
+// -1 when the name is not in the table.
+func (m *monitor) indexOfName(name string) int {
+	for i, candidate := range m.procOrder {
+		if candidate == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// syncSelection derives the highlighted row index from the tracked process
+// name. It is the single place that writes m.selected: the cursor path moves
+// the name and rebuildOrder re-derives the index after a re-sort, so the
+// highlight keeps identifying the same process.
+//
+// When the tracked name is gone the cursor stays inside the table and adopts
+// the row it lands on. When no name is tracked the index is only clamped,
+// which preserves the legacy behaviour for callers that set the index
+// directly.
+func (m *monitor) syncSelection() {
+	if m.selectedName != "" {
+		if index := m.indexOfName(m.selectedName); index >= 0 {
+			m.selected = index
+			return
+		}
+		m.selected = max(0, min(m.selected, len(m.procOrder)-1))
+		m.selectedName = ""
+		if len(m.procOrder) > 0 {
+			m.selectedName = m.procOrder[m.selected]
+		}
+		return
+	}
 	if m.selected >= len(m.procOrder) {
 		m.selected = max(0, len(m.procOrder)-1)
 	}
+}
+
+// moveSelection moves the highlight by delta rows. Only the tracked name
+// moves; the index is derived by syncSelection.
+func (m *monitor) moveSelection(delta int) {
+	if len(m.procOrder) == 0 {
+		return
+	}
+	current := m.selected
+	if m.selectedName != "" {
+		if index := m.indexOfName(m.selectedName); index >= 0 {
+			current = index
+		}
+	}
+	target := current + delta
+	if target < 0 || target >= len(m.procOrder) {
+		return
+	}
+	m.selectedName = m.procOrder[target]
+	m.syncSelection()
 }
 
 func healthRank(st *ipc.ProcState) int {
@@ -342,13 +461,9 @@ func (m *monitor) handleKey(key string) (quit bool) {
 	case "?", "h":
 		m.showHelp = !m.showHelp
 	case "up", "k":
-		if m.selected > 0 {
-			m.selected--
-		}
+		m.moveSelection(-1)
 	case "down", "j":
-		if m.selected < len(m.procOrder)-1 {
-			m.selected++
-		}
+		m.moveSelection(1)
 	case "enter":
 		if len(m.procOrder) > 0 {
 			selected := m.procOrder[m.selected]
@@ -615,7 +730,9 @@ func (m *monitor) renderFrame() []byte {
 	writeBorderedRow(row, div)
 	row++
 	writeBorderedRow(row, fmt.Sprintf("%s%s%s%s", ansiBold, filterLabel, ansiReset, scrollHint))
-	row++
+	// The log area starts at the row the shared helper reports, so the page
+	// size (logAreaRows) always matches the rendered area.
+	row = m.logAreaStartRow()
 
 	// ── Log lines ─────────────────────────────────────────────────────────────
 	logRows := m.height - row
@@ -690,7 +807,12 @@ func (m *monitor) write(b []byte) {
 	out.WriteString("\033[?2026h")
 	out.Write(b)
 	out.WriteString("\033[?2026l")
-	os.Stdout.Write(out.Bytes())
+	target := m.out
+	if target == nil {
+		target = os.Stdout
+	}
+	// A frame that cannot be written is dropped; the next repaint replaces it.
+	_, _ = target.Write(out.Bytes())
 }
 
 func (m *monitor) renderMessage(msg string) {
@@ -856,12 +978,23 @@ func (m *monitor) filteredLogs() []ipc.LogEntry {
 	return out
 }
 
-func (m *monitor) logAreaRows() int {
-	extra := 0
+// logAreaStartRow returns the terminal row where the log area starts — the
+// first row below the "Logs:" label. It is the single source of truth for the
+// frame's chrome height: renderFrame and logAreaRows both derive from it, so
+// the page size cannot drift from the rendered area.
+func (m *monitor) logAreaStartRow() int {
+	// Rows above the log area: top border, title, summary, optional tunnel
+	// row, table header, one row per process, the divider and the "Logs:"
+	// label.
+	chrome := 6 + len(m.procOrder)
 	if m.tunnelURL != "" {
-		extra = 1
+		chrome++
 	}
-	rows := m.height - 4 - len(m.procOrder) - 2 - extra
+	return chrome + 1 // terminal rows are 1-based
+}
+
+func (m *monitor) logAreaRows() int {
+	rows := m.height - m.logAreaStartRow()
 	if rows < 1 {
 		return 1
 	}

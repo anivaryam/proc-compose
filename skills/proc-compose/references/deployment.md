@@ -6,14 +6,14 @@ proc-compose can be the single entrypoint of a container on Railway, Render,
 Fly.io, and similar platforms:
 
 ```sh
-proc-compose up --silent \
+proc-compose up \
   --log-format json \
-  --wait-ready --wait-timeout 90 \
   --health-port 8081
 ```
 
-- `--wait-ready` blocks the entrypoint until every probe passes, so traffic
-  never reaches a half-started stack.
+- Keep the entrypoint in the foreground: `--silent` returns after launching
+  the daemon, which can end the container. Gate traffic with the platform's
+  readiness check against `:8081/ready`.
 - `--health-port` serves `GET /health`: 200 only when every service is
   `running` or `restarting` and not `unhealthy`, and every task completed;
   otherwise 503. `GET /ready` reports readiness only and ignores health. Point
@@ -72,7 +72,7 @@ processes:
 | Feature | Linux | macOS | Windows |
 |---|---|---|---|
 | Shell for `cmd` | `sh -c` | `sh -c` | `cmd /c` |
-| Graceful `stop --timeout` | SIGTERM, then SIGKILL | SIGTERM, then SIGKILL | Always `taskkill /T /F` |
+| Graceful `stop --timeout` | SIGTERM, then SIGKILL | SIGTERM, then SIGKILL | Terminate the owned Job Object |
 | `--survive`, `uninstall` | systemd | No | No |
 | Probe owner attribution | Yes | No (`unattributable`) | Yes |
 | `verify` refuses another session's answer | Yes | Never | Leased ports only |

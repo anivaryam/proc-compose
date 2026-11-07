@@ -1,9 +1,13 @@
 package monitor
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode"
@@ -867,5 +871,327 @@ func TestLogAreaRows_Defaults(t *testing.T) {
 	m.height = 80
 	if got := m.logAreaRows(); got <= 0 {
 		t.Errorf("logAreaRows = %d, want positive", got)
+	}
+}
+
+// ─── Issue #11 — a closed keyboard channel must stop the render loop ────────
+
+// syncBuffer is a concurrency-safe sink for rendered frames.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func (s *syncBuffer) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Len()
+}
+
+func TestEventLoop_ClosedKeysStopsWithoutRendering(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 100
+	m.height = 30
+	out := &syncBuffer{}
+	m.out = out
+
+	keys := make(chan string)
+	close(keys) // stdin ended
+	events := make(chan ipc.Event)
+	resize := make(chan struct{}, 1)
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+
+	done := make(chan error, 1)
+	go func() { done <- m.eventLoop(events, keys, resize, ticker) }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errKeyboardClosed) {
+			t.Fatalf("eventLoop error = %v, want errKeyboardClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("eventLoop did not return within 1s after the keys channel closed")
+	}
+	if out.Len() != 0 {
+		t.Errorf("rendered %d bytes after the keys channel closed, want 0", out.Len())
+	}
+}
+
+func TestEventLoop_ClosedEventsStillWaitsForAKey(t *testing.T) {
+	m := newTestMonitor()
+	m.width = 100
+	m.height = 30
+	out := &syncBuffer{}
+	m.out = out
+
+	events := make(chan ipc.Event)
+	close(events) // daemon disconnected
+	keys := make(chan string, 1)
+	resize := make(chan struct{}, 1)
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+
+	done := make(chan error, 1)
+	go func() { done <- m.eventLoop(events, keys, resize, ticker) }()
+
+	deadline := time.Now().Add(time.Second)
+	for out.Len() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("daemon-disconnect notice was not rendered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !strings.Contains(out.String(), "daemon disconnected") {
+		t.Errorf("rendered output = %q, want the daemon-disconnect notice", out.String())
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("eventLoop returned %v before a key was pressed", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	keys <- "x"
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("eventLoop error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("eventLoop did not return after a key press")
+	}
+}
+
+func TestReportExit_PrintsNoticeForClosedKeyboard(t *testing.T) {
+	var out bytes.Buffer
+	if err := reportExit(&out, errKeyboardClosed); err != nil {
+		t.Fatalf("reportExit error = %v, want nil", err)
+	}
+	if !strings.Contains(out.String(), "keyboard input closed") {
+		t.Errorf("notice = %q, want the keyboard-input notice", out.String())
+	}
+}
+
+func TestReportExit_KeepsOtherErrors(t *testing.T) {
+	var out bytes.Buffer
+	sentinel := errors.New("boom")
+	if err := reportExit(&out, sentinel); !errors.Is(err, sentinel) {
+		t.Fatalf("reportExit error = %v, want %v", err, sentinel)
+	}
+	if out.Len() != 0 {
+		t.Errorf("notice = %q, want no notice", out.String())
+	}
+}
+
+// ─── Issue #17 — the selection follows the process, not the row index ───────
+
+func TestSelection_TracksProcessAcrossHealthResort(t *testing.T) {
+	m := newTestMonitor()
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "alpha", State: "running", Ready: true},
+		{Name: "bravo", State: "running", Ready: true},
+	}})
+	m.moveSelection(1)
+	if m.selectedName != "bravo" {
+		t.Fatalf("selectedName = %q, want bravo", m.selectedName)
+	}
+	// bravo fails: the health-first order moves it to the top.
+	m.applyEvent(ipc.Event{Type: ipc.TypeState, Proc: &ipc.ProcState{Name: "bravo", State: "failed"}})
+	if m.selectedName != "bravo" {
+		t.Errorf("selectedName = %q after the re-sort, want bravo", m.selectedName)
+	}
+	if m.procOrder[m.selected] != "bravo" {
+		t.Errorf("highlighted row = %q, want bravo", m.procOrder[m.selected])
+	}
+}
+
+func TestSelection_TracksProcessAcrossInsertion(t *testing.T) {
+	m := newTestMonitor()
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "alpha", State: "running", Ready: true},
+		{Name: "bravo", State: "running", Ready: true},
+	}})
+	m.moveSelection(1)
+	if m.selectedName != "bravo" {
+		t.Fatalf("selectedName = %q, want bravo", m.selectedName)
+	}
+	// aaa fails and is inserted before the highlighted process.
+	m.applyEvent(ipc.Event{Type: ipc.TypeState, Proc: &ipc.ProcState{Name: "aaa", State: "failed"}})
+	if m.selectedName != "bravo" {
+		t.Errorf("selectedName = %q after the insertion, want bravo", m.selectedName)
+	}
+	if m.procOrder[m.selected] != "bravo" {
+		t.Errorf("highlighted row = %q, want bravo", m.procOrder[m.selected])
+	}
+}
+
+func TestSelection_FallsBackWhenSelectedProcessIsGone(t *testing.T) {
+	m := newTestMonitor()
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "alpha", State: "running", Ready: true},
+		{Name: "bravo", State: "running", Ready: true},
+		{Name: "charlie", State: "running", Ready: true},
+	}})
+	m.moveSelection(2)
+	if m.selectedName != "charlie" {
+		t.Fatalf("selectedName = %q, want charlie", m.selectedName)
+	}
+	delete(m.procs, "charlie")
+	m.rebuildOrder()
+	if m.selected < 0 || m.selected >= len(m.procOrder) {
+		t.Fatalf("selected = %d, want an index inside procOrder %v", m.selected, m.procOrder)
+	}
+	if m.selectedName != m.procOrder[m.selected] {
+		t.Errorf("selectedName = %q, want the highlighted row %q", m.selectedName, m.procOrder[m.selected])
+	}
+}
+
+func TestHandleKeyEnterFiltersHighlightedProcess(t *testing.T) {
+	m := newTestMonitor()
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: []ipc.ProcState{
+		{Name: "alpha", State: "running", Ready: true},
+		{Name: "bravo", State: "running", Ready: true},
+	}})
+	m.moveSelection(1)
+	m.handleKey("enter")
+	if m.filter != "bravo" {
+		t.Errorf("filter = %q, want bravo (the highlighted process)", m.filter)
+	}
+}
+
+// ─── Issue #57 — the page size must match the rendered log area ─────────────
+
+// renderedLogRows returns the log rows drawn in the frame, in row order.
+func renderedLogRows(frame []byte) []string {
+	rows := cursorRows(frame)
+	var out []string
+	for row := 1; row <= 500; row++ {
+		text, ok := rows[row]
+		if !ok {
+			continue
+		}
+		if strings.Contains(text, " │ ") {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+var testLogLabelRe = regexp.MustCompile(`L(\d{3})`)
+
+// logLabelNumbers returns the numeric label of every log row drawn.
+func logLabelNumbers(frame []byte) []int {
+	var out []int
+	for _, row := range renderedLogRows(frame) {
+		matches := testLogLabelRe.FindAllStringSubmatch(row, -1)
+		if len(matches) == 0 {
+			continue
+		}
+		value, err := strconv.Atoi(matches[len(matches)-1][1])
+		if err != nil {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+// logTestMonitor builds a monitor with the given processes and log lines.
+func logTestMonitor(t *testing.T, height, procCount, logCount int) *monitor {
+	t.Helper()
+	m := newTestMonitor()
+	m.width = 100
+	m.height = height
+	processes := make([]ipc.ProcState, 0, procCount)
+	for i := 0; i < procCount; i++ {
+		processes = append(processes, ipc.ProcState{Name: fmt.Sprintf("proc%d", i), State: "running", Ready: true})
+	}
+	m.applyEvent(ipc.Event{Type: ipc.TypeSnapshot, Processes: processes})
+	for i := 0; i < logCount; i++ {
+		m.pushLog(ipc.LogEntry{Process: "proc0", Line: fmt.Sprintf("L%03d", i)})
+	}
+	return m
+}
+
+func TestLogAreaRows_MatchesRenderedLogRows(t *testing.T) {
+	cases := []struct {
+		name   string
+		height int
+		procs  int
+		tunnel bool
+		logs   int
+	}{
+		{"height 30 with 3 processes", 30, 3, false, 100},
+		{"height 80 with 5 processes", 80, 5, false, 500},
+		{"height 30 with 3 processes and a tunnel", 30, 3, true, 100},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := logTestMonitor(t, tc.height, tc.procs, tc.logs)
+			if tc.tunnel {
+				m.tunnelURL = "https://example.invalid/"
+			}
+			drawn := len(renderedLogRows(m.renderFrame()))
+			if drawn != m.logAreaRows() {
+				t.Errorf("drawn log rows = %d, logAreaRows = %d", drawn, m.logAreaRows())
+			}
+			if want := m.height - m.logAreaStartRow(); m.logAreaRows() != want {
+				t.Errorf("logAreaRows = %d, want height - logAreaStartRow = %d", m.logAreaRows(), want)
+			}
+		})
+	}
+}
+
+func TestLogAreaStartRow_MatchesRenderedFrame(t *testing.T) {
+	m := logTestMonitor(t, 30, 3, 100)
+	rows := cursorRows(m.renderFrame())
+	first := -1
+	last := -1
+	for row := 1; row <= 500; row++ {
+		text, ok := rows[row]
+		if !ok || !strings.Contains(text, " │ ") {
+			continue
+		}
+		if first < 0 {
+			first = row
+		}
+		last = row
+	}
+	if first != m.logAreaStartRow() {
+		t.Errorf("first rendered log row = %d, want logAreaStartRow = %d", first, m.logAreaStartRow())
+	}
+	if last != m.height-1 {
+		t.Errorf("last rendered log row = %d, want %d", last, m.height-1)
+	}
+}
+
+func TestPgUpPagesLogAreaContiguously(t *testing.T) {
+	m := logTestMonitor(t, 30, 3, 100)
+	first := logLabelNumbers(m.renderFrame())
+	if len(first) == 0 {
+		t.Fatal("no log rows rendered")
+	}
+	m.handleKey("pgup")
+	second := logLabelNumbers(m.renderFrame())
+	if len(second) == 0 {
+		t.Fatal("no log rows rendered after PgUp")
+	}
+	if len(second) != len(first) {
+		t.Errorf("page sizes differ: %d then %d", len(first), len(second))
+	}
+	if second[len(second)-1]+1 != first[0] {
+		t.Errorf("pages are not contiguous: page ends at %d, next page starts at %d",
+			second[len(second)-1], first[0])
 	}
 }

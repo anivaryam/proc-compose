@@ -8,12 +8,18 @@ import (
 	"net"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 )
 
 // ErrRecvTimeout is returned by RecvTimeout when no event arrived within
 // the requested duration.
 var ErrRecvTimeout = errors.New("ipc: timed out waiting for event")
+
+// ErrDisconnected means the peer closed the event stream without a read or
+// framing error. It does not by itself mean the daemon exited: a full outbound
+// queue also disconnects an individual subscriber.
+var ErrDisconnected = errors.New("daemon disconnected")
 
 // Client connects to a running daemon's socket/pipe and streams events.
 type Client struct {
@@ -39,6 +45,32 @@ func sanitizeSocketPath(path string) string {
 	return path
 }
 
+// dialCause extracts the root cause of a dial failure so the returned error
+// can name the operating system's reason.
+//
+// It prefers the syscall.Errno carried by the chain (ENOENT for a missing
+// socket, EINVAL for an unusable socket address, ECONNREFUSED for a socket
+// whose daemon is gone). When the chain holds no errno — a dial timeout's
+// cause is net's unexported *net.timeoutError, "i/o timeout" — it falls back
+// to the deepest unwrapped cause.
+//
+// It never returns the raw *net.OpError: that error carries the unsanitized
+// socket path, which the user-facing message must not expose.
+func dialCause(err error) error {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno
+	}
+	cause := err
+	for {
+		next := errors.Unwrap(cause)
+		if next == nil {
+			return cause
+		}
+		cause = next
+	}
+}
+
 // Dial connects to the daemon at socketPath.
 func Dial(socketPath string) (*Client, error) {
 	return DialTimeout(socketPath, 2*time.Second)
@@ -49,10 +81,15 @@ func Dial(socketPath string) (*Client, error) {
 // Callers that share one overall budget across several phases need the
 // connection attempt to draw from it rather than impose a fixed cost of their
 // own; that is the difference between a bounded stop and an unbounded one.
+//
+// A failed dial returns an error that names the operating system's cause, so
+// a permanently unusable socket address is distinguishable from a daemon that
+// is simply not running. The cause is the root cause only: the message
+// carries the sanitized socket path, never the raw one.
 func DialTimeout(socketPath string, d time.Duration) (*Client, error) {
 	conn, err := dialAddr(socketPath, d)
 	if err != nil {
-		return nil, fmt.Errorf("no proc-compose daemon running (socket: %s)", sanitizeSocketPath(socketPath))
+		return nil, fmt.Errorf("no proc-compose daemon running (socket: %s): %w", sanitizeSocketPath(socketPath), dialCause(err))
 	}
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 64<<10), MaxEventBytes)
@@ -60,13 +97,13 @@ func DialTimeout(socketPath string, d time.Duration) (*Client, error) {
 }
 
 // Recv reads the next event from the daemon. Blocks until an event arrives
-// or the connection is closed (returns io.EOF-wrapped error).
+// or the connection is closed (returns ErrDisconnected on clean EOF).
 func (c *Client) Recv() (Event, error) {
 	if !c.scanner.Scan() {
 		if err := c.scanner.Err(); err != nil {
 			return Event{}, err
 		}
-		return Event{}, fmt.Errorf("daemon disconnected")
+		return Event{}, ErrDisconnected
 	}
 	var ev Event
 	if err := json.Unmarshal(c.scanner.Bytes(), &ev); err != nil {

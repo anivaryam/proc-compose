@@ -127,12 +127,18 @@ proc-compose stop                         # stop everything and verify it ended
 - **Unit tests while editing:** add the test watcher (for example
   `npx vitest`) as an ordinary service. Do not make it `mode: task`: a task
   that exits non-zero fails the whole stack.
-- **End-to-end tests:** start with `up --silent --wait-ready`, run Playwright
-  or Cypress against the URLs from `status --json`, then `stop`.
+- **End-to-end tests:** prefer `verify` for a single owned check. When the
+  task needs a retained development environment, start with
+  `up --silent --wait-ready`, run tests against the resolved URLs, then `stop`.
 - **One owned run with a verdict:**
   `proc-compose verify --json -- npm test` starts a fresh session, waits for
   readiness, runs the command, stops everything, and writes a receipt. Exit
   0 passed, 1 failed, 2 nothing started, 130 interrupted.
+
+`verify` currently requires at least one service. For a standalone unit test,
+lint, or build, use the project's existing command and the agent harness's
+managed background execution when needed. Check the installed CLI's help
+before assuming it supports detached verification or standalone jobs.
 
 See [testing](references/testing.md) for all three, `compare`, environment
 reports, and CI recipes.

@@ -84,7 +84,9 @@ func TestDiscoverSessions_NeverProbesLease(t *testing.T) {
 			t.Fatal(err)
 		}
 		owner := owners[name]
-		receipt := &verify.Result{SchemaVersion: verify.SchemaVersion, State: verify.StateActive, AttemptID: &id, Owner: &owner}
+		// The status is part of the receipt contract: an active receipt
+		// carries not_run, the status of an attempt that has no verdict yet.
+		receipt := &verify.Result{SchemaVersion: verify.SchemaVersion, State: verify.StateActive, Status: verify.StatusNotRun, AttemptID: &id, Owner: &owner}
 		if err := verify.WriteReceipt(filepath.Join(verify.AttemptsDir(paths.SessionDir(hash)), id+".json"), receipt); err != nil {
 			t.Fatal(err)
 		}

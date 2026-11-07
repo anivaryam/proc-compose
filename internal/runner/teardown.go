@@ -160,7 +160,7 @@ func (r *Runner) runTeardownProcess(p procInfo, deadline time.Time) TeardownResu
 	handoffTimer := time.AfterFunc(time.Until(deadline), func() { close(handoff) })
 	defer handoffTimer.Stop()
 
-	st := &procState{state: "starting", generation: 1, readyCh: make(chan struct{}), restartCh: make(chan struct{}, 1)}
+	st := &procState{state: "starting", generation: 1, readyCycle: newReadyCycle(), restartCh: make(chan struct{}, 1)}
 	r.checksMu.Lock()
 	if r.checks == nil {
 		r.checks = make(map[string]*procState)

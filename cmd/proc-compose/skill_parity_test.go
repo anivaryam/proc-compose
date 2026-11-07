@@ -18,7 +18,8 @@ import (
 // The agent skill is Markdown that users copy or link into ~/.claude/skills,
 // outside this repository, so it cannot share code with the CLI. These tests
 // keep it from drifting: it must cover every command and config field, show
-// only commands that exist, and load in both Claude Code and OpenCode.
+// only commands that exist, and follow the shared skill portability contract.
+// Static validation is not proof that either agent loaded the skill at runtime.
 
 var skillDir = filepath.Join("..", "..", "skills", "proc-compose")
 
@@ -107,7 +108,7 @@ func cliCommandPaths(t *testing.T, bin string, parent ...string) []string {
 	return paths
 }
 
-func TestSkill_FrontmatterLoadsInClaudeCodeAndOpenCode(t *testing.T) {
+func TestSkill_PortableFrontmatter(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(skillDir, "SKILL.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -124,8 +125,9 @@ func TestSkill_FrontmatterLoadsInClaudeCodeAndOpenCode(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(block), &front); err != nil {
 		t.Fatalf("frontmatter: %v", err)
 	}
-	// OpenCode documents only these keys; Claude-only keys such as
-	// allowed-tools are not promised to load there.
+	// Keep a conservative shared subset. OpenCode V2 accepts additional keys
+	// and does not enforce the naming/length bounds below; these are our
+	// portability rules, not a claim about its runtime parser.
 	portable := []string{"name", "description", "license", "compatibility", "metadata"}
 	for key := range front {
 		if !slices.Contains(portable, key) {

@@ -283,16 +283,6 @@ func (pg *windowsProcessGroup) Close() error {
 	return err
 }
 
-// lastProbeFailure returns why the job handle could not be queried, or nil.
-//
-// Windows answers from the kernel's own job counters rather than a probe, so
-// there is no probe error to report; the accessor exists so the shared verdict
-// reporter does not need to know which mechanism a platform uses.
-func lastProbeFailure() error { return nil }
-
-// lastTrackFailure returns why containment could not be established, or nil.
-func lastTrackFailure() error { return nil }
-
 // RecoverGroups has nothing to recover on Windows: every managed tree runs in a
 // kill-on-close Job Object that ended with the daemon, and no process groups
 // are recorded. Any group passed in is reported unknown and nothing is

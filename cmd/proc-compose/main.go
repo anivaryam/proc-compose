@@ -267,17 +267,23 @@ auto-injection — see:
 				if err := waitForDaemonReady(pid, socketPath, paths.BootLog(hash), 10*time.Second, pidPath); err != nil {
 					return err
 				}
+				var project *ipc.Project
+				if waitReady || upJSON {
+					project, err = session.Read(paths.Metadata(hash))
+					if err != nil {
+						return err
+					}
+					if project.Owner == nil || project.Owner.PID != pid {
+						return fmt.Errorf("startup lost session ownership to another daemon; this invocation did not start that session")
+					}
+				}
 				if waitReady {
 					expected := waitReadyProcessNames(cfg, args)
-					if err := waitForProcessesReady(socketPath, expected, time.Duration(waitTimeout)*time.Second); err != nil {
+					if err := waitForProcessesReady(socketPath, expected, time.Duration(waitTimeout)*time.Second, project.RunID); err != nil {
 						return err
 					}
 				}
 				if upJSON {
-					project, err := session.Read(paths.Metadata(hash))
-					if err != nil {
-						return err
-					}
 					return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{"operation": "up", "pid": pid, "ready": waitReady, "project": project})
 				}
 				fmt.Printf("proc-compose daemon started\n")
@@ -372,6 +378,7 @@ auto-injection — see:
 				Journal:       journal,
 				Project:       plan.Project,
 				ResolveConfig: plan.Resolve,
+				BeforeStart:   plan.ReleasePorts,
 				RecordPath:    pidPath,
 			}
 			if daemonChild {
@@ -690,11 +697,22 @@ Flag-parsing errors remain plain text and exit 1.`,
 			}
 			defer client.Close()
 
+			// Read the snapshot the daemon writes first before sending. An
+			// older daemon reads nothing until it is out, and a Windows named
+			// pipe does not buffer, so a command sent first would wait for it.
+			snapshot, err := client.Recv()
+			if err != nil {
+				return fmt.Errorf("no response from daemon: %w", err)
+			}
+			runID := ""
+			if snapshot.Project != nil {
+				runID = snapshot.Project.RunID
+			}
 			if err := client.Send(ipc.Command{Action: "restart", Process: args[0]}); err != nil {
 				return fmt.Errorf("failed to send restart command: %w", err)
 			}
 
-			// Read events until we get an ack (skip snapshot and any state/log events).
+			// Read events until we get an ack (skip any state/log events).
 			for {
 				ev, err := client.Recv()
 				if err != nil {
@@ -708,7 +726,7 @@ Flag-parsing errors remain plain text and exit 1.`,
 							if ev.AckGeneration == 0 {
 								return fmt.Errorf("daemon does not expose process generations; restart it with the current proc-compose")
 							}
-							if err := waitForProcessesReady(socketPath, map[string]struct{}{args[0]: {}}, time.Duration(restartTimeout)*time.Second, map[string]uint64{args[0]: ev.AckGeneration}); err != nil {
+							if err := waitForProcessesReady(socketPath, map[string]struct{}{args[0]: {}}, time.Duration(restartTimeout)*time.Second, runID, map[string]uint64{args[0]: ev.AckGeneration}); err != nil {
 								return err
 							}
 							*restartResult.Ready = true
@@ -769,6 +787,10 @@ plain text and exit 1.`,
 			}
 			defer client.Close()
 
+			// Read the snapshot first, as restart does.
+			if _, err := client.Recv(); err != nil {
+				return fmt.Errorf("no response from daemon: %w", err)
+			}
 			if err := client.Send(ipc.Command{Action: "reload"}); err != nil {
 				return fmt.Errorf("failed to send reload command: %w", err)
 			}
@@ -1008,16 +1030,22 @@ See: https://github.com/anivaryam/proc-compose/blob/main/docs/cli.md#diagnose-or
 	// over the screen. Cobra returns for --help and --version before any run
 	// hook, so those never reach it.
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
-		// Commands that promise a structured result report this refusal
-		// themselves; they silence cobra's printing to keep stdout clean.
+		// verify and compare report this refusal in their own result kinds;
+		// every other command reports it here, the same way on each.
 		if err := validateSessionFlag(); err != nil && cmd.Annotations[structuredUsageAnnotation] == "" {
-			return err
+			return refuseSession(cmd, err)
 		}
 		printUpdateNotice(cmd, version, stderrIsTerminal())
 		return nil
 	}
 
-	if err := rootCmd.Execute(); err != nil {
+	// The notice's release lookup runs in the background. Join it here, after
+	// the command has done its work and before any exit below, so a short
+	// command still records the result for the next invocation. The join is
+	// bounded and returns at once when no lookup was scheduled.
+	err := rootCmd.Execute()
+	waitForUpdateRefresh()
+	if err != nil {
 		var coded exitCodeError
 		if errors.As(err, &coded) {
 			os.Exit(coded.code)
@@ -1057,48 +1085,6 @@ func resolveConfigContext(configFile string, explicit bool) (root, configPath st
 		return filepath.Dir(absConfig), absConfig, nil
 	}
 	return ".", "", nil
-}
-
-// computeClosure returns the set of process names that would run given
-// the config and the selected args (which may be empty for "all").
-// It expands args to include transitive dependencies.
-func computeClosure(procs map[string]config.Process, args []string) []string {
-	if len(args) == 0 {
-		names := make([]string, 0, len(procs))
-		for name := range procs {
-			names = append(names, name)
-		}
-		return names
-	}
-
-	filterSet := make(map[string]bool)
-	for _, name := range args {
-		filterSet[name] = true
-	}
-
-	var expand func(name string)
-	expand = func(name string) {
-		proc, ok := procs[name]
-		if !ok {
-			return
-		}
-		for _, dep := range proc.DependsOn {
-			if !filterSet[dep] {
-				filterSet[dep] = true
-				expand(dep)
-			}
-		}
-	}
-
-	for _, name := range args {
-		expand(name)
-	}
-
-	result := make([]string, 0, len(filterSet))
-	for name := range filterSet {
-		result = append(result, name)
-	}
-	return result
 }
 
 func validateSilentSelection(cfg *config.Config, args []string) error {

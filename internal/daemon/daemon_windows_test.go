@@ -47,6 +47,14 @@ func TestStartProven_ExitedProcessWithOpenHandleIsNotProven(t *testing.T) {
 	if alive, _ := IsAliveFromPIDFile(path); !alive {
 		t.Fatal("IsAliveFromPIDFile changed: it no longer reports the exited, still-open process")
 	}
+	// stop waits for the daemon with IsRunning while it holds a handle to it,
+	// so an exited, still-open process must read as gone there.
+	if IsRunning(cmd.Process.Pid) {
+		t.Fatal("IsRunning = true for an exited process that a handle keeps open")
+	}
+	if !IsRunning(os.Getpid()) {
+		t.Fatal("IsRunning(this running process) = false")
+	}
 	self := filepath.Join(t.TempDir(), "self.pid")
 	if err := WritePID(self, os.Getpid(), ""); err != nil {
 		t.Fatal(err)

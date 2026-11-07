@@ -66,6 +66,12 @@ One owned operation: validate the config, acquire a fresh session, start the
 selected processes, wait for readiness, run the check, stop everything it
 started, and write a receipt.
 
+The selection must include a service; standalone tests do not need a dummy
+server. Run their existing project command directly. `verify` runs in the
+foreground; use the agent harness's managed background-command facility for
+asynchronous execution, and retrieve its terminal result before reporting a
+pass. Do not infer success from an active receipt or a successful launch.
+
 ```sh
 proc-compose verify -- npm test
 proc-compose verify api -- go test ./e2e/...                  # api plus its dependencies
