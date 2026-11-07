@@ -30,8 +30,8 @@ const (
 	DefaultCleanupTimeout = 30 * time.Second
 	MinStartupTimeout     = time.Second
 	MaxStartupTimeout     = 10 * time.Minute
-	MinCheckTimeout       = time.Second
-	MaxCheckTimeout       = time.Hour
+	MinCheckTimeout       = time.Duration(config.MinTaskTimeoutSeconds) * time.Second
+	MaxCheckTimeout       = time.Duration(config.MaxTaskTimeoutSeconds) * time.Second
 	MinCleanupTimeout     = 30 * time.Second
 	MaxCleanupTimeout     = 2 * time.Minute
 	// sealReserve is the final part of the cleanup budget reserved for
@@ -49,6 +49,10 @@ type Options struct {
 	// Standalone runs only Argv, without reading or starting the config.
 	// ConfigPath still supplies the session identity and default working directory.
 	Standalone bool
+	// TaskName resolves a named catalog command from ConfigPath at execution.
+	// Explicit CLI check timeouts take precedence over the catalog default.
+	TaskName             string
+	CheckTimeoutExplicit bool
 	// EvidenceDir retains the receipt and journal outside ephemeral runtime
 	// storage. Session/resource leases and process records remain runtime-owned.
 	EvidenceDir    string
@@ -136,6 +140,7 @@ func newResult(opts Options, started time.Time) *Result {
 	result := &Result{
 		SchemaVersion:     SchemaVersion,
 		Standalone:        opts.Standalone,
+		TaskName:          opts.TaskName,
 		Kind:              KindResponse,
 		State:             StateCompleted,
 		Status:            StatusNotRun,
@@ -197,6 +202,51 @@ func Run(ctx context.Context, opts Options) *Result {
 	}
 
 	// ── validation (no ownership, no receipt) ───────────────────────────────
+	cfg := &config.Config{Processes: map[string]config.Process{}}
+	loadConfig := func() bool {
+		raw, err := os.ReadFile(opts.ConfigPath)
+		if err != nil {
+			failPreAcquisition(result, CodeInvalidConfig, opts.now())
+			return false
+		}
+		result.ConfigSHA256 = digestPtr(raw)
+		cfg, err = config.LoadBytes(opts.ConfigPath, raw)
+		if err != nil {
+			fmt.Fprintf(opts.Log, "verify: %v\n", err)
+			failPreAcquisition(result, CodeInvalidConfig, opts.now())
+			return false
+		}
+		return true
+	}
+	if opts.TaskName != "" {
+		if !loadConfig() {
+			return result
+		}
+		task, ok := cfg.Tasks[opts.TaskName]
+		if !ok || len(opts.Argv) != 0 || len(opts.Selectors) != 0 {
+			fmt.Fprintln(opts.Log, "verify: select an existing task without overriding its argv or services")
+			failPreAcquisition(result, CodeUsage, opts.now())
+			return result
+		}
+		opts.Argv, opts.Selectors = task.Argv, task.Services
+		opts.Standalone = len(task.Services) == 0
+		if opts.Dir == "" {
+			opts.Dir = task.Dir
+		}
+		if task.Timeout != 0 && !opts.CheckTimeoutExplicit {
+			opts.CheckTimeout = time.Duration(task.Timeout) * time.Second
+		}
+		cfg.Resources = append(cfg.Resources, task.Resources...)
+		if opts.Standalone {
+			// A standalone catalog task owns resources, never service or
+			// teardown processes from the surrounding config.
+			cfg = &config.Config{Processes: map[string]config.Process{}, Resources: cfg.Resources}
+		}
+		result.Standalone = opts.Standalone
+		result.Check.Argv = append([]string(nil), opts.Argv...)
+		sum, size := ArgvDigest(opts.Argv)
+		result.Check.ArgvSHA256, result.Check.ArgvBytes = &sum, size
+	}
 	if len(opts.Argv) == 0 || opts.Argv[0] == "" {
 		failPreAcquisition(result, CodeUsage, opts.now())
 		return result
@@ -222,20 +272,8 @@ func Run(ctx context.Context, opts Options) *Result {
 	if opts.cleanupBudget > 0 {
 		opts.CleanupTimeout = opts.cleanupBudget
 	}
-	cfg := &config.Config{Processes: map[string]config.Process{}}
-	if !opts.Standalone {
-		raw, err := os.ReadFile(opts.ConfigPath)
-		if err != nil {
-			failPreAcquisition(result, CodeInvalidConfig, opts.now())
-			return result
-		}
-		result.ConfigSHA256 = digestPtr(raw)
-		cfg, err = config.Load(opts.ConfigPath)
-		if err != nil {
-			fmt.Fprintf(opts.Log, "verify: %v\n", err)
-			failPreAcquisition(result, CodeInvalidConfig, opts.now())
-			return result
-		}
+	if opts.TaskName == "" && !opts.Standalone && !loadConfig() {
+		return result
 	}
 	for _, name := range opts.Selectors {
 		if err := config.CheckSelector(cfg, name); err != nil {
@@ -245,13 +283,7 @@ func Run(ctx context.Context, opts Options) *Result {
 		}
 	}
 	selected := config.SelectedNames(cfg, opts.Selectors)
-	hasService := false
-	for _, name := range selected {
-		if cfg.Processes[name].EffectiveMode() != config.ProcessModeTask {
-			hasService = true
-		}
-	}
-	if !hasService && !opts.Standalone {
+	if !config.HasService(cfg, opts.Selectors) && !opts.Standalone {
 		fmt.Fprintln(opts.Log, "verify: the selection must include at least one service")
 		failPreAcquisition(result, CodeUsage, opts.now())
 		return result
@@ -276,7 +308,7 @@ func Run(ctx context.Context, opts Options) *Result {
 	result.Workdir = workdir
 	result.Check.Cwd = &workdir
 	result.Startup.Validation = StatusPassed
-	if opts.Standalone {
+	if opts.Standalone && opts.TaskName == "" {
 		result.Startup.Validation = StatusNotNeeded
 	}
 	sourceBefore := observeSource(workdir, opts.now)

@@ -308,6 +308,8 @@ func TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere(t *testing.T) {
 		{operation: "reload"},
 		{operation: "verify", check: []string{"true"}},
 		{operation: "run", check: []string{"true"}},
+		{operation: "tasks list"},
+		{operation: "tasks run", args: []string{"lint"}},
 		{operation: "jobs list"},
 		{operation: "jobs show", args: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}},
 		{operation: "jobs logs", args: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}},
@@ -365,7 +367,7 @@ func TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere(t *testing.T) {
 			}
 			result := decodeOne(t, stdout)
 			switch tc.operation {
-			case "verify", "run":
+			case "verify", "run", "tasks run":
 				if result["kind"] != "verify.response" || result["exit_code"] != float64(2) || result["attempt_id"] != nil || result["config_path"] != config {
 					t.Fatalf("verify --json result %v", result)
 				}
@@ -397,6 +399,10 @@ func TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere(t *testing.T) {
 			case "verify", "run":
 				if !strings.Contains(stdout, tc.operation+" FAILED (exit 2)") {
 					t.Fatalf("%s human stdout = %q", tc.operation, stdout)
+				}
+			case "tasks run":
+				if !strings.Contains(stdout, "verify FAILED (exit 2)") {
+					t.Fatalf("tasks run human stdout = %q", stdout)
 				}
 			case "compare":
 				if !strings.Contains(stdout, "compare NOT_COMPARABLE (exit 2)") {

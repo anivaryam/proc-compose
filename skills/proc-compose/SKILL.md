@@ -28,9 +28,9 @@ uses it. The `references/` files hold the details.
 
 ## Ground rules
 
-- Pass the same `-f /abs/path/proc-compose.yml --session NAME` to every command
-  of one task. A session's identity is the absolute config path plus the
-  optional session name.
+- Pass the same `-f /abs/path/proc-compose.yml --session NAME` to session-scoped
+  commands for one task. A session's identity is the absolute config path plus
+  the optional name. Retrieve background work with `jobs` by its immutable ID.
 - Never stop, restart, or reload a session you did not start. Look first with
   `proc-compose sessions --json` or `proc-compose status --json`. When `verify`
   reports `session_occupied`, choose another `--session`.
@@ -62,6 +62,7 @@ uses it. The `references/` files hold the details.
 | One owned check with a receipt | `verify`, `attempts`, `why --attempt` | [testing](references/testing.md#verify) |
 | Standalone unit tests, lint, builds, code generation | `run`, `attempts`, `why --attempt` | [testing](references/testing.md#standalone-checks) |
 | Background tests and later result retrieval | `--background`, `jobs list/show/logs/wait/cancel` | [testing](references/testing.md#background-jobs) |
+| Discover and run project checks by name | `tasks list`, `tasks run` | [testing](references/testing.md#named-project-tasks) |
 | Same check on two worktrees | `compare` | [testing](references/testing.md#compare) |
 | Logs and failure evidence | `logs`, `why` | [sessions and logs](references/sessions-and-logs.md#logs) |
 | Parallel copies per branch or worktree | `--session`, `ports`, `${urls...}`, `resources`, `sessions` | [sessions and logs](references/sessions-and-logs.md#sessions) |

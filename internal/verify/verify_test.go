@@ -385,6 +385,76 @@ func TestRun_StandaloneIgnoresConfigAndHonorsOwnership(t *testing.T) {
 	}
 }
 
+func TestRun_TaskCatalogExecution(t *testing.T) {
+	for _, stack := range []bool{false, true} {
+		t.Run(fmt.Sprintf("services=%t", stack), func(t *testing.T) {
+			argv, _ := json.Marshal(checkArgv("exit", "0")) // JSON flow arrays are valid YAML, including Windows paths.
+			body := strings.Replace(serviceConfig, "    cmd:", "    depends_on: [setup]\n    cmd:", 1) + "  setup:\n    cmd: {{BIN}} 0\n    mode: task\n    env:\n      " + helperEnv + ": exit\n" + "tasks:\n  test:\n    argv: " + string(argv) + "\n    dir: work\n    timeout: 10\n"
+			if stack {
+				body += "    services: [api]\n"
+			}
+			f := newFixture(t, body)
+			if err := os.Mkdir(filepath.Join(f.dir, "work"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			withHelper(t, "exit")
+			opts := f.options(t, "catalog")
+			opts.TaskName = "test"
+			start := time.Now()
+			opts.Now = func() time.Time { return start }
+			result := Run(context.Background(), opts)
+			assertComplete(t, result)
+			raw, _ := os.ReadFile(f.config)
+			if result.Status != StatusPassed || result.TaskName != "test" || result.Standalone == stack || result.ConfigSHA256 == nil || *result.ConfigSHA256 != *digestPtr(raw) || result.Startup.Validation != StatusPassed || result.Workdir != filepath.Join(f.dir, "work") || result.Check.DeadlineAt == nil || *result.Check.DeadlineAt != start.Add(10*time.Second).UTC().Format(time.RFC3339Nano) {
+				t.Fatalf("catalog execution: %+v", result)
+			}
+			if stack {
+				if len(result.SelectedProcesses) != 2 {
+					t.Fatalf("service dependency not selected: %+v", result.SelectedProcesses)
+				}
+				assertGone(t, pidFromFile(t, f.pidFile))
+			} else if _, err := os.Stat(f.pidFile); !os.IsNotExist(err) || len(result.SelectedProcesses) != 0 {
+				t.Fatal("standalone catalog task started services")
+			}
+			receipt, err := ReadReceipt(*result.ReceiptPath)
+			if err != nil || receipt.TaskName != "test" || receipt.Check.Argv[0] != os.Args[0] {
+				t.Fatalf("task provenance not retained: %+v %v", receipt, err)
+			}
+		})
+	}
+}
+
+func TestRun_TaskResourcesAndOverrides(t *testing.T) {
+	argv, _ := json.Marshal(checkArgv("exit", "0"))
+	f := newFixture(t, "resources: [global-catalog-resource]\ntasks:\n  test:\n    argv: "+string(argv)+"\n    dir: missing\n    timeout: 1\n    resources: [task-catalog-resource]\n")
+	withHelper(t, "exit")
+	opts := f.options(t, "catalog")
+	opts.TaskName, opts.Dir, opts.CheckTimeoutExplicit = "test", ".", true
+	for _, resource := range []string{"global-catalog-resource", "task-catalog-resource"} {
+		hash, _ := paths.FromConfig(f.config, "holder")
+		plan, err := session.Acquire(&config.Config{Processes: map[string]config.Process{}, Resources: []string{resource}}, f.config, hash, "holder", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := Run(context.Background(), opts)
+		plan.Close()
+		if result.ExitCode != ExitUsage || result.Check.StartedAt != nil || result.Errors[0].Code != CodeResourceUnavailable {
+			t.Fatalf("task ignored resource %s: %+v", resource, result)
+		}
+	}
+	start := time.Now()
+	opts.Now = func() time.Time { return start }
+	result := Run(context.Background(), opts)
+	if result.Status != StatusPassed || result.Check.DeadlineAt == nil || *result.Check.DeadlineAt != start.Add(opts.CheckTimeout).UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("CLI overrides not respected: %+v", result)
+	}
+	opts.TaskName = "missing"
+	result = Run(context.Background(), opts)
+	if result.ExitCode != ExitUsage || result.Check.StartedAt != nil {
+		t.Fatalf("unknown task ran: %+v", result)
+	}
+}
+
 // TestRun_ForeignListenerRejectFailsStartupNamingTheHolder is the verify
 // side of foreign_listener: reject: a foreign server on the probe address
 // does not make the stack ready, the check never runs, and the receipt's

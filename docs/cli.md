@@ -21,6 +21,7 @@ proc-compose list                                       List config processes
 proc-compose verify [processes...] -- PROGRAM [ARG...]  Owned stack + check + verified cleanup + receipt
 proc-compose run -- PROGRAM [ARG...]                    Standalone command + verified cleanup + receipt
 proc-compose jobs list|show|logs|wait|cancel              Retained background jobs by immutable ID
+proc-compose tasks list|run                             Discover and execute named project tasks
 proc-compose attempts [id|latest] [--json]              List or show verification receipts
 proc-compose agent-guide                                Print the offline operating guide for coding agents
 proc-compose why <process> | --attempt <id|latest>      Bounded failure evidence (live, retained, or one attempt)
@@ -173,6 +174,12 @@ the command's original exit code is in `check.exit_code`. Receipts have the same
 runtime-directory retention as verification attempts in foreground mode.
 
 ### Background development jobs
+
+For declared project commands, `proc-compose tasks list --json` discovers the
+catalog and `proc-compose tasks run NAME --json` executes one. Add `--background`
+to use the same job workflow below. Task defaults include direct argv, directory,
+service dependencies, timeout and exclusive resources; see
+[Named Development Tasks](configuration.md#named-development-tasks).
 
 ```sh
 proc-compose run --background --json -- go test ./...

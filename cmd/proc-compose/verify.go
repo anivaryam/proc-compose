@@ -42,14 +42,15 @@ func validateSessionFlag() error {
 }
 
 func newVerifyCommand(configFile *string) *cobra.Command {
-	return newExecutionCommand(configFile, false)
+	return newExecutionCommand(configFile, "verify")
 }
 
 func newRunCommand(configFile *string) *cobra.Command {
-	return newExecutionCommand(configFile, true)
+	return newExecutionCommand(configFile, "run")
 }
 
-func newExecutionCommand(configFile *string, standalone bool) *cobra.Command {
+func newExecutionCommand(configFile *string, operation string) *cobra.Command {
+	standalone := operation == "run"
 	var (
 		machine        bool
 		background     bool
@@ -117,15 +118,16 @@ Default budgets (unmeasured policy): startup 120s (1s-10m), check 10m
 			}
 			stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 			opts := verify.Options{
-				Standalone:         standalone,
-				Session:            sessionName,
-				Selectors:          selectors,
-				Argv:               argv,
-				Dir:                dir,
-				ToolVersion:        version,
-				Log:                stderr,
-				RequireEnvironment: requireEnv,
-				RefuseCrossSession: !allowCross,
+				CheckTimeoutExplicit: cmd.Flags().Changed("check-timeout"),
+				Standalone:           standalone,
+				Session:              sessionName,
+				Selectors:            selectors,
+				Argv:                 argv,
+				Dir:                  dir,
+				ToolVersion:          version,
+				Log:                  stderr,
+				RequireEnvironment:   requireEnv,
+				RefuseCrossSession:   !allowCross,
 			}
 			if !machine || streamLogs {
 				opts.ProcessOutput = stderr
@@ -142,7 +144,14 @@ Default budgets (unmeasured policy): startup 120s (1s-10m), check 10m
 			if parseErr == nil {
 				parseErr = parseBudgets(startupTimeout, checkTimeout, cleanupTimeout, &opts)
 			}
-			if parseErr == nil && argv == nil {
+			if parseErr == nil && operation == "task" {
+				if len(args) != 1 || cmd.ArgsLenAtDash() >= 0 {
+					parseErr = fmt.Errorf("tasks run requires exactly one task name")
+				} else {
+					opts.TaskName, opts.Selectors = args[0], nil
+				}
+			}
+			if parseErr == nil && argv == nil && operation != "task" {
 				parseErr = fmt.Errorf("%s requires a check command after --", cmd.Name())
 			}
 			if parseErr == nil && standalone && len(selectors) != 0 {
@@ -198,6 +207,16 @@ Receipts are retained in the runtime directory and may disappear at logout/reboo
 		command.Example = `  proc-compose run --json -- go test ./...
   proc-compose --session lint run --dir web -- npm run lint`
 	}
+	if operation == "task" {
+		command.Use = "run NAME"
+		command.Short = "Run a declared project task with owned services and cleanup"
+		command.Long = `Run a named entry from the config's tasks catalog. Its argv executes
+directly, without an implicit shell. With services, acquire a fresh stack and
+wait for readiness; otherwise run standalone. Global and task resource labels
+are leased for the operation. --dir and --check-timeout override task defaults.
+The result records task_name, executed argv, and the execution-time config hash.`
+		command.Example = "  proc-compose tasks run lint --json\n  proc-compose tasks run integration --background --json"
+	}
 	command.Long += `
 
 With --background, return a persistent job ID after worker acknowledgement.
@@ -251,7 +270,7 @@ func printVerifyHuman(w io.Writer, r *verify.Result) {
 		fmt.Fprintf(w, " (run %s)", *r.RunID)
 	}
 	fmt.Fprintln(w)
-	if r.Standalone {
+	if r.Standalone && r.TaskName == "" {
 		fmt.Fprintf(w, "  context:  %s (identity only; config not loaded)\n", r.ConfigPath)
 	} else {
 		fmt.Fprintf(w, "  config:   %s (validation %s)\n", r.ConfigPath, r.Startup.Validation)

@@ -2,10 +2,12 @@
 
 Offline and version-matched: `proc-compose agent-guide`. Use `<command> --help`
 for exact flags. Schema version 1. Pass the same explicit
-`-f /abs/proc-compose.yml --session NAME` to every command; session identity is
-the absolute config path plus the optional name. A NAME outside
+`-f /abs/proc-compose.yml --session NAME` to session-scoped commands; session
+identity is the absolute config path plus the optional name. `jobs` retrieves
+background work by immutable job ID, independently of that session context.
+A NAME outside
 `[A-Za-z0-9._-]{1,64}` is refused by every command before it does anything:
-exit 2 and, with `--json`, one object on stdout (`verify`/`run`/`compare`: their own
+exit 2 and, with `--json`, one object on stdout (`verify`/`run`/`tasks run`/`compare`: their own
 kind with `usage_error`; others: `{operation, status: "error", message}`).
 
 ## Standalone checks: `run`
@@ -58,6 +60,39 @@ proc-compose jobs cancel JOB_ID --timeout 1m --json
   override the same when reconnecting. They survive normal logout/reboot; running
   commands do not survive reboot. Journals retain 10 MiB plus three rotations.
   Background receipts use `jobs`, not the session's runtime-only `attempts`.
+
+## Named project tasks
+
+Discover explicit commands with `proc-compose tasks list --json`; run one with
+`proc-compose tasks run NAME --json`, or add `--background` and retrieve its
+result with `jobs wait`. A config can contain only `tasks` for projects without
+services. Reuse existing package scripts or Make targets:
+
+```yaml
+tasks:
+  lint:
+    description: Existing lint script
+    argv: [npm, run, lint]
+    dir: web
+    timeout: 120
+    resources: ['build:${config.dir}/web']
+  integration:
+    argv: [npm, run, test:integration]
+    services: [api]
+```
+
+`services` selects configured processes and their dependencies and must include
+a service; their startup, readiness, teardown and cleanup use normal verification.
+Omitting it runs standalone with no service or teardown processes. Global and
+task `resources` are leased in either mode. `timeout` is check seconds (0 uses
+10m; 1..3600 otherwise); `--check-timeout` overrides it. `dir` is config-relative;
+`--dir` overrides it. Commands use direct argv and inherit the check environment.
+Catalog entries do not run automatically on `up`; `processes.*.mode: task` is
+for stack setup dependencies. Names use the process-name rules.
+
+Background workers read the catalog at execution time; the terminal result's
+`task_name`, `check.argv`, and `config_sha256` describe what actually ran. A
+standalone catalog task still validates/hashes its config; raw `run --` does not.
 
 ## Checks needing services: `verify`
 

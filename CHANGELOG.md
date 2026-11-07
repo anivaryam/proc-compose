@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Named project `tasks` catalog with `tasks list --json` and `tasks run NAME`:
+  existing command argv, directory, service dependencies, timeout and exclusive
+  resources. Foreground/background execution shares verification and job
+  ownership, and records the task name and execution-time config snapshot hash.
 - `run --background` and `verify --background` return a persistent job ID after
   detached worker acknowledgement. `jobs list/show/logs/wait/cancel` retrieves
   bounded results and logs across directories and runtime cleanup, waits with

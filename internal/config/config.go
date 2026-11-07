@@ -124,7 +124,25 @@ type Config struct {
 	Merge     *Merge             `yaml:"merge,omitempty"`
 	Processes map[string]Process `yaml:"processes"`
 	Resources []string           `yaml:"resources,omitempty"` // exclusive resource labels held while the stack runs
+	Tasks     map[string]Task    `yaml:"tasks,omitempty"`
 }
+
+// Task names an existing project command. Services selects an owned stack;
+// without services it is standalone. Commands are direct argv, never an
+// implicitly selected shell or an automatically guessed package-manager task.
+type Task struct {
+	Description string   `yaml:"description,omitempty" json:"description,omitempty"`
+	Argv        []string `yaml:"argv" json:"argv"`
+	Dir         string   `yaml:"dir,omitempty" json:"dir,omitempty"`
+	Services    []string `yaml:"services,omitempty" json:"services,omitempty"`
+	Timeout     int      `yaml:"timeout,omitempty" json:"timeout,omitempty"` // seconds; zero uses the check default
+	Resources   []string `yaml:"resources,omitempty" json:"resources,omitempty"`
+}
+
+const (
+	MinTaskTimeoutSeconds = 1
+	MaxTaskTimeoutSeconds = 3600
+)
 
 var processNameRe = regexp.MustCompile(`^[A-Za-z0-9][-A-Za-z0-9._]*[A-Za-z0-9]$|^[A-Za-z0-9]$`)
 
@@ -158,7 +176,13 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot read %s: %w", path, err)
 	}
+	return LoadBytes(path, data)
+}
 
+// LoadBytes validates one config snapshot. path anchors relative directories and
+// env files; callers can hash the same bytes they execute for provenance.
+func LoadBytes(path string, data []byte) (*Config, error) {
+	var err error
 	var cfg Config
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -166,7 +190,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("invalid YAML in %s: %w", path, err)
 	}
 
-	if len(cfg.Processes) == 0 && cfg.Merge == nil {
+	if len(cfg.Processes) == 0 && cfg.Merge == nil && len(cfg.Tasks) == 0 {
 		return nil, invalid(CodeNoProcesses, nil, nil, "no processes defined in %s", path)
 	}
 
@@ -399,6 +423,45 @@ func Load(path string) (*Config, error) {
 	if err := detectCycles(cfg.Processes); err != nil {
 		return nil, err
 	}
+	cfg.Resources, err = normalizeResources(cfg.Resources, []any{"resources"})
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range SortedProcessNames(cfg.Tasks) {
+		task := cfg.Tasks[name]
+		at := []any{"tasks", name}
+		if !processNameRe.MatchString(name) {
+			return nil, invalid(CodeInvalidProcessName, at, nil, "invalid task name %q", name)
+		}
+		if len(task.Argv) == 0 || task.Argv[0] == "" {
+			return nil, invalid(CodeInvalidValue, append(at, "argv"), nil, "task %q needs non-empty argv", name)
+		}
+		for i, arg := range task.Argv {
+			if strings.ContainsRune(arg, '\x00') {
+				return nil, invalid(CodeInvalidValue, []any{"tasks", name, "argv", i}, nil, "task argv cannot contain NUL")
+			}
+		}
+		if task.Timeout < 0 || task.Timeout > MaxTaskTimeoutSeconds {
+			return nil, invalid(CodeInvalidValue, append(at, "timeout"), nil, "task timeout must be 0 (default) or %d..%d seconds", MinTaskTimeoutSeconds, MaxTaskTimeoutSeconds)
+		}
+		for i, service := range task.Services {
+			if err := CheckSelector(&cfg, service); err != nil {
+				return nil, invalid(CodeUnknownDependency, []any{"tasks", name, "services", i}, err, "%s", err)
+			}
+		}
+		if len(task.Services) > 0 && !HasService(&cfg, task.Services) {
+			return nil, invalid(CodeInvalidValue, append(at, "services"), nil, "task services must select at least one service (plus its dependencies)")
+		}
+		task.Resources, err = normalizeResources(task.Resources, append(at, "resources"))
+		if err != nil {
+			return nil, err
+		}
+		cfg.Tasks[name] = task
+	}
+	return &cfg, nil
+}
+
+func normalizeResources(resources []string, at []any) ([]string, error) {
 	// Resource labels are normalised once, here: the trimmed label is the
 	// lease identity, the duplicate check and Project.Resources all use it.
 	// Two independent checks: an exactly repeated label is still a
@@ -406,15 +469,15 @@ func Load(path string) (*Config, error) {
 	// whitespace names the same resource and is skipped (first wins).
 	seenResources := make(map[string]bool)
 	seenTrimmed := make(map[string]bool)
-	normalized := make([]string, 0, len(cfg.Resources))
-	for i, resource := range cfg.Resources {
+	normalized := make([]string, 0, len(resources))
+	for i, resource := range resources {
 		if seenResources[resource] {
-			return nil, invalid(CodeInvalidResource, []any{"resources", i}, nil, "invalid or duplicate resource label %q", resource)
+			return nil, invalid(CodeInvalidResource, append(at, i), nil, "invalid or duplicate resource label %q", resource)
 		}
 		seenResources[resource] = true
 		trimmed := strings.TrimSpace(resource)
 		if trimmed == "" || len(trimmed) > maxResourceLabel || strings.ContainsAny(trimmed, "\r\n\x00") {
-			return nil, invalid(CodeInvalidResource, []any{"resources", i}, nil, "invalid or duplicate resource label %q", resource)
+			return nil, invalid(CodeInvalidResource, append(at, i), nil, "invalid or duplicate resource label %q", resource)
 		}
 		if seenTrimmed[trimmed] {
 			continue
@@ -422,11 +485,10 @@ func Load(path string) (*Config, error) {
 		seenTrimmed[trimmed] = true
 		normalized = append(normalized, trimmed)
 	}
-	if len(cfg.Resources) > 0 {
-		cfg.Resources = normalized
+	if len(resources) == 0 {
+		return resources, nil
 	}
-
-	return &cfg, nil
+	return normalized, nil
 }
 
 // validateTeardown refuses every field a teardown process cannot use: it
@@ -607,6 +669,16 @@ func TeardownNames(cfg *Config) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// HasService reports whether a selection and its dependencies contain a service.
+func HasService(cfg *Config, filter []string) bool {
+	for _, name := range SelectedNames(cfg, filter) {
+		if cfg.Processes[name].EffectiveMode() == ProcessModeService {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckSelector reports whether name can be selected to start: it must be a

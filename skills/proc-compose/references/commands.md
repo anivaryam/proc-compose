@@ -136,6 +136,8 @@ that `up --survive --install` created. Linux only.
 |---|---|---|
 | `proc-compose verify [processes...] -- PROGRAM [ARG...]` | Fresh owned session, readiness, one check, verified cleanup, receipt | [testing](testing.md#verify) |
 | `proc-compose run -- PROGRAM [ARG...]` | Standalone command, verified cleanup, receipt; no services or config required | [testing](testing.md#standalone-checks) |
+| `proc-compose tasks list --json` | Discover declared commands, defaults, services and resource labels | [testing](testing.md#named-project-tasks) |
+| `proc-compose tasks run NAME --json` | Execute one catalog entry; supports `--background` | [testing](testing.md#named-project-tasks) |
 | `proc-compose jobs list --json` | Bounded global job summaries; `--limit`, `--before` | [testing](testing.md#background-jobs) |
 | `proc-compose jobs show JOB_ID --json` | Retrieve state and retained result by immutable ID | [testing](testing.md#background-jobs) |
 | `proc-compose jobs logs JOB_ID --json` | Bounded retained logs; `--after`, `-n`, `--max-bytes` | [testing](testing.md#background-jobs) |

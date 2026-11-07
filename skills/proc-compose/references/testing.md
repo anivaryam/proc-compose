@@ -49,6 +49,26 @@ cleanup. They survive normal logout/reboot; the running commands do not survive
 reboot. Keep the same job-root override when reconnecting. Journals are bounded
 at 10 MiB plus three rotations; resume with `next_cursor` and respect `gap`.
 
+## Named project tasks
+
+Start with `proc-compose tasks list --json`. Use an existing catalog entry when
+it matches the requested check, rather than recreating its command:
+
+```sh
+proc-compose tasks run lint --json
+proc-compose tasks run integration --background --json
+proc-compose jobs wait JOB_ID --timeout 30s --json
+```
+
+The catalog's `argv` references existing scripts or Make targets. With `services`,
+execution owns the selected stack and its dependencies; without it, execution
+is standalone. Global and task `resources` are leased in either mode. `--dir`
+and `--check-timeout` override catalog defaults. See the [catalog fields](configuration.md#named-task-catalog).
+Save background job IDs and retrieve terminal results before claiming success.
+The worker reads the catalog at execution time; `task_name`, `config_sha256`,
+and `check.argv` record the executed definition. Standalone catalog tasks still
+validate their config; raw `run --` does not.
+
 ## Local development loop
 
 ### Test watcher as a process

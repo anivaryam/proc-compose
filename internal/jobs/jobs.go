@@ -26,18 +26,20 @@ const maxRecordBytes = 128 << 10
 // Request contains only execution inputs. Inherited environment values are
 // passed to the detached process, not copied into persistent metadata.
 type Request struct {
-	ConfigPath         string        `json:"config_path"`
-	Session            string        `json:"session"`
-	Standalone         bool          `json:"standalone"`
-	Selectors          []string      `json:"selectors,omitempty"`
-	Argv               []string      `json:"argv"`
-	Dir                string        `json:"dir,omitempty"`
-	StartupTimeout     time.Duration `json:"startup_timeout_ns"`
-	CheckTimeout       time.Duration `json:"check_timeout_ns"`
-	CleanupTimeout     time.Duration `json:"cleanup_timeout_ns"`
-	ToolVersion        string        `json:"tool_version"`
-	RequireEnvironment bool          `json:"require_environment,omitempty"`
-	RefuseCrossSession bool          `json:"refuse_cross_session,omitempty"`
+	TaskName             string        `json:"task_name,omitempty"`
+	CheckTimeoutExplicit bool          `json:"check_timeout_explicit,omitempty"`
+	ConfigPath           string        `json:"config_path"`
+	Session              string        `json:"session"`
+	Standalone           bool          `json:"standalone"`
+	Selectors            []string      `json:"selectors,omitempty"`
+	Argv                 []string      `json:"argv"`
+	Dir                  string        `json:"dir,omitempty"`
+	StartupTimeout       time.Duration `json:"startup_timeout_ns"`
+	CheckTimeout         time.Duration `json:"check_timeout_ns"`
+	CleanupTimeout       time.Duration `json:"cleanup_timeout_ns"`
+	ToolVersion          string        `json:"tool_version"`
+	RequireEnvironment   bool          `json:"require_environment,omitempty"`
+	RefuseCrossSession   bool          `json:"refuse_cross_session,omitempty"`
 }
 
 type Record struct {
@@ -52,6 +54,7 @@ type Record struct {
 }
 
 type View struct {
+	TaskName        string         `json:"task_name,omitempty"`
 	Version         int            `json:"schema_version"`
 	Kind            string         `json:"kind"`
 	ID              string         `json:"job_id"`
@@ -149,7 +152,7 @@ func (s *Store) read(id string) (*Record, string, error) {
 // job-specific session lets independent jobs coexist without touching a stack.
 func (s *Store) Prepare(opts verify.Options) (*View, error) {
 	_, size := verify.ArgvDigest(opts.Argv)
-	if len(opts.Argv) == 0 || opts.Argv[0] == "" || size > verify.MaxArgvBytes || !filepath.IsAbs(opts.ConfigPath) {
+	if (opts.TaskName == "" && (len(opts.Argv) == 0 || opts.Argv[0] == "")) || size > verify.MaxArgvBytes || !filepath.IsAbs(opts.ConfigPath) {
 		return nil, errors.New("job needs an absolute config context and bounded command argv")
 	}
 	id, err := verify.NewAttemptID(time.Now())
@@ -170,6 +173,7 @@ func (s *Store) Prepare(opts verify.Options) (*View, error) {
 		opts.Session = "job-" + id
 	}
 	rec := &Record{Version: 1, ID: id, State: "queued", CreatedAt: time.Now().UTC(), Request: Request{
+		TaskName: opts.TaskName, CheckTimeoutExplicit: opts.CheckTimeoutExplicit,
 		ConfigPath: opts.ConfigPath, Session: opts.Session, Standalone: opts.Standalone,
 		Selectors: opts.Selectors, Argv: opts.Argv, Dir: opts.Dir,
 		StartupTimeout: opts.StartupTimeout, CheckTimeout: opts.CheckTimeout, CleanupTimeout: opts.CleanupTimeout,
@@ -187,6 +191,7 @@ func (s *Store) Get(id string) (*View, error) {
 		return nil, err
 	}
 	v := &View{Version: 1, Kind: "job.response", ID: id, State: rec.State, CreatedAt: rec.CreatedAt,
+		TaskName: rec.Request.TaskName,
 		OwnerPID: rec.OwnerPID, ConfigPath: rec.Request.ConfigPath, Session: rec.Request.Session,
 		Directory: dir, Result: rec.Result, Message: rec.Error}
 	if _, err := os.Stat(filepath.Join(dir, "cancel")); err == nil {
@@ -391,6 +396,7 @@ func (s *Store) Work(ctx context.Context, id string) error {
 		}
 	}()
 	result := verify.Run(ctx, verify.Options{
+		TaskName: request.TaskName, CheckTimeoutExplicit: request.CheckTimeoutExplicit,
 		ConfigPath: request.ConfigPath, Session: request.Session, Hash: hash, Standalone: request.Standalone,
 		Selectors: request.Selectors, Argv: request.Argv, Dir: request.Dir, EvidenceDir: dir,
 		StartupTimeout: request.StartupTimeout, CheckTimeout: request.CheckTimeout, CleanupTimeout: request.CleanupTimeout,
