@@ -60,6 +60,7 @@ uses it. The `references/` files hold the details.
 | Watch and control it | `monitor`, `status`, `restart`, `reload`, `stop`, `list` | [commands](references/commands.md#run-and-control) |
 | Run tests while developing | test watcher process, or tests against a running stack | [testing](references/testing.md#local-development-loop) |
 | One owned check with a receipt | `verify`, `attempts`, `why --attempt` | [testing](references/testing.md#verify) |
+| Standalone unit tests, lint, builds, code generation | `run`, `attempts`, `why --attempt` | [testing](references/testing.md#standalone-checks) |
 | Same check on two worktrees | `compare` | [testing](references/testing.md#compare) |
 | Logs and failure evidence | `logs`, `why` | [sessions and logs](references/sessions-and-logs.md#logs) |
 | Parallel copies per branch or worktree | `--session`, `ports`, `${urls...}`, `resources`, `sessions` | [sessions and logs](references/sessions-and-logs.md#sessions) |
@@ -135,10 +136,11 @@ proc-compose stop                         # stop everything and verify it ended
   readiness, runs the command, stops everything, and writes a receipt. Exit
   0 passed, 1 failed, 2 nothing started, 130 interrupted.
 
-`verify` currently requires at least one service. For a standalone unit test,
-lint, or build, use the project's existing command and the agent harness's
-managed background execution when needed. Check the installed CLI's help
-before assuming it supports detached verification or standalone jobs.
+`verify` requires at least one service. For a standalone unit test, lint, or
+build, use `proc-compose run --json -- PROGRAM [ARG...]` with the project's
+existing command. It requires no config and starts no services. Both commands
+currently run in the foreground; use the harness's managed background execution
+when needed. Check the installed CLI's help before assuming detached jobs exist.
 
 See [testing](references/testing.md) for all three, `compare`, environment
 reports, and CI recipes.

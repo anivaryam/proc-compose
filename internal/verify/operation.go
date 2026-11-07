@@ -45,7 +45,10 @@ const (
 
 // Options is one verification attempt's validated input.
 type Options struct {
-	ConfigPath     string // absolute config path
+	ConfigPath string // absolute config path
+	// Standalone runs only Argv, without reading or starting the config.
+	// ConfigPath still supplies the session identity and default working directory.
+	Standalone     bool
 	Session        string // session name; empty is the default session
 	Hash           string // runtime hash for (config, session)
 	Selectors      []string
@@ -129,6 +132,7 @@ func newResult(opts Options, started time.Time) *Result {
 	// failPreAcquisition and finishVerdict set the real one.
 	result := &Result{
 		SchemaVersion:     SchemaVersion,
+		Standalone:        opts.Standalone,
 		Kind:              KindResponse,
 		State:             StateCompleted,
 		Status:            StatusNotRun,
@@ -215,17 +219,20 @@ func Run(ctx context.Context, opts Options) *Result {
 	if opts.cleanupBudget > 0 {
 		opts.CleanupTimeout = opts.cleanupBudget
 	}
-	raw, err := os.ReadFile(opts.ConfigPath)
-	if err != nil {
-		failPreAcquisition(result, CodeInvalidConfig, opts.now())
-		return result
-	}
-	result.ConfigSHA256 = digestPtr(raw)
-	cfg, err := config.Load(opts.ConfigPath)
-	if err != nil {
-		fmt.Fprintf(opts.Log, "verify: %v\n", err)
-		failPreAcquisition(result, CodeInvalidConfig, opts.now())
-		return result
+	cfg := &config.Config{Processes: map[string]config.Process{}}
+	if !opts.Standalone {
+		raw, err := os.ReadFile(opts.ConfigPath)
+		if err != nil {
+			failPreAcquisition(result, CodeInvalidConfig, opts.now())
+			return result
+		}
+		result.ConfigSHA256 = digestPtr(raw)
+		cfg, err = config.Load(opts.ConfigPath)
+		if err != nil {
+			fmt.Fprintf(opts.Log, "verify: %v\n", err)
+			failPreAcquisition(result, CodeInvalidConfig, opts.now())
+			return result
+		}
 	}
 	for _, name := range opts.Selectors {
 		if err := config.CheckSelector(cfg, name); err != nil {
@@ -241,7 +248,7 @@ func Run(ctx context.Context, opts Options) *Result {
 			hasService = true
 		}
 	}
-	if !hasService {
+	if !hasService && !opts.Standalone {
 		fmt.Fprintln(opts.Log, "verify: the selection must include at least one service")
 		failPreAcquisition(result, CodeUsage, opts.now())
 		return result
@@ -266,6 +273,9 @@ func Run(ctx context.Context, opts Options) *Result {
 	result.Workdir = workdir
 	result.Check.Cwd = &workdir
 	result.Startup.Validation = StatusPassed
+	if opts.Standalone {
+		result.Startup.Validation = StatusNotNeeded
+	}
 	sourceBefore := observeSource(workdir, opts.now)
 	result.Source = sourceBefore.source
 
@@ -412,7 +422,11 @@ func (a *attempt) startAndCheck(ctx context.Context) {
 
 	cfg := clampGrace(plan.Config)
 	plan.Project.LogPath = paths.Log(opts.Hash)
-	plan.Project.Owner = session.NewOwner("verify", opts.ConfigPath)
+	operation := "verify"
+	if opts.Standalone {
+		operation = "run"
+	}
+	plan.Project.Owner = session.NewOwner(operation, opts.ConfigPath)
 	if err := session.Save(paths.Metadata(opts.Hash), plan.Project); err != nil {
 		fmt.Fprintf(opts.Log, "verify: session metadata: %v\n", err)
 	}
@@ -456,6 +470,7 @@ func (a *attempt) startAndCheck(ctx context.Context) {
 		AttemptID:          *res.AttemptID,
 		RecordPath:         pidPath,
 		RefuseCrossSession: opts.RefuseCrossSession,
+		CheckOnly:          opts.Standalone,
 	}
 	if server != nil {
 		r.IPC = server
@@ -545,6 +560,9 @@ func (a *attempt) waitReady(ctx context.Context, deadline time.Time) bool {
 			byName[st.Name] = st
 		}
 		allReady := len(byName) > 0
+		if a.opts.Standalone {
+			allReady = r.ChecksReady()
+		}
 		for _, name := range a.selected {
 			st, ok := byName[name]
 			if !ok {
@@ -624,6 +642,9 @@ func (a *attempt) waitReady(ctx context.Context, deadline time.Time) bool {
 	switch outcome {
 	case StatusPassed:
 		res.Startup.Status = StatusPassed
+		if a.opts.Standalone {
+			res.Startup.Status = StatusNotNeeded
+		}
 		res.Startup.FinishedAt = timestamp(a.opts.now())
 		return true
 	case StatusInterrupted:

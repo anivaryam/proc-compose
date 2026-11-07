@@ -1,6 +1,24 @@
 # Testing with proc-compose
 
-Three ways to run tests, from the fastest feedback to the strongest verdict.
+Use standalone checks for commands that need no services, and verification for
+checks needing an owned environment. Retained development loops are below.
+
+## Standalone checks
+
+```sh
+proc-compose run --json -- go test ./...
+proc-compose --session lint run --dir web -- npm run lint
+proc-compose --session lint attempts latest --json
+```
+
+`run` executes direct argv after `--`, with the same check/cleanup budgets,
+process-tree ownership, exit codes, and receipts as `verify`. The config path
+and session identify the attempt, and the config directory is the default
+working directory, but the file is not loaded and need not exist. Pass the same
+absolute `-f` and `--session` to retrieve results. JSON adds `standalone: true`,
+sets `config_sha256: null`, and marks startup and its validation `not_needed`.
+A pass proves the command and cleanup, not stack readiness. No dummy service is
+needed. A live session is refused rather than shared or stopped.
 
 ## Local development loop
 
@@ -66,9 +84,8 @@ One owned operation: validate the config, acquire a fresh session, start the
 selected processes, wait for readiness, run the check, stop everything it
 started, and write a receipt.
 
-The selection must include a service; standalone tests do not need a dummy
-server. Run their existing project command directly. `verify` runs in the
-foreground; use the agent harness's managed background-command facility for
+The selection must include a service; use `run` for standalone tests. Both
+commands run in the foreground; use the agent harness's managed background-command facility for
 asynchronous execution, and retrieve its terminal result before reporting a
 pass. Do not infer success from an active receipt or a successful launch.
 

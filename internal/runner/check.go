@@ -77,6 +77,14 @@ func (r *Runner) stateFor(name string) *procState {
 	return r.checks[name]
 }
 
+// ChecksReady reports that Run has initialized check admission. This is a
+// readiness observation only: RunCheck still checks admission under the lock.
+func (r *Runner) ChecksReady() bool {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	return r.checkWG != nil && !r.checksClosed && !r.launchAdmissionClosedLocked()
+}
+
 // RunCheck executes spec while the stack is running. Cancelling ctx (deadline
 // or interruption) terminates the check's process group through the same
 // graceful/forced teardown as managed processes. Reaping is bounded by the

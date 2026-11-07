@@ -312,6 +312,9 @@ type Owner struct {
 // Result is the full v1 response and receipt schema. Every field is always
 // present; nullable fields encode as JSON null.
 type Result struct {
+	// Standalone distinguishes a command-only run from a verified stack.
+	// Its config_path is an identity anchor, not a loaded configuration.
+	Standalone        bool                `json:"standalone,omitempty"`
 	SchemaVersion     int                 `json:"schema_version"`
 	Kind              string              `json:"kind"`
 	State             string              `json:"state"`

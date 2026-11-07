@@ -19,6 +19,7 @@ proc-compose reload [--json]                            Reload config and restar
 proc-compose stop [--timeout N] [--force]               Stop daemon and verify its processes ended
 proc-compose list                                       List config processes
 proc-compose verify [processes...] -- PROGRAM [ARG...]  Owned stack + check + verified cleanup + receipt
+proc-compose run -- PROGRAM [ARG...]                    Standalone command + verified cleanup + receipt
 proc-compose attempts [id|latest] [--json]              List or show verification receipts
 proc-compose agent-guide                                Print the offline operating guide for coding agents
 proc-compose why <process> | --attempt <id|latest>      Bounded failure evidence (live, retained, or one attempt)
@@ -75,7 +76,7 @@ Flags (logs): see `proc-compose logs --help` and [Sessions and logs](sessions-an
 
 A `--session` name must match `[A-Za-z0-9._-]{1,64}`. Every command refuses
 any other name the same way, before it does anything: it exits `2`. With
-`--json`, stdout holds exactly one JSON object. `verify` and `compare` report
+`--json`, stdout holds exactly one JSON object. `verify`, `run`, and `compare` report
 the refusal in their own result (error code `usage_error`); every other
 command prints `{"operation": …, "status": "error", "message": "invalid
 --session: …"}`, where `operation` is the command, such as `status` or
@@ -144,6 +145,31 @@ older binary without a structured journal, `logs` reports that limitation and
 the legacy text-log path instead. See [Sessions and logs](sessions-and-logs.md#logs-for-coding-agents).
 
 ## Common tasks
+
+### Run tests, lint, or builds without services
+
+```sh
+proc-compose --session unit run --json -- go test ./...
+proc-compose --session unit attempts latest --json
+proc-compose --session unit why --attempt latest --json
+```
+
+`run` executes argv after `--` directly; use an explicit shell for shell syntax.
+It starts no services and does not read or validate the config file. The same
+`-f` config path and `--session` still identify its session and receipts. Default
+config discovery selects the directory context as usual; without a config the
+current directory is used. The command runs in that directory, or `--dir`
+relative to it. An occupied session is refused, never reused or stopped.
+
+Use `--check-timeout` and `--cleanup-timeout` as with `verify`. Cancellation and
+timeout terminate the command's owned process tree and verify cleanup. JSON
+reuses the `verify.response` / `verify.receipt` contract with `standalone: true`,
+`config_sha256: null`, and `startup.status` / `startup.validation: not_needed`.
+`config_path` is the session identity anchor, not evidence of a loaded config.
+Exit codes are 0 passed, 1 failed, 2 refused before starting, 130 interrupted;
+the command's original exit code is in `check.exit_code`. Receipts have the same
+runtime-directory retention as verification attempts. This command currently
+runs in the foreground.
 
 ### Start all processes
 

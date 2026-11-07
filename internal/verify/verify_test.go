@@ -315,6 +315,76 @@ func TestRun_HappyPathLiteralArgvEndpointsAndReceipt(t *testing.T) {
 	}
 }
 
+func TestRun_StandaloneWithoutConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, arg, status, check string
+		exit                           int
+	}{
+		{"pass", "exit", "0", StatusPassed, StatusPassed, ExitPassed},
+		{"failure", "exit", "7", StatusFailed, StatusFailed, ExitFailed},
+		{"timeout", "sleep", "1m", StatusFailed, StatusTimedOut, ExitFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, serviceConfig)
+			if err := os.Remove(f.config); err != nil {
+				t.Fatal(err)
+			}
+			withHelper(t, tc.mode)
+			opts := f.options(t, "standalone", checkArgv(tc.mode, tc.arg)...)
+			opts.Standalone = true
+			if tc.name == "timeout" {
+				opts.CheckTimeout = time.Second
+			}
+			result := Run(context.Background(), opts)
+			assertComplete(t, result)
+			if result.Status != tc.status || result.Check.Status != tc.check || result.ExitCode != tc.exit {
+				t.Fatalf("standalone verdict: %+v", result)
+			}
+			if result.Startup.Status != StatusNotNeeded || result.Startup.Validation != StatusNotNeeded || len(result.SelectedProcesses) != 0 || len(result.Endpoints) != 0 || result.ConfigSHA256 != nil {
+				t.Fatalf("standalone run claimed a stack: %+v", result)
+			}
+			if result.Cleanup.Status != StatusPassed || result.Cleanup.TerminationVerified == nil || !*result.Cleanup.TerminationVerified || !result.ReceiptPersisted || result.ReceiptPath == nil {
+				t.Fatalf("standalone cleanup/receipt: %+v", result)
+			}
+			receipt, err := ReadReceipt(*result.ReceiptPath)
+			if err != nil || !receipt.Standalone || receipt.Status != tc.status {
+				t.Fatalf("standalone receipt: %+v, %v", receipt, err)
+			}
+			if held, err := session.InstanceHeld(opts.Hash); err != nil || held {
+				t.Fatalf("standalone retained lease: held=%t err=%v", held, err)
+			}
+		})
+	}
+}
+
+func TestRun_StandaloneIgnoresConfigAndHonorsOwnership(t *testing.T) {
+	f := newFixture(t, "invalid: [")
+	withHelper(t, "exit")
+	opts := f.options(t, "owned", checkArgv("exit", "0")...)
+	opts.Standalone = true
+	plan, err := session.Acquire(&config.Config{Processes: map[string]config.Process{}}, f.config, opts.Hash, opts.Session, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	result := Run(context.Background(), opts)
+	if result.ExitCode != ExitUsage || result.Check.StartedAt != nil || len(result.Errors) != 1 || result.Errors[0].Code != CodeSessionOccupied {
+		t.Fatalf("standalone touched an occupied session: %+v", result)
+	}
+	plan.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opts.afterStartup = func(*runner.Runner) { cancel() }
+	result = Run(ctx, opts)
+	if result.Status != StatusInterrupted || result.Cleanup.Status != StatusPassed || result.ExitCode != ExitInterrupted {
+		t.Fatalf("standalone interruption: %+v", result)
+	}
+	data, err := os.ReadFile(f.config)
+	if err != nil || string(data) != "invalid: [" {
+		t.Fatalf("standalone changed the config: %q, %v", data, err)
+	}
+}
+
 // TestRun_ForeignListenerRejectFailsStartupNamingTheHolder is the verify
 // side of foreign_listener: reject: a foreign server on the probe address
 // does not make the stack ready, the check never runs, and the receipt's

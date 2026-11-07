@@ -5,10 +5,28 @@ for exact flags. Schema version 1. Pass the same explicit
 `-f /abs/proc-compose.yml --session NAME` to every command; session identity is
 the absolute config path plus the optional name. A NAME outside
 `[A-Za-z0-9._-]{1,64}` is refused by every command before it does anything:
-exit 2 and, with `--json`, one object on stdout (`verify`/`compare`: their own
+exit 2 and, with `--json`, one object on stdout (`verify`/`run`/`compare`: their own
 kind with `usage_error`; others: `{operation, status: "error", message}`).
 
-## To check a change, use `verify`
+## Standalone checks: `run`
+
+For unit tests, lint, typechecking, builds, or code generation that need no
+services, use the existing project command:
+
+```sh
+proc-compose -f /repo/proc-compose.yml --session task-1 run --json -- npm run lint
+proc-compose -f /repo/proc-compose.yml --session task-1 attempts latest --json
+```
+
+The config need not exist: its path anchors session identity and the default
+working directory, but is never loaded. `--dir` overrides that directory.
+`run` shares verification's check/cleanup budgets, exit codes, receipts, and
+bounded JSON, adding `standalone: true` and marking startup/validation
+`not_needed`. A pass proves the command and cleanup, not readiness of a stack.
+Both `run` and `verify` currently run in the foreground; use the harness's
+managed background execution when needed, and retrieve the terminal verdict.
+
+## Checks needing services: `verify`
 
 One command starts the stack, waits for readiness, runs your check, stops
 everything it started, and records a receipt. Prefer it over composing

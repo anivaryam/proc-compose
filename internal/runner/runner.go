@@ -68,6 +68,9 @@ type Runner struct {
 	// foreign_listener: reject refuses a foreign one. verify sets it unless
 	// --allow-cross-session is given; up never does.
 	RefuseCrossSession bool
+	// CheckOnly owns auxiliary checks without configured processes. Run stays
+	// open until its context is cancelled, then uses the normal terminal sweep.
+	CheckOnly bool
 	// TeardownDeadline, when set, returns a time the teardown phase must end
 	// by, earlier than its fixed budget would; verify passes its cleanup
 	// deadline minus the seal reserve.
@@ -279,7 +282,10 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 	}
 
 	procs := r.resolve()
-	if len(procs) == 0 {
+	if r.CheckOnly && len(r.Config.Processes) != 0 {
+		return fmt.Errorf("check-only runner cannot start configured processes")
+	}
+	if len(procs) == 0 && !r.CheckOnly {
 		return fmt.Errorf("no matching processes to run")
 	}
 
@@ -412,6 +418,11 @@ func (r *Runner) Run(ctx context.Context) (result error) {
 
 	workersDone := make(chan struct{})
 	go func() {
+		if r.CheckOnly {
+			// There are no service workers to hold admission open. The owner
+			// ends this run after its check, or a shutdown request cancels it.
+			<-runCtx.Done()
+		}
 		wg.Wait()
 		// Checks join the same quiescence: once no worker remains, refuse new
 		// checks, cancel running ones, and wait until each has finished its

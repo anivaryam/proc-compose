@@ -4954,6 +4954,70 @@ func TestRunCheck_RefusedWithoutRunningStack(t *testing.T) {
 	}
 }
 
+func TestRunCheck_CheckOnlyLifetime(t *testing.T) {
+	r := makeRunner(map[string]config.Process{})
+	r.CheckOnly, r.Silent, r.NoColor, r.Output = true, true, true, io.Discard
+	r.CleanupHandoffTimeout = 10 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("check-only runner cleanup: %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Error("check-only runner did not stop")
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for !r.ChecksReady() {
+		if !time.Now().Before(deadline) {
+			t.Fatal("check-only runner never admitted checks")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	results := make(chan CheckResult, 1)
+	go func() {
+		results <- r.RunCheck(context.Background(), CheckSpec{Name: "check", Argv: helperArgv("pid-block", pidFile), Cleanup: 5 * time.Second})
+	}()
+	pid, ok := waitForPIDFile(t, pidFile, 5*time.Second)
+	if !ok {
+		t.Fatal("check-only command never started")
+	}
+	cancel()
+	select {
+	case result := <-results:
+		if !result.Started || (result.ExitCode != nil && *result.ExitCode == 0) || result.HandedOff {
+			t.Fatalf("cancelled check: %+v", result)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runner shutdown did not cancel the active check")
+	}
+	assertTerminated(t, pid, "check-only command", 5*time.Second)
+	if r.ChecksReady() {
+		t.Fatal("cancelled runner still reports admission")
+	}
+	if result := r.RunCheck(context.Background(), CheckSpec{Name: "late", Argv: helperArgv("exit", "0")}); !result.AdmissionRefused || result.Started {
+		t.Fatalf("check admitted after shutdown: %+v", result)
+	}
+}
+
+func TestRunCheck_CheckOnlyRejectsConfiguredProcesses(t *testing.T) {
+	r := makeRunner(map[string]config.Process{"api": {Cmd: helperCmd("exit", "0")}})
+	r.CheckOnly = true
+	if err := r.Run(context.Background()); err == nil {
+		t.Fatal("check-only runner accepted configured processes")
+	}
+	r = makeRunner(map[string]config.Process{})
+	if err := r.Run(context.Background()); err == nil {
+		t.Fatal("ordinary runner accepted an empty stack")
+	}
+}
+
 type admissionGateProcessGroup struct {
 	ProcessGroup
 	trackStarted     chan struct{}

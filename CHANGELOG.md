@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `run -- PROGRAM [ARG...]` executes standalone tests, lint, builds, and other
+  existing commands without requiring or starting services. It reuses the
+  verification runner's process-tree ownership, bounded output, timeouts,
+  cleanup verdict, provenance, and receipts. JSON marks `standalone: true` and
+  startup/validation `not_needed`; the config path is a session identity anchor
+  and is not loaded.
 - Agent skill `skills/proc-compose` for Claude Code and OpenCode, covering
   every command and config field: setup, running, testing (`verify`,
   `compare`, local test loops), logs, sessions, and deployment. Tests fail

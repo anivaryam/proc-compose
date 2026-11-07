@@ -20,19 +20,25 @@ import (
 )
 
 func TestRun_CheckDescendantsAreCleanedUp(t *testing.T) {
-	f := newFixture(t, serviceConfig)
-	childPID := filepath.Join(t.TempDir(), "child.pid")
-	// The check leader exits at once and leaves a background child behind.
-	result := Run(context.Background(), f.options(t, "", "/bin/sh", "-c", `sleep 60 & echo $! > "$1"`, "sh", childPID))
-	if result.Check.Status != StatusPassed || result.Cleanup.Status != StatusPassed || result.Status != StatusPassed {
-		t.Fatalf("check %s cleanup %+v errors %v", result.Check.Status, result.Cleanup, result.Errors)
+	for _, standalone := range []bool{false, true} {
+		t.Run(strconv.FormatBool(standalone), func(t *testing.T) {
+			f := newFixture(t, serviceConfig)
+			childPID := filepath.Join(t.TempDir(), "child.pid")
+			// The check leader exits at once and leaves a background child behind.
+			opts := f.options(t, "", "/bin/sh", "-c", `sleep 60 & echo $! > "$1"`, "sh", childPID)
+			opts.Standalone = standalone
+			result := Run(context.Background(), opts)
+			if result.Check.Status != StatusPassed || result.Cleanup.Status != StatusPassed || result.Status != StatusPassed {
+				t.Fatalf("check %s cleanup %+v errors %v", result.Check.Status, result.Cleanup, result.Errors)
+			}
+			data, err := os.ReadFile(childPID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+			assertGone(t, pid)
+		})
 	}
-	data, err := os.ReadFile(childPID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
-	assertGone(t, pid)
 }
 
 func TestRun_EscapedCheckDescendantIsUnverified(t *testing.T) {

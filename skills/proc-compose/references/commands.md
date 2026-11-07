@@ -135,6 +135,7 @@ that `up --survive --install` created. Linux only.
 | Command | What it does | Details |
 |---|---|---|
 | `proc-compose verify [processes...] -- PROGRAM [ARG...]` | Fresh owned session, readiness, one check, verified cleanup, receipt | [testing](testing.md#verify) |
+| `proc-compose run -- PROGRAM [ARG...]` | Standalone command, verified cleanup, receipt; no services or config required | [testing](testing.md#standalone-checks) |
 | `proc-compose attempts [id\|latest] [--json]` | Verification receipts for this session, newest first | [testing](testing.md#receipts-and-attempt-evidence) |
 | `proc-compose compare --baseline DIR --candidate DIR -- PROGRAM` | Same check against two worktrees | [testing](testing.md#compare) |
 | `proc-compose logs [processes...]` | Bounded, structured event queries; `--follow` streams | [sessions and logs](sessions-and-logs.md#logs) |
