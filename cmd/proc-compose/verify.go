@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/anivaryam/proc-compose/internal/ipc"
+	"github.com/anivaryam/proc-compose/internal/jobs"
 	"github.com/anivaryam/proc-compose/internal/verify"
 	"github.com/spf13/cobra"
 )
@@ -41,8 +42,18 @@ func validateSessionFlag() error {
 }
 
 func newVerifyCommand(configFile *string) *cobra.Command {
+	return newExecutionCommand(configFile, "verify")
+}
+
+func newRunCommand(configFile *string) *cobra.Command {
+	return newExecutionCommand(configFile, "run")
+}
+
+func newExecutionCommand(configFile *string, operation string) *cobra.Command {
+	standalone := operation == "run"
 	var (
 		machine        bool
+		background     bool
 		streamLogs     bool
 		requireEnv     bool
 		allowCross     bool
@@ -107,14 +118,16 @@ Default budgets (unmeasured policy): startup 120s (1s-10m), check 10m
 			}
 			stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 			opts := verify.Options{
-				Session:            sessionName,
-				Selectors:          selectors,
-				Argv:               argv,
-				Dir:                dir,
-				ToolVersion:        version,
-				Log:                stderr,
-				RequireEnvironment: requireEnv,
-				RefuseCrossSession: !allowCross,
+				CheckTimeoutExplicit: cmd.Flags().Changed("check-timeout"),
+				Standalone:           standalone,
+				Session:              sessionName,
+				Selectors:            selectors,
+				Argv:                 argv,
+				Dir:                  dir,
+				ToolVersion:          version,
+				Log:                  stderr,
+				RequireEnvironment:   requireEnv,
+				RefuseCrossSession:   !allowCross,
 			}
 			if !machine || streamLogs {
 				opts.ProcessOutput = stderr
@@ -131,8 +144,37 @@ Default budgets (unmeasured policy): startup 120s (1s-10m), check 10m
 			if parseErr == nil {
 				parseErr = parseBudgets(startupTimeout, checkTimeout, cleanupTimeout, &opts)
 			}
-			if parseErr == nil && argv == nil {
-				parseErr = fmt.Errorf("verify requires a check command after --")
+			if parseErr == nil && operation == "task" {
+				if len(args) != 1 || cmd.ArgsLenAtDash() >= 0 {
+					parseErr = fmt.Errorf("tasks run requires exactly one task name")
+				} else {
+					opts.TaskName, opts.Selectors = args[0], nil
+				}
+			}
+			if parseErr == nil && argv == nil && operation != "task" {
+				parseErr = fmt.Errorf("%s requires a check command after --", cmd.Name())
+			}
+			if parseErr == nil && standalone && len(selectors) != 0 {
+				parseErr = fmt.Errorf("run accepts only a command after --, not process selectors")
+			}
+			if parseErr == nil && background && streamLogs {
+				parseErr = fmt.Errorf("--background cannot stream logs; retrieve them with jobs logs")
+			}
+			if parseErr == nil && background {
+				store, err := jobs.Open()
+				if err != nil {
+					return jobFailure(cmd, machine, err)
+				}
+				ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+				defer stop()
+				ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				view, err := store.Launch(ctx, opts)
+				code := 0 // launch acknowledgement, never a check verdict
+				if err != nil {
+					code = 1
+				}
+				return renderJob(cmd, view, machine, err, code)
 			}
 			var result *verify.Result
 			if parseErr != nil {
@@ -146,11 +188,58 @@ Default budgets (unmeasured policy): startup 120s (1s-10m), check 10m
 			return renderVerify(stdout, stderr, result, machine)
 		},
 	}
+	if standalone {
+		command.Use = "run -- PROGRAM [ARG...]"
+		command.Short = "Run one standalone command with verified cleanup and a receipt"
+		command.Long = `Run a test, lint, build, or other existing command without starting services.
+The command after -- executes directly, without a shell. Cancellation and
+timeouts stop its owned process tree and verify cleanup before recording a verdict.
+
+No config file is required or loaded. -f and --session provide the same session
+identity used by attempts, logs, and why; the config path's directory is the
+default working directory. --dir overrides it. An occupied session is refused.
+
+JSON uses the verify.response/verify.receipt contract with standalone: true,
+config_sha256: null, and startup.status/validation: not_needed. A pass proves
+this command and verified cleanup, not a ready stack. Exit codes match verify:
+0 passed, 1 failed, 2 refused before starting, 130 interrupted.
+Receipts are retained in the runtime directory and may disappear at logout/reboot.`
+		command.Example = `  proc-compose run --json -- go test ./...
+  proc-compose --session lint run --dir web -- npm run lint`
+	}
+	if operation == "task" {
+		command.Use = "run NAME"
+		command.Short = "Run a declared project task with owned services and cleanup"
+		command.Long = `Run a named entry from the config's tasks catalog. Its argv executes
+directly, without an implicit shell. With services, acquire a fresh stack and
+wait for readiness; otherwise run standalone. Global and task resource labels
+are leased for the operation. --dir and --check-timeout override task defaults.
+The result records task_name, executed argv, and the execution-time config hash.`
+		command.Example = "  proc-compose tasks run lint --json\n  proc-compose tasks run integration --background --json"
+	}
+	command.Long += `
+
+With --background, return a persistent job ID after worker acknowledgement.
+Launch exit 0 means accepted, not passed. Use jobs wait JOB_ID --json for the
+terminal verdict, jobs logs for retained output, and jobs cancel for cleanup.
+Without --session each background job gets a unique session. Job evidence lives
+under the user config directory's proc-compose/jobs, or PROC_COMPOSE_JOB_DIR,
+independently of runtime cleanup; use jobs rather than attempts to retrieve it.`
+	command.Long += `
+
+Checks receive PROC_COMPOSE_ARTIFACT_DIR for retained files and
+PROC_COMPOSE_JUNIT_REPORT for an optional junit.xml. Results include a bounded
+file index and testcase-based JUnit counts/failure examples after cleanup.
+A supplied failing or invalid report fails the operation even if the command
+exits 0; missing reports do not change the verdict. Raw files are preserved.`
 	usageFlagErrors(command)
 	command.Flags().BoolVar(&machine, "json", false, "emit exactly one JSON result object on stdout")
+	command.Flags().BoolVar(&background, "background", false, "detach with a persistent job ID; use jobs wait for the verdict")
 	command.Flags().BoolVar(&streamLogs, "stream-logs", false, "with --json, also stream process output to stderr (default: journal only)")
 	addRequireEnvironmentFlag(command, &requireEnv)
-	command.Flags().BoolVar(&allowCross, "allow-cross-session", false, "count readiness and health answers from another live session instead of refusing them")
+	if !standalone {
+		command.Flags().BoolVar(&allowCross, "allow-cross-session", false, "count readiness and health answers from another live session instead of refusing them")
+	}
 	addBudgetFlags(command, &dir, &startupTimeout, &checkTimeout, &cleanupTimeout)
 	return command
 }
@@ -178,13 +267,21 @@ func renderVerify(stdout, stderr io.Writer, result *verify.Result, machine bool)
 }
 
 func printVerifyHuman(w io.Writer, r *verify.Result) {
-	fmt.Fprintf(w, "verify %s (exit %d)\n", strings.ToUpper(r.Status), r.ExitCode)
+	operation := "verify"
+	if r.Standalone {
+		operation = "run"
+	}
+	fmt.Fprintf(w, "%s %s (exit %d)\n", operation, strings.ToUpper(r.Status), r.ExitCode)
 	fmt.Fprintf(w, "  session:  %s", r.Session)
 	if r.RunID != nil {
 		fmt.Fprintf(w, " (run %s)", *r.RunID)
 	}
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "  config:   %s (validation %s)\n", r.ConfigPath, r.Startup.Validation)
+	if r.Standalone && r.TaskName == "" {
+		fmt.Fprintf(w, "  context:  %s (identity only; config not loaded)\n", r.ConfigPath)
+	} else {
+		fmt.Fprintf(w, "  config:   %s (validation %s)\n", r.ConfigPath, r.Startup.Validation)
+	}
 	fmt.Fprintf(w, "  startup:  %s\n", r.Startup.Status)
 	for _, obs := range r.Startup.ReadinessObservations {
 		probe := "none"
@@ -224,6 +321,12 @@ func printVerifyHuman(w io.Writer, r *verify.Result) {
 	}
 	fmt.Fprintf(w, "  %s\n", strings.Join(r.Check.Argv, " "))
 	printEnvironmentHuman(w, r.Environment)
+	if a := r.Artifacts; a != nil {
+		fmt.Fprintf(w, "  artifacts: %s (%s)\n", a.Directory, a.Status)
+		if a.JUnit.Status != "missing" && a.JUnit.Status != verify.StatusNotRun {
+			fmt.Fprintf(w, "  junit:    %s; %d tests, %d failures, %d errors, %d skipped\n", a.JUnit.Status, a.JUnit.Tests, a.JUnit.Failures, a.JUnit.Errors, a.JUnit.Skipped)
+		}
+	}
 	fmt.Fprintf(w, "  cleanup:  %s (signalling authority %s)\n", r.Cleanup.Status, r.Cleanup.SignalingAuthority)
 	for _, u := range r.Cleanup.UnresolvedProcesses {
 		fmt.Fprintf(w, "    unresolved: %s (%s)\n", u.Name, u.Identity)
@@ -242,7 +345,7 @@ func printVerifyHuman(w io.Writer, r *verify.Result) {
 		}
 		fmt.Fprintf(w, "  receipt:  %s (%s; %s)\n", *r.ReceiptPath, state, r.Retention)
 	}
-	if r.Startup.Status == verify.StatusPassed && r.Source.Revision != nil {
+	if (r.Startup.Status == verify.StatusPassed || r.Standalone) && r.Source.Revision != nil {
 		dirty := ""
 		if r.Source.Dirty != nil && *r.Source.Dirty {
 			dirty = " (dirty)"

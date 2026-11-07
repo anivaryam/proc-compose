@@ -11,6 +11,8 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      DIST: ${{ github.workspace }}/dist
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,7 +35,9 @@ jobs:
             "windows/amd64"
           )
 
-          mkdir -p dist
+          mkdir -p "$DIST"
+          TMP=""
+          trap '[ -z "$TMP" ] || rm -rf "$TMP"' EXIT
 
           for platform in "${platforms[@]}"; do
             GOOS="${platform%/*}"
@@ -49,12 +53,28 @@ jobs:
 
             archive="proc-compose_${GOOS}_${GOARCH}"
             if [ "$GOOS" = "windows" ]; then
-              (cd "$TMP" && zip -q "${OLDPWD}/dist/${archive}.zip" "$bin")
+              (cd "$TMP" && python3 -m zipfile --create "$DIST/${archive}.zip" "$bin")
             else
-              tar -czf "dist/${archive}.tar.gz" -C "$TMP" "$bin"
+              tar -czf "$DIST/${archive}.tar.gz" -C "$TMP" "$bin"
             fi
             rm -rf "$TMP"
           done
+
+      - name: Validate shared agent skill
+        run: go test ./cmd/proc-compose -run '^TestSkill_' -count=1
+
+      - name: Package shared agent skill
+        run: |
+          STAGE="$(mktemp -d)"
+          trap 'rm -rf "$STAGE"' EXIT
+          cp -R skills/proc-compose "$STAGE/proc-compose"
+          cp LICENSE "$STAGE/proc-compose/LICENSE"
+          printf '%s\n' "$GITHUB_REF_NAME" > "$STAGE/proc-compose/VERSION"
+          tar -czf "$DIST/proc-compose_skill.tar.gz" -C "$STAGE" proc-compose
+          (cd "$STAGE" && python3 -m zipfile --create "$DIST/proc-compose_skill.zip" proc-compose)
+
+      - name: Checksum release assets
+        run: (cd "$DIST" && sha256sum *.tar.gz *.zip > SHA256SUMS)
 
       - name: Create release
         uses: softprops/action-gh-release@v2

@@ -9,6 +9,40 @@ import (
 	"testing"
 )
 
+func TestLoad_TaskCatalog(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		valid      bool
+	}{
+		{"standalone", "tasks:\n  lint:\n    argv: [npm, run, lint]\n    resources: [' cache ']\n", true},
+		{"service dependency", "processes:\n  api:\n    cmd: serve\ntasks:\n  integration:\n    argv: [make, integration]\n    services: [api]\n", true},
+		{"no argv", "tasks:\n  lint: {}\n", false},
+		{"empty argv", "tasks:\n  lint:\n    argv: ['', lint]\n", false},
+		{"bad name", "tasks:\n  ../lint:\n    argv: [make]\n", false},
+		{"unknown service", "tasks:\n  lint:\n    argv: [make]\n    services: [missing]\n", false},
+		{"task-only dependency", "processes:\n  setup:\n    cmd: setup\n    mode: task\ntasks:\n  lint:\n    argv: [make]\n    services: [setup]\n", false},
+		{"timeout too long", "tasks:\n  lint:\n    argv: [make]\n    timeout: 3601\n", false},
+		{"negative timeout", "tasks:\n  lint:\n    argv: [make]\n    timeout: -1\n", false},
+		{"duplicate resource", "tasks:\n  lint:\n    argv: [make]\n    resources: [cache, cache]\n", false},
+		{"normalized resource", "tasks:\n  lint:\n    argv: [make]\n    resources: [cache, ' cache ']\n", true},
+		{"unknown task field", "tasks:\n  lint:\n    argv: [make]\n    shell: true\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.body)
+			cfg, err := Load(path)
+			if (err == nil) != tc.valid {
+				t.Fatalf("Load valid=%t: %v", tc.valid, err)
+			}
+			if got := Diagnose(path); got.Valid != tc.valid {
+				t.Fatalf("diagnostics disagree: %+v", got)
+			}
+			if tc.name == "standalone" && cfg.Tasks["lint"].Resources[0] != "cache" {
+				t.Fatal("task resource label was not normalized")
+			}
+		})
+	}
+}
+
 func TestBuildMergeCmd_SimpleMode(t *testing.T) {
 	tests := []struct {
 		name    string

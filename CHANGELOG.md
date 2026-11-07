@@ -7,8 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-11-07
+
 ### Added
 
+- Release assets now include the shared Claude Code/OpenCode skill as tar.gz
+  and ZIP archives, with license/version metadata and SHA-256 checksums alongside
+  the platform binaries.
+- `jobs prune` provides explicit age/count-based retention with dry-run preview
+  and bounded batches. It preserves active/unverified evidence, holds worker
+  leases during deletion, and keeps immutable identity tombstones and lock files
+  while removing results, logs and artifacts. Interrupted pruning is resumable.
+- Per-attempt artifact directories and optional JUnit XML reporting through
+  `PROC_COMPOSE_ARTIFACT_DIR` and `PROC_COMPOSE_JUNIT_REPORT`. Results retain
+  bounded file indexes, testcase counts and failure examples while preserving
+  raw files. Reported test failures or invalid reports prevent a pass; background
+  artifacts survive runtime cleanup and foreground artifacts follow verified
+  receipt retention.
+- Named project `tasks` catalog with `tasks list --json` and `tasks run NAME`:
+  existing command argv, directory, service dependencies, timeout and exclusive
+  resources. Foreground/background execution shares verification and job
+  ownership, and records the task name and execution-time config snapshot hash.
+- `run --background` and `verify --background` return a persistent job ID after
+  detached worker acknowledgement. `jobs list/show/logs/wait/cancel` retrieves
+  bounded results and logs across directories and runtime cleanup, waits with
+  a finite budget, and cancels only the owned job. Launch acceptance is distinct
+  from a terminal verdict; worker lease loss never reports success.
+- `run -- PROGRAM [ARG...]` executes standalone tests, lint, builds, and other
+  existing commands without requiring or starting services. It reuses the
+  verification runner's process-tree ownership, bounded output, timeouts,
+  cleanup verdict, provenance, and receipts. JSON marks `standalone: true` and
+  startup/validation `not_needed`; the config path is a session identity anchor
+  and is not loaded.
 - Agent skill `skills/proc-compose` for Claude Code and OpenCode, covering
   every command and config field: setup, running, testing (`verify`,
   `compare`, local test loops), logs, sessions, and deployment. Tests fail
@@ -919,7 +949,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policies, readiness probes, dependencies, background daemon, monitor TUI,
   and merge-port integration.
 
-[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.12.1...HEAD
+[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.13.0...HEAD
+[1.13.0]: https://github.com/anivaryam/proc-compose/compare/v1.12.1...v1.13.0
 [1.12.1]: https://github.com/anivaryam/proc-compose/compare/v1.12.0...v1.12.1
 [1.12.0]: https://github.com/anivaryam/proc-compose/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/anivaryam/proc-compose/compare/v1.10.0...v1.11.0

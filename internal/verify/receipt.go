@@ -195,6 +195,11 @@ func WriteReceipt(path string, result *Result) error {
 // validAttemptID reports whether id has the shape NewAttemptID gives every
 // attempt: 26 Crockford base32 digits.
 func validAttemptID(id string) bool {
+	return ValidAttemptID(id)
+}
+
+// ValidAttemptID checks the ULID format shared by attempts and persistent jobs.
+func ValidAttemptID(id string) bool {
 	if len(id) != 26 {
 		return false
 	}
@@ -292,9 +297,32 @@ func Prune(sessionDir, keep string) error {
 		if readErr != nil || receipt.State != StateCompleted {
 			continue
 		}
+		if receipt.Artifacts != nil && (receipt.Cleanup.TerminationVerified == nil || !*receipt.Cleanup.TerminationVerified) {
+			continue // artifacts may still have live writers; retain their receipt too
+		}
 		terminal++
 		if terminal <= RetainedTerminalReceipts || path == keep {
 			continue
+		}
+		if receipt.Artifacts != nil {
+			// Derive the path from the validated receipt ID, never its stored
+			// directory. A replaced artifacts parent must not redirect pruning.
+			root := filepath.Join(sessionDir, "artifacts")
+			info, err := os.Lstat(root)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, err)
+				continue
+			}
+			if err == nil {
+				if !info.IsDir() {
+					errs = append(errs, fmt.Errorf("artifact root is not a directory: %s", root))
+					continue
+				}
+				if err := os.RemoveAll(artifactDirectory(sessionDir, *receipt.AttemptID)); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+			}
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)

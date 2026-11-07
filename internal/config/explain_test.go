@@ -263,18 +263,26 @@ func TestSchema_ParityWithStructTagsAndParser(t *testing.T) {
 		return out
 	}
 	objects := map[string]map[string]any{"Config": schema.Properties}
-	for _, typ := range []reflect.Type{reflect.TypeOf(Process{}), reflect.TypeOf(ReadyWhen{}), reflect.TypeOf(Merge{})} {
+	for _, typ := range []reflect.Type{reflect.TypeOf(Process{}), reflect.TypeOf(ReadyWhen{}), reflect.TypeOf(Merge{}), reflect.TypeOf(Task{})} {
 		props, _ := schema.Defs[typ.Name()]["properties"].(map[string]any)
 		objects[typ.Name()] = props
 	}
-	types := map[string]reflect.Type{"Config": reflect.TypeOf(Config{}), "Process": reflect.TypeOf(Process{}), "ReadyWhen": reflect.TypeOf(ReadyWhen{}), "Merge": reflect.TypeOf(Merge{})}
+	types := map[string]reflect.Type{"Config": reflect.TypeOf(Config{}), "Process": reflect.TypeOf(Process{}), "ReadyWhen": reflect.TypeOf(ReadyWhen{}), "Merge": reflect.TypeOf(Merge{}), "Task": reflect.TypeOf(Task{})}
 	for name, typ := range types {
 		if got, want := keys(objects[name]), tagNames(typ); !reflect.DeepEqual(got, want) {
 			t.Fatalf("%s schema properties %v != yaml tags %v", name, got, want)
 		}
 	}
-	if len(schema.Defs) != 3 {
+	if len(schema.Defs) != len(types)-1 {
 		t.Fatalf("unexpected $defs: %v", keys(map[string]any{"defs": schema.Defs}))
+	}
+	taskTimeout := objects["Task"]["timeout"].(map[string]any)
+	maxTimeout := int(taskTimeout["maximum"].(float64))
+	for _, seconds := range []int{0, MinTaskTimeoutSeconds, maxTimeout, maxTimeout + 1, -1} {
+		_, err := Load(writeConfig(t, fmt.Sprintf("tasks:\n  test:\n    argv: [make, test]\n    timeout: %d\n", seconds)))
+		if want := seconds >= 0 && seconds <= maxTimeout; (err == nil) != want {
+			t.Fatalf("task timeout schema/loader disagree for %d: %v", seconds, err)
+		}
 	}
 
 	// Parser parity: every schema property of Process is accepted by the decoder.

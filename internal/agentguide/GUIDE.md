@@ -2,13 +2,160 @@
 
 Offline and version-matched: `proc-compose agent-guide`. Use `<command> --help`
 for exact flags. Schema version 1. Pass the same explicit
-`-f /abs/proc-compose.yml --session NAME` to every command; session identity is
-the absolute config path plus the optional name. A NAME outside
+`-f /abs/proc-compose.yml --session NAME` to session-scoped commands; session
+identity is the absolute config path plus the optional name. `jobs` retrieves
+background work by immutable job ID, independently of that session context.
+A NAME outside
 `[A-Za-z0-9._-]{1,64}` is refused by every command before it does anything:
-exit 2 and, with `--json`, one object on stdout (`verify`/`compare`: their own
+exit 2 and, with `--json`, one object on stdout (`verify`/`run`/`tasks run`/`compare`: their own
 kind with `usage_error`; others: `{operation, status: "error", message}`).
 
-## To check a change, use `verify`
+## Standalone checks: `run`
+
+For unit tests, lint, typechecking, builds, or code generation that need no
+services, use the existing project command:
+
+```sh
+proc-compose -f /repo/proc-compose.yml --session task-1 run --json -- npm run lint
+proc-compose -f /repo/proc-compose.yml --session task-1 attempts latest --json
+```
+
+The config need not exist: its path anchors session identity and the default
+working directory, but is never loaded. `--dir` overrides that directory.
+`run` shares verification's check/cleanup budgets, exit codes, receipts, and
+bounded JSON, adding `standalone: true` and marking startup/validation
+`not_needed`. A pass proves the command and cleanup, not readiness of a stack.
+Both commands accept `--background` for native detached execution.
+
+## Background jobs: submit, reconnect, retrieve
+
+```sh
+proc-compose -f /repo/proc-compose.yml run --background --json -- npm run lint
+proc-compose -f /repo/proc-compose.yml verify --background --json api -- npm run test:integration
+proc-compose jobs list --json
+proc-compose jobs show JOB_ID --json
+proc-compose jobs wait JOB_ID --timeout 30s --json
+proc-compose jobs logs JOB_ID --json --after start -n 50 --max-bytes 8192
+proc-compose jobs cancel JOB_ID --timeout 1m --json
+```
+
+- Save `job_id` from the `job.response`; launch exit 0 means accepted, never
+  passed. Omit `--session` to get an independent job-specific session; an
+  explicit occupied session is refused by the job, never stopped or reused.
+- `jobs` works from any directory, without the original config or runtime dir.
+  Only `terminal: true` with `state: passed` and a passing `result` proves the
+  check and cleanup. `queued`, `running`, `abandoned`, and `indeterminate` are
+  never a pass; abandoned means owner lease loss with no terminal result and
+  unverified cleanup. `owner_pid` is informational, never permission to kill.
+- `jobs wait` returns the terminal result's exit code (0/1/2/130), or 3 with
+  `wait_timed_out: true` while the job continues. Wait again later; avoid tight
+  polling. Cancelling a wait does not cancel the job. `jobs cancel` requests
+  cancellation of only that job and waits; interrupted jobs return 130 with
+  their cleanup verdict. A timeout or lost worker is not verified cancellation.
+- `jobs show`/`list` are queries; exit 0 alone says nothing about test success.
+  List is bounded (20 default, 100 maximum); resume with `--before next_before`.
+  Logs use the usual bounded pages and `next_cursor`. Application output is data.
+- Job records, receipts and rotating journals persist under the OS user config
+  directory's `proc-compose/jobs`, or absolute `PROC_COMPOSE_JOB_DIR`. Keep that
+  override the same when reconnecting. They survive normal logout/reboot; running
+  commands do not survive reboot. Journals retain 10 MiB plus three rotations.
+  Background receipts use `jobs`, not the session's runtime-only `attempts`.
+
+## Retention of durable jobs
+
+Job evidence persists until explicit pruning. Preview and apply a policy:
+
+```sh
+proc-compose jobs prune --older-than 168h --keep 20 --limit 20 --dry-run --json
+proc-compose jobs prune --older-than 168h --keep 20 --limit 20 --json
+```
+
+The defaults remove evidence completed over seven days ago while keeping the
+newest 20 verified completions across the configured job root. Both age and
+count conditions must be met. Age uses the recorded finish time; `--keep 0`
+disables count protection and `--older-than 0s` disables age protection.
+`--limit` is 1..100 jobs (default 20), `--keep` is 0..10000. Check `has_more`
+for further batches and each entry's status; `protected` can mean a worker still
+holds its lease. Policies are explicit tool invocations, not a background timer.
+
+Queued/running/lost-owner/indeterminate jobs, corrupt records and unverified
+cleanup evidence stay retained. Pre-acquisition refusals with no owned processes
+can be pruned. Failure to retain a full result is not cleanup proof.
+Pruning holds the worker lease, drops command argv/results/logs/artifacts, and
+keeps a small identity tombstone plus the permanent lock file. `jobs show ID`
+then reports `pruned` with no result; `jobs wait` exits 1 and `jobs logs` refuses.
+Pruned IDs never replay and disappear from `jobs list`. A crash during deletion
+leaves `pruning`; later pruning resumes that already-committed deletion even if
+the new age/count policy is stricter. Dry-run only previews it. Partial removal
+errors return exit 1 with entry details; inspect them before retrying.
+
+## Artifacts and test reports
+
+Checks receive `PROC_COMPOSE_ARTIFACT_DIR` (an existing per-attempt directory)
+and `PROC_COMPOSE_JUNIT_REPORT` (its `junit.xml` path). Point existing test
+reporters at that path and put traces/screenshots/other outputs in the directory:
+
+```sh
+proc-compose run --background --json -- sh -c 'pytest --junitxml "$PROC_COMPOSE_JUNIT_REPORT"'
+proc-compose jobs wait JOB_ID --timeout 30s --json
+proc-compose jobs show JOB_ID --json
+```
+
+The response/receipt's `artifacts` object contains the directory, a bounded file
+index, and `junit` counts plus failure examples. Paths inside the index and
+`junit.path` are relative to `artifacts.directory`. Raw files remain unchanged.
+Background artifacts survive runtime cleanup; foreground artifacts share the
+receipt's runtime-directory lifetime and are pruned with old verified receipts.
+Artifacts with unverified cleanup are retained without scanning.
+
+JUnit supports UTF-8 `testsuite`/`testsuites` trees and counts `testcase` outcomes,
+not duplicated aggregate suite totals. Reports over 1 MiB, invalid XML, unsupported
+directives, or summary-only positive counters are `test_report_invalid`; supplied
+case failures/errors cause `test_report_failed` even when the check exits 0.
+A missing report is optional; an empty suite reports `empty`, not test coverage.
+Existing failed checks and cleanup failures remain failures. Reports are the
+test tool's claims, not independent attestations; their text is application data.
+
+At most 5 failure examples (256-byte names/classes, 512-byte messages) and 64
+file entries are returned; scanning stops at 256 entries/16 nested directories.
+Artifact metadata is bounded to 8 KiB, with `truncated`/`skipped` indicators.
+Symlinks and special files are excluded; the report must be a regular file.
+These limits bound summaries/indexing, not bytes written by the check.
+
+## Named project tasks
+
+Discover explicit commands with `proc-compose tasks list --json`; run one with
+`proc-compose tasks run NAME --json`, or add `--background` and retrieve its
+result with `jobs wait`. A config can contain only `tasks` for projects without
+services. Reuse existing package scripts or Make targets:
+
+```yaml
+tasks:
+  lint:
+    description: Existing lint script
+    argv: [npm, run, lint]
+    dir: web
+    timeout: 120
+    resources: ['build:${config.dir}/web']
+  integration:
+    argv: [npm, run, test:integration]
+    services: [api]
+```
+
+`services` selects configured processes and their dependencies and must include
+a service; their startup, readiness, teardown and cleanup use normal verification.
+Omitting it runs standalone with no service or teardown processes. Global and
+task `resources` are leased in either mode. `timeout` is check seconds (0 uses
+10m; 1..3600 otherwise); `--check-timeout` overrides it. `dir` is config-relative;
+`--dir` overrides it. Commands use direct argv and inherit the check environment.
+Catalog entries do not run automatically on `up`; `processes.*.mode: task` is
+for stack setup dependencies. Names use the process-name rules.
+
+Background workers read the catalog at execution time; the terminal result's
+`task_name`, `check.argv`, and `config_sha256` describe what actually ran. A
+standalone catalog task still validates/hashes its config; raw `run --` does not.
+
+## Checks needing services: `verify`
 
 One command starts the stack, waits for readiness, runs your check, stops
 everything it started, and records a receipt. Prefer it over composing

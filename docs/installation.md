@@ -70,6 +70,26 @@ that teaches coding agents every proc-compose feature: setup, running, testing,
 logs, sessions, and deployment. It uses the shared `SKILL.md` format, and
 OpenCode also reads Claude Code's skill directories, so one copy serves both.
 
+Releases include `proc-compose_skill.tar.gz` and `proc-compose_skill.zip`, with
+the complete `proc-compose/` skill directory, its references, license and release
+`VERSION`. Download the skill from the same tag as your installed binary. All
+binary and skill archives are listed in the release's `SHA256SUMS` asset.
+
+```sh
+VERSION=v1.13.0
+BASE="https://github.com/anivaryam/proc-compose/releases/download/$VERSION"
+curl -fLO "$BASE/proc-compose_skill.tar.gz"
+curl -fLO "$BASE/SHA256SUMS"
+grep '  proc-compose_skill.tar.gz$' SHA256SUMS | sha256sum -c - &&
+  mkdir -p ~/.claude/skills &&
+  tar -xzf proc-compose_skill.tar.gz -C ~/.claude/skills
+```
+
+On macOS, use `shasum -a 256 -c -` in place of `sha256sum -c -`. On Windows,
+download the ZIP and compare its SHA-256 (`Get-FileHash`) with `SHA256SUMS`, then
+extract `proc-compose/` into `%USERPROFILE%\.claude\skills\`. Extracting replaces
+files in an existing skill copy; preserve any local edits first.
+
 ```sh
 # From a clone: link it, so git pull keeps it current
 mkdir -p ~/.claude/skills

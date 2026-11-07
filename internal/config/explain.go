@@ -60,7 +60,7 @@ var diagnosticHints = map[string]string{
 	CodeYAMLSyntax:          "fix the YAML syntax near the reported line",
 	CodeUnknownField:        "remove the key or correct its spelling; run proc-compose config schema for accepted keys",
 	CodeInvalidType:         "change the value to the type the schema declares",
-	CodeNoProcesses:         "define at least one entry under processes (or a merge section)",
+	CodeNoProcesses:         "define at least one entry under processes or tasks (or a merge section)",
 	CodeInvalidMerge:        "use either merge.client/server/api_prefixes or merge.routes; merge.client, merge.server, merge.port and a route's port target are 1-65535; merge.client_process must name a service; an upstream whose PORT (env, env_file or ports.http) differs from the merge port is refused",
 	CodeInvalidProcessName:  "use [-A-Za-z0-9._] and start/end with an alphanumeric character",
 	CodeMissingCmd:          "add a cmd: the shell command that runs this process",
@@ -477,7 +477,7 @@ func schemaExtras() map[string]map[string]any {
 
 	return map[string]map[string]any{
 		"Config": {
-			// At least one of a non-empty processes map or a merge section.
+			// At least one non-empty processes/tasks map or a merge section.
 			// The non-empty rule lives inside the branch, because a bare
 			// minProperties on Config.processes would refuse processes: {}
 			// next to a merge section — which Load accepts.
@@ -487,6 +487,7 @@ func schemaExtras() map[string]map[string]any {
 					"properties": map[string]any{"processes": map[string]any{"minProperties": 1}},
 				},
 				map[string]any{"required": []string{"merge"}},
+				map[string]any{"required": []string{"tasks"}, "properties": map[string]any{"tasks": map[string]any{"minProperties": 1}}},
 			},
 			// The merge section generates the merge-port process, so a
 			// config with a merge section cannot define one.
@@ -495,7 +496,12 @@ func schemaExtras() map[string]map[string]any {
 			}},
 		},
 		"Config.processes": {"propertyNames": map[string]any{"pattern": processNameRe.String()}},
+		"Config.tasks":     {"propertyNames": map[string]any{"pattern": processNameRe.String()}},
 		"Config.resources": {"uniqueItems": true, "items": map[string]any{"type": "string", "pattern": resourceLabelPattern()}},
+		"Task":             {"required": []string{"argv"}},
+		"Task.argv":        {"minItems": 1, "prefixItems": []any{map[string]any{"type": "string", "minLength": 1}}},
+		"Task.timeout":     {"minimum": 0, "maximum": MaxTaskTimeoutSeconds},
+		"Task.resources":   {"uniqueItems": true, "items": map[string]any{"type": "string", "pattern": resourceLabelPattern()}},
 		"Merge": {"anyOf": []any{
 			// Simple mode: a client and a server port, and no routes.
 			map[string]any{

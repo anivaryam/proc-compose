@@ -71,6 +71,20 @@ func helper(mode, arg string) int {
 			return 5
 		}
 		return 0
+	case "artifacts":
+		dir := os.Getenv("PROC_COMPOSE_ARTIFACT_DIR")
+		if err := os.MkdirAll(filepath.Join(dir, "diagnostics"), 0700); err != nil {
+			return 5
+		}
+		if err := os.WriteFile(filepath.Join(dir, "diagnostics", "output.txt"), []byte("diagnostic evidence"), 0600); err != nil {
+			return 5
+		}
+		if arg != "missing" {
+			if err := os.WriteFile(os.Getenv("PROC_COMPOSE_JUNIT_REPORT"), []byte(arg), 0600); err != nil {
+				return 5
+			}
+		}
+		return 0
 	case "rep":
 		// The first repetition is the same on both sides, the second differs:
 		// a cross-side difference at a later repetition only.
@@ -312,6 +326,185 @@ func TestRun_HappyPathLiteralArgvEndpointsAndReceipt(t *testing.T) {
 	held, err := session.InstanceHeld(opts.Hash)
 	if err != nil || held {
 		t.Fatalf("instance lease after attempt held=%t err=%v", held, err)
+	}
+}
+
+func TestRun_StandaloneWithoutConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, arg, status, check string
+		exit                           int
+	}{
+		{"pass", "exit", "0", StatusPassed, StatusPassed, ExitPassed},
+		{"failure", "exit", "7", StatusFailed, StatusFailed, ExitFailed},
+		{"timeout", "sleep", "1m", StatusFailed, StatusTimedOut, ExitFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, serviceConfig)
+			if err := os.Remove(f.config); err != nil {
+				t.Fatal(err)
+			}
+			withHelper(t, tc.mode)
+			opts := f.options(t, "standalone", checkArgv(tc.mode, tc.arg)...)
+			opts.Standalone = true
+			if tc.name == "timeout" {
+				opts.CheckTimeout = time.Second
+			}
+			result := Run(context.Background(), opts)
+			assertComplete(t, result)
+			if result.Status != tc.status || result.Check.Status != tc.check || result.ExitCode != tc.exit {
+				t.Fatalf("standalone verdict: %+v", result)
+			}
+			if result.Startup.Status != StatusNotNeeded || result.Startup.Validation != StatusNotNeeded || len(result.SelectedProcesses) != 0 || len(result.Endpoints) != 0 || result.ConfigSHA256 != nil {
+				t.Fatalf("standalone run claimed a stack: %+v", result)
+			}
+			if result.Cleanup.Status != StatusPassed || result.Cleanup.TerminationVerified == nil || !*result.Cleanup.TerminationVerified || !result.ReceiptPersisted || result.ReceiptPath == nil {
+				t.Fatalf("standalone cleanup/receipt: %+v", result)
+			}
+			receipt, err := ReadReceipt(*result.ReceiptPath)
+			if err != nil || !receipt.Standalone || receipt.Status != tc.status {
+				t.Fatalf("standalone receipt: %+v, %v", receipt, err)
+			}
+			if held, err := session.InstanceHeld(opts.Hash); err != nil || held {
+				t.Fatalf("standalone retained lease: held=%t err=%v", held, err)
+			}
+		})
+	}
+}
+
+func TestRun_ArtifactsAndJUnitVerdicts(t *testing.T) {
+	for _, tc := range []struct{ name, report, status, code string }{
+		{"pass", `<testsuite><testcase name="unit"/></testsuite>`, "parsed", ""},
+		{"missing", "missing", "missing", ""},
+		{"failure", `<testsuite><testcase name="unit"><failure message="bad result"/></testcase></testsuite>`, "parsed", CodeTestReportFailed},
+		{"invalid", `<testsuite><testcase/>`, "invalid", CodeTestReportInvalid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, serviceConfig)
+			withHelper(t, "artifacts")
+			opts := f.options(t, "artifacts", checkArgv("artifacts", tc.report)...)
+			opts.Standalone, opts.EvidenceDir = true, t.TempDir()
+			result := Run(context.Background(), opts)
+			assertComplete(t, result)
+			if result.Artifacts == nil || result.Artifacts.Status != "collected" || result.Artifacts.JUnit.Status != tc.status || result.Check.ExitCode == nil || *result.Check.ExitCode != 0 {
+				t.Fatalf("artifact result: %+v", result)
+			}
+			if tc.code == "" {
+				if result.ExitCode != ExitPassed {
+					t.Fatalf("unexpected failure: %+v", result)
+				}
+			} else if result.ExitCode != ExitFailed || len(result.Errors) != 1 || result.Errors[0].Code != tc.code {
+				t.Fatalf("JUnit did not fail an exit-zero check: %+v", result)
+			}
+			if err := os.RemoveAll(os.Getenv("XDG_RUNTIME_DIR")); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(result.Artifacts.Directory, "diagnostics", "output.txt")
+			if data, err := os.ReadFile(path); err != nil || string(data) != "diagnostic evidence" {
+				t.Fatalf("retained artifact: %q %v", data, err)
+			}
+			receipt, err := ReadReceipt(*result.ReceiptPath)
+			if err != nil || receipt.Artifacts == nil || receipt.Artifacts.JUnit.Status != tc.status {
+				t.Fatalf("retained summary: %+v %v", receipt, err)
+			}
+		})
+	}
+}
+
+func TestRun_StandaloneIgnoresConfigAndHonorsOwnership(t *testing.T) {
+	f := newFixture(t, "invalid: [")
+	withHelper(t, "exit")
+	opts := f.options(t, "owned", checkArgv("exit", "0")...)
+	opts.Standalone = true
+	plan, err := session.Acquire(&config.Config{Processes: map[string]config.Process{}}, f.config, opts.Hash, opts.Session, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	result := Run(context.Background(), opts)
+	if result.ExitCode != ExitUsage || result.Check.StartedAt != nil || len(result.Errors) != 1 || result.Errors[0].Code != CodeSessionOccupied {
+		t.Fatalf("standalone touched an occupied session: %+v", result)
+	}
+	plan.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opts.afterStartup = func(*runner.Runner) { cancel() }
+	result = Run(ctx, opts)
+	if result.Status != StatusInterrupted || result.Cleanup.Status != StatusPassed || result.ExitCode != ExitInterrupted {
+		t.Fatalf("standalone interruption: %+v", result)
+	}
+	data, err := os.ReadFile(f.config)
+	if err != nil || string(data) != "invalid: [" {
+		t.Fatalf("standalone changed the config: %q, %v", data, err)
+	}
+}
+
+func TestRun_TaskCatalogExecution(t *testing.T) {
+	for _, stack := range []bool{false, true} {
+		t.Run(fmt.Sprintf("services=%t", stack), func(t *testing.T) {
+			argv, _ := json.Marshal(checkArgv("exit", "0")) // JSON flow arrays are valid YAML, including Windows paths.
+			body := strings.Replace(serviceConfig, "    cmd:", "    depends_on: [setup]\n    cmd:", 1) + "  setup:\n    cmd: {{BIN}} 0\n    mode: task\n    env:\n      " + helperEnv + ": exit\n" + "tasks:\n  test:\n    argv: " + string(argv) + "\n    dir: work\n    timeout: 10\n"
+			if stack {
+				body += "    services: [api]\n"
+			}
+			f := newFixture(t, body)
+			if err := os.Mkdir(filepath.Join(f.dir, "work"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			withHelper(t, "exit")
+			opts := f.options(t, "catalog")
+			opts.TaskName = "test"
+			start := time.Now()
+			opts.Now = func() time.Time { return start }
+			result := Run(context.Background(), opts)
+			assertComplete(t, result)
+			raw, _ := os.ReadFile(f.config)
+			if result.Status != StatusPassed || result.TaskName != "test" || result.Standalone == stack || result.ConfigSHA256 == nil || *result.ConfigSHA256 != *digestPtr(raw) || result.Startup.Validation != StatusPassed || result.Workdir != filepath.Join(f.dir, "work") || result.Check.DeadlineAt == nil || *result.Check.DeadlineAt != start.Add(10*time.Second).UTC().Format(time.RFC3339Nano) {
+				t.Fatalf("catalog execution: %+v", result)
+			}
+			if stack {
+				if len(result.SelectedProcesses) != 2 {
+					t.Fatalf("service dependency not selected: %+v", result.SelectedProcesses)
+				}
+				assertGone(t, pidFromFile(t, f.pidFile))
+			} else if _, err := os.Stat(f.pidFile); !os.IsNotExist(err) || len(result.SelectedProcesses) != 0 {
+				t.Fatal("standalone catalog task started services")
+			}
+			receipt, err := ReadReceipt(*result.ReceiptPath)
+			if err != nil || receipt.TaskName != "test" || receipt.Check.Argv[0] != os.Args[0] {
+				t.Fatalf("task provenance not retained: %+v %v", receipt, err)
+			}
+		})
+	}
+}
+
+func TestRun_TaskResourcesAndOverrides(t *testing.T) {
+	argv, _ := json.Marshal(checkArgv("exit", "0"))
+	f := newFixture(t, "resources: [global-catalog-resource]\ntasks:\n  test:\n    argv: "+string(argv)+"\n    dir: missing\n    timeout: 1\n    resources: [task-catalog-resource]\n")
+	withHelper(t, "exit")
+	opts := f.options(t, "catalog")
+	opts.TaskName, opts.Dir, opts.CheckTimeoutExplicit = "test", ".", true
+	for _, resource := range []string{"global-catalog-resource", "task-catalog-resource"} {
+		hash, _ := paths.FromConfig(f.config, "holder")
+		plan, err := session.Acquire(&config.Config{Processes: map[string]config.Process{}, Resources: []string{resource}}, f.config, hash, "holder", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := Run(context.Background(), opts)
+		plan.Close()
+		if result.ExitCode != ExitUsage || result.Check.StartedAt != nil || result.Errors[0].Code != CodeResourceUnavailable {
+			t.Fatalf("task ignored resource %s: %+v", resource, result)
+		}
+	}
+	start := time.Now()
+	opts.Now = func() time.Time { return start }
+	result := Run(context.Background(), opts)
+	if result.Status != StatusPassed || result.Check.DeadlineAt == nil || *result.Check.DeadlineAt != start.Add(opts.CheckTimeout).UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("CLI overrides not respected: %+v", result)
+	}
+	opts.TaskName = "missing"
+	result = Run(context.Background(), opts)
+	if result.ExitCode != ExitUsage || result.Check.StartedAt != nil {
+		t.Fatalf("unknown task ran: %+v", result)
 	}
 }
 
@@ -1367,6 +1560,54 @@ func TestPrune_KeepsRecentTerminalAndAllNonterminal(t *testing.T) {
 	}
 	if _, err := os.Stat(activeOld); err != nil {
 		t.Fatal("active receipt was pruned")
+	}
+}
+
+func TestPrune_ArtifactsFollowVerifiedReceiptsOnly(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	external := filepath.Join(outside, "keep")
+	if err := os.WriteFile(external, []byte("external"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var last string
+	var old []string
+	for i := 0; i < RetainedTerminalReceipts+5; i++ {
+		state := StateCompleted
+		if i == 0 {
+			state = StateActive
+		}
+		last = writeTestReceipt(t, dir, i, state)
+		receipt, err := ReadReceipt(last)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt.Artifacts = &Artifacts{Directory: outside} // not deletion authority
+		receipt.Cleanup.TerminationVerified = ptr(i != 1)
+		if err := WriteReceipt(last, receipt); err != nil {
+			t.Fatal(err)
+		}
+		path := artifactDirectory(dir, *receipt.AttemptID)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "raw"), []byte("raw"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		old = append(old, path)
+	}
+	if err := Prune(dir, last); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{old[0], old[1], old[len(old)-1], outside} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("protected artifacts removed: %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(old[2]); !os.IsNotExist(err) {
+		t.Fatalf("old verified artifacts retained: %v", err)
+	}
+	if data, err := os.ReadFile(external); err != nil || string(data) != "external" {
+		t.Fatal("pruning trusted stored artifact path")
 	}
 }
 

@@ -30,8 +30,8 @@ const (
 	DefaultCleanupTimeout = 30 * time.Second
 	MinStartupTimeout     = time.Second
 	MaxStartupTimeout     = 10 * time.Minute
-	MinCheckTimeout       = time.Second
-	MaxCheckTimeout       = time.Hour
+	MinCheckTimeout       = time.Duration(config.MinTaskTimeoutSeconds) * time.Second
+	MaxCheckTimeout       = time.Duration(config.MaxTaskTimeoutSeconds) * time.Second
 	MinCleanupTimeout     = 30 * time.Second
 	MaxCleanupTimeout     = 2 * time.Minute
 	// sealReserve is the final part of the cleanup budget reserved for
@@ -45,7 +45,17 @@ const (
 
 // Options is one verification attempt's validated input.
 type Options struct {
-	ConfigPath     string // absolute config path
+	ConfigPath string // absolute config path
+	// Standalone runs only Argv, without reading or starting the config.
+	// ConfigPath still supplies the session identity and default working directory.
+	Standalone bool
+	// TaskName resolves a named catalog command from ConfigPath at execution.
+	// Explicit CLI check timeouts take precedence over the catalog default.
+	TaskName             string
+	CheckTimeoutExplicit bool
+	// EvidenceDir retains the receipt and journal outside ephemeral runtime
+	// storage. Session/resource leases and process records remain runtime-owned.
+	EvidenceDir    string
 	Session        string // session name; empty is the default session
 	Hash           string // runtime hash for (config, session)
 	Selectors      []string
@@ -129,6 +139,8 @@ func newResult(opts Options, started time.Time) *Result {
 	// failPreAcquisition and finishVerdict set the real one.
 	result := &Result{
 		SchemaVersion:     SchemaVersion,
+		Standalone:        opts.Standalone,
+		TaskName:          opts.TaskName,
 		Kind:              KindResponse,
 		State:             StateCompleted,
 		Status:            StatusNotRun,
@@ -190,6 +202,51 @@ func Run(ctx context.Context, opts Options) *Result {
 	}
 
 	// ── validation (no ownership, no receipt) ───────────────────────────────
+	cfg := &config.Config{Processes: map[string]config.Process{}}
+	loadConfig := func() bool {
+		raw, err := os.ReadFile(opts.ConfigPath)
+		if err != nil {
+			failPreAcquisition(result, CodeInvalidConfig, opts.now())
+			return false
+		}
+		result.ConfigSHA256 = digestPtr(raw)
+		cfg, err = config.LoadBytes(opts.ConfigPath, raw)
+		if err != nil {
+			fmt.Fprintf(opts.Log, "verify: %v\n", err)
+			failPreAcquisition(result, CodeInvalidConfig, opts.now())
+			return false
+		}
+		return true
+	}
+	if opts.TaskName != "" {
+		if !loadConfig() {
+			return result
+		}
+		task, ok := cfg.Tasks[opts.TaskName]
+		if !ok || len(opts.Argv) != 0 || len(opts.Selectors) != 0 {
+			fmt.Fprintln(opts.Log, "verify: select an existing task without overriding its argv or services")
+			failPreAcquisition(result, CodeUsage, opts.now())
+			return result
+		}
+		opts.Argv, opts.Selectors = task.Argv, task.Services
+		opts.Standalone = len(task.Services) == 0
+		if opts.Dir == "" {
+			opts.Dir = task.Dir
+		}
+		if task.Timeout != 0 && !opts.CheckTimeoutExplicit {
+			opts.CheckTimeout = time.Duration(task.Timeout) * time.Second
+		}
+		cfg.Resources = append(cfg.Resources, task.Resources...)
+		if opts.Standalone {
+			// A standalone catalog task owns resources, never service or
+			// teardown processes from the surrounding config.
+			cfg = &config.Config{Processes: map[string]config.Process{}, Resources: cfg.Resources}
+		}
+		result.Standalone = opts.Standalone
+		result.Check.Argv = append([]string(nil), opts.Argv...)
+		sum, size := ArgvDigest(opts.Argv)
+		result.Check.ArgvSHA256, result.Check.ArgvBytes = &sum, size
+	}
 	if len(opts.Argv) == 0 || opts.Argv[0] == "" {
 		failPreAcquisition(result, CodeUsage, opts.now())
 		return result
@@ -215,16 +272,7 @@ func Run(ctx context.Context, opts Options) *Result {
 	if opts.cleanupBudget > 0 {
 		opts.CleanupTimeout = opts.cleanupBudget
 	}
-	raw, err := os.ReadFile(opts.ConfigPath)
-	if err != nil {
-		failPreAcquisition(result, CodeInvalidConfig, opts.now())
-		return result
-	}
-	result.ConfigSHA256 = digestPtr(raw)
-	cfg, err := config.Load(opts.ConfigPath)
-	if err != nil {
-		fmt.Fprintf(opts.Log, "verify: %v\n", err)
-		failPreAcquisition(result, CodeInvalidConfig, opts.now())
+	if opts.TaskName == "" && !opts.Standalone && !loadConfig() {
 		return result
 	}
 	for _, name := range opts.Selectors {
@@ -235,13 +283,7 @@ func Run(ctx context.Context, opts Options) *Result {
 		}
 	}
 	selected := config.SelectedNames(cfg, opts.Selectors)
-	hasService := false
-	for _, name := range selected {
-		if cfg.Processes[name].EffectiveMode() != config.ProcessModeTask {
-			hasService = true
-		}
-	}
-	if !hasService {
+	if !config.HasService(cfg, opts.Selectors) && !opts.Standalone {
 		fmt.Fprintln(opts.Log, "verify: the selection must include at least one service")
 		failPreAcquisition(result, CodeUsage, opts.now())
 		return result
@@ -266,10 +308,19 @@ func Run(ctx context.Context, opts Options) *Result {
 	result.Workdir = workdir
 	result.Check.Cwd = &workdir
 	result.Startup.Validation = StatusPassed
+	if opts.Standalone && opts.TaskName == "" {
+		result.Startup.Validation = StatusNotNeeded
+	}
 	sourceBefore := observeSource(workdir, opts.now)
 	result.Source = sourceBefore.source
 
 	// ── acquisition ─────────────────────────────────────────────────────────
+	if ctx.Err() != nil {
+		result.Status, result.ExitCode, result.Precedence = StatusInterrupted, ExitInterrupted, PrecedenceInterrupted
+		result.Errors = []ErrorRecord{{Code: CodeInterrupted, Count: 1}}
+		result.FinishedAt = timestamp(opts.now())
+		return result
+	}
 	result.Phase = PhaseAcquiring
 	plan, err := session.Acquire(cfg, opts.ConfigPath, opts.Hash, opts.Session, opts.Selectors)
 	if err != nil {
@@ -339,11 +390,19 @@ func (a *attempt) run(ctx context.Context) *Result {
 	for _, name := range a.selected {
 		res.SelectedProcesses = append(res.SelectedProcesses, ProcessGeneration{Name: name})
 	}
-	receiptPath := filepath.Join(AttemptsDir(plan.Project.Directory), attemptID+".json")
-	res.ReceiptPath = &receiptPath
+	evidenceDir := plan.Project.Directory
 	res.Retention = Retention
+	if opts.EvidenceDir != "" {
+		evidenceDir = opts.EvidenceDir
+		plan.Project.JournalPath = filepath.Join(evidenceDir, "events.jsonl")
+		res.Retention = "persistent job directory; retained until explicitly pruned"
+	}
+	receiptPath := filepath.Join(AttemptsDir(evidenceDir), attemptID+".json")
+	res.ReceiptPath = &receiptPath
 	journalPath := plan.Project.JournalPath
 	res.Evidence.Journal = &journalPath
+	artifactDir := artifactDirectory(evidenceDir, attemptID)
+	res.Artifacts = &Artifacts{Directory: artifactDir, Status: "pending", Files: []ArtifactFile{}, JUnit: JUnitSummary{Path: JUnitFile, Status: StatusNotRun, Examples: []TestFailure{}}}
 
 	// Active receipt before any process is launched.
 	res.Kind, res.State, res.Phase = KindReceipt, StateActive, PhaseStarting
@@ -362,6 +421,22 @@ func (a *attempt) run(ctx context.Context) *Result {
 
 	a.startAndCheck(ctx)
 	a.cleanup()
+	if res.Cleanup.TerminationVerified != nil && *res.Cleanup.TerminationVerified {
+		res.Artifacts = collectArtifacts(artifactDir)
+		if res.Artifacts.Status == "unavailable" {
+			a.errs.Add(CodeArtifactsUnavailable)
+		}
+		switch res.Artifacts.JUnit.Status {
+		case "invalid", "too_large":
+			a.errs.Add(CodeTestReportInvalid)
+		case "parsed":
+			if res.Artifacts.JUnit.Failures > 0 || res.Artifacts.JUnit.Errors > 0 {
+				a.errs.Add(CodeTestReportFailed)
+			}
+		}
+	} else {
+		res.Artifacts.Status, res.Artifacts.JUnit.Status = "unverified", "unverified"
+	}
 	a.collectEvidence()
 	sourceAfter := observeSource(res.Workdir, opts.now)
 	if a.source.ok && sourceAfter.ok && !sourceAfter.equal(a.source) {
@@ -378,7 +453,7 @@ func (a *attempt) run(ctx context.Context) *Result {
 		res.ReceiptPersisted = false
 		a.errs.Add(CodeReceiptPersistence)
 		a.finishVerdict()
-	} else if err := Prune(plan.Project.Directory, receiptPath); err != nil {
+	} else if err := Prune(evidenceDir, receiptPath); err != nil {
 		fmt.Fprintf(opts.Log, "verify: prune receipts: %v\n", err)
 	}
 	if res.Cleanup.SignalingAuthority == "withdrawn" {
@@ -406,13 +481,23 @@ func (a *attempt) persistTerminal(path string) error {
 
 func (a *attempt) startAndCheck(ctx context.Context) {
 	res, plan, opts := a.result, a.plan, a.opts
+	if err := os.MkdirAll(res.Artifacts.Directory, 0700); err != nil {
+		fmt.Fprintf(opts.Log, "verify: artifact directory: %v\n", err)
+		a.failStartup(CodeArtifactsUnavailable, StatusFailed)
+		a.beginCleanup()
+		return
+	}
 	startupStart := opts.now()
 	startupDeadline := startupStart.Add(opts.StartupTimeout)
 	res.Startup.StartedAt, res.Startup.DeadlineAt = timestamp(startupStart), timestamp(startupDeadline)
 
 	cfg := clampGrace(plan.Config)
 	plan.Project.LogPath = paths.Log(opts.Hash)
-	plan.Project.Owner = session.NewOwner("verify", opts.ConfigPath)
+	operation := "verify"
+	if opts.Standalone {
+		operation = "run"
+	}
+	plan.Project.Owner = session.NewOwner(operation, opts.ConfigPath)
 	if err := session.Save(paths.Metadata(opts.Hash), plan.Project); err != nil {
 		fmt.Fprintf(opts.Log, "verify: session metadata: %v\n", err)
 	}
@@ -456,6 +541,7 @@ func (a *attempt) startAndCheck(ctx context.Context) {
 		AttemptID:          *res.AttemptID,
 		RecordPath:         pidPath,
 		RefuseCrossSession: opts.RefuseCrossSession,
+		CheckOnly:          opts.Standalone,
 	}
 	if server != nil {
 		r.IPC = server
@@ -545,6 +631,9 @@ func (a *attempt) waitReady(ctx context.Context, deadline time.Time) bool {
 			byName[st.Name] = st
 		}
 		allReady := len(byName) > 0
+		if a.opts.Standalone {
+			allReady = r.ChecksReady()
+		}
 		for _, name := range a.selected {
 			st, ok := byName[name]
 			if !ok {
@@ -624,6 +713,9 @@ func (a *attempt) waitReady(ctx context.Context, deadline time.Time) bool {
 	switch outcome {
 	case StatusPassed:
 		res.Startup.Status = StatusPassed
+		if a.opts.Standalone {
+			res.Startup.Status = StatusNotNeeded
+		}
 		res.Startup.FinishedAt = timestamp(a.opts.now())
 		return true
 	case StatusInterrupted:
@@ -1019,6 +1111,8 @@ func (a *attempt) checkEnv() map[string]string {
 		"PROC_COMPOSE_SESSION_DIR":        project.Directory,
 		"PROC_COMPOSE_RUN_ID":             project.RunID,
 		"PROC_COMPOSE_ENVIRONMENT_REPORT": environmentReportPath(project.Directory, *a.result.AttemptID),
+		"PROC_COMPOSE_ARTIFACT_DIR":       a.result.Artifacts.Directory,
+		"PROC_COMPOSE_JUNIT_REPORT":       filepath.Join(a.result.Artifacts.Directory, JUnitFile),
 	} {
 		env[key] = value
 	}

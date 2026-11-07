@@ -19,6 +19,9 @@ proc-compose reload [--json]                            Reload config and restar
 proc-compose stop [--timeout N] [--force]               Stop daemon and verify its processes ended
 proc-compose list                                       List config processes
 proc-compose verify [processes...] -- PROGRAM [ARG...]  Owned stack + check + verified cleanup + receipt
+proc-compose run -- PROGRAM [ARG...]                    Standalone command + verified cleanup + receipt
+proc-compose jobs list|show|logs|wait|cancel|prune        Retained background jobs by immutable ID
+proc-compose tasks list|run                             Discover and execute named project tasks
 proc-compose attempts [id|latest] [--json]              List or show verification receipts
 proc-compose agent-guide                                Print the offline operating guide for coding agents
 proc-compose why <process> | --attempt <id|latest>      Bounded failure evidence (live, retained, or one attempt)
@@ -75,7 +78,7 @@ Flags (logs): see `proc-compose logs --help` and [Sessions and logs](sessions-an
 
 A `--session` name must match `[A-Za-z0-9._-]{1,64}`. Every command refuses
 any other name the same way, before it does anything: it exits `2`. With
-`--json`, stdout holds exactly one JSON object. `verify` and `compare` report
+`--json`, stdout holds exactly one JSON object. `verify`, `run`, and `compare` report
 the refusal in their own result (error code `usage_error`); every other
 command prints `{"operation": …, "status": "error", "message": "invalid
 --session: …"}`, where `operation` is the command, such as `status` or
@@ -90,6 +93,7 @@ printed on stderr.
 | `PORT` | merge-port config | Used as `merge.port` when not set explicitly (cloud platforms) |
 | `XDG_RUNTIME_DIR` | daemon | Preferred runtime directory; otherwise uses the per-user cache's `proc-compose` directory, then the OS temporary directory if the cache is unavailable |
 | `PROC_COMPOSE_INSTALL_DIR` | `install.sh` | Override install target (default `~/.local/bin`) |
+| `PROC_COMPOSE_JOB_DIR` | background jobs and `jobs` | Absolute persistent job root; default OS user config directory + `proc-compose/jobs` |
 | `PROC_COMPOSE_VERSION` | `install.sh` | Pin a specific release tag (e.g. `v1.2.3`) |
 
 ## Daemon file paths
@@ -144,6 +148,146 @@ older binary without a structured journal, `logs` reports that limitation and
 the legacy text-log path instead. See [Sessions and logs](sessions-and-logs.md#logs-for-coding-agents).
 
 ## Common tasks
+
+### Run tests, lint, or builds without services
+
+```sh
+proc-compose --session unit run --json -- go test ./...
+proc-compose --session unit attempts latest --json
+proc-compose --session unit why --attempt latest --json
+```
+
+`run` executes argv after `--` directly; use an explicit shell for shell syntax.
+It starts no services and does not read or validate the config file. The same
+`-f` config path and `--session` still identify its session and receipts. Default
+config discovery selects the directory context as usual; without a config the
+current directory is used. The command runs in that directory, or `--dir`
+relative to it. An occupied session is refused, never reused or stopped.
+
+Use `--check-timeout` and `--cleanup-timeout` as with `verify`. Cancellation and
+timeout terminate the command's owned process tree and verify cleanup. JSON
+reuses the `verify.response` / `verify.receipt` contract with `standalone: true`,
+`config_sha256: null`, and `startup.status` / `startup.validation: not_needed`.
+`config_path` is the session identity anchor, not evidence of a loaded config.
+Exit codes are 0 passed, 1 failed, 2 refused before starting, 130 interrupted;
+the command's original exit code is in `check.exit_code`. Receipts have the same
+runtime-directory retention as verification attempts in foreground mode.
+
+### Background development jobs
+
+For declared project commands, `proc-compose tasks list --json` discovers the
+catalog and `proc-compose tasks run NAME --json` executes one. Add `--background`
+to use the same job workflow below. Task defaults include direct argv, directory,
+service dependencies, timeout and exclusive resources; see
+[Named Development Tasks](configuration.md#named-development-tasks).
+
+```sh
+proc-compose run --background --json -- go test ./...
+proc-compose verify --background --json api -- npm run test:integration
+proc-compose jobs list --json
+proc-compose jobs show JOB_ID --json
+proc-compose jobs wait JOB_ID --timeout 30s --json
+proc-compose jobs logs JOB_ID --json --after start -n 50 --max-bytes 8192
+proc-compose jobs cancel JOB_ID --timeout 1m --json
+```
+
+`run` and `verify` accept `--background`. They return a `job.response` with a
+`job_id` once a detached worker owns the job and has recorded its acknowledgement.
+Launch exit 0 means accepted, not passed. Without `--session`, a job-specific
+session is assigned. The existing argv, readiness, timeout and cleanup contracts
+still apply; explicitly occupied sessions are refused rather than reused.
+
+Job evidence is in the OS user config directory under `proc-compose/jobs`, or
+the absolute `PROC_COMPOSE_JOB_DIR` override. It survives normal logout/reboot
+and runtime-directory removal; commands themselves do not survive reboot. Use
+the same override when reconnecting. Background receipts are retrieved through
+`jobs`, not `attempts`. Journals rotate at 10 MiB with three retained rotations.
+
+| Command | Contract |
+|---|---|
+| `jobs list [--limit 20] [--before ID]` | Newest first; 1..100 summaries; `has_more` and `next_before` enable paging. |
+| `jobs show ID` | One retained result; query exit 0 is not a test verdict. |
+| `jobs logs ID [--after CURSOR] [-n 50] [--max-bytes 65536]` | Usual bounded event pages; use `next_cursor` to resume, `start` for oldest retained events. |
+| `jobs wait ID [--timeout 1m]` | Finite wait (1ms..10m); terminal result exit 0/1/2/130, or exit 3 and `wait_timed_out: true`. Timing out leaves the job running. |
+| `jobs cancel ID [--timeout 1m]` | Request cancellation of only this job, then wait for its result; interrupted jobs return 130. Inspect `result.cleanup` to prove termination. |
+| `jobs prune [--older-than 168h] [--keep 20] [--limit 20] [--dry-run]` | Explicit bounded evidence retention; preview or remove old verified completions while preserving newest results. |
+
+All accept `--json`. `terminal: true`, `state: passed`, and the passing `result`
+mean a completed check with verified cleanup. `queued` and `running` are not
+verdicts; `abandoned` means the worker lease was released without a terminal
+record, and `indeterminate` means its lease/record could not be established.
+Neither proves cleanup. `owner_pid` is descriptive, never signalling authority.
+Cancellation uses the job's own mailbox; it never kills a stored PID or stops
+an unrelated session. An early worker failure can have `state: failed` and a
+`message` without a verification result. Flag parsing errors may be plain text.
+
+### Job retention
+
+```sh
+proc-compose jobs prune --older-than 168h --keep 20 --limit 20 --dry-run --json
+proc-compose jobs prune --older-than 168h --keep 20 --limit 20 --json
+```
+
+Pruning is explicit and spans the configured job root, across projects. Defaults
+keep the newest 20 verified completions and remove evidence whose finish time is
+over seven days old; both conditions must hold. `--keep` accepts 0..10000;
+`--older-than` accepts nonnegative durations. Zero disables that protection.
+At most `--limit` jobs (1..100, default 20) are processed per call. The `jobs.prune`
+JSON response includes policy cutoff, eligible/protected counts, `has_more`, and
+per-job statuses (`would_prune`, `pruned`, `protected`, `already_pruned`, `error`).
+Dry-run acquires/relinquishes the same leases but does not change evidence.
+
+Active, queued, abandoned, indeterminate, corrupt and unverified-cleanup jobs
+are preserved. A completed result with proven cleanup or a pre-acquisition
+refusal that owned no processes is eligible. Worker leases are acquired before
+deletion and state is re-read; a busy/unavailable lease protects that job.
+`eligible` describes the policy snapshot, so some entries may still be protected
+by their lease. `has_more` identifies candidates beyond the current batch.
+
+Evidence removal keeps a minimal `job.json` tombstone (identity, project/session,
+task name and creation/pruning timestamps) and the permanent `worker.lock` inode.
+The old argv, result, logs and artifacts are removed. `jobs show ID` still returns
+`state: pruned`, without a verdict; `jobs wait` returns 1 and `jobs logs` errors.
+`jobs list` omits pruned tombstones. IDs cannot be replayed. These small identity
+records persist rather than risking deletion of a lock another process may hold.
+
+Deletion first records `pruning`; interrupted removal resumes on the next prune
+invocation, independently of a stricter new age/count policy. Dry-run previews
+the pending cleanup. Partial errors return exit 1 with per-entry details.
+
+### Retained artifacts and JUnit
+
+Every owned check receives `PROC_COMPOSE_ARTIFACT_DIR`, an existing directory
+for report files, screenshots, traces and other output, and
+`PROC_COMPOSE_JUNIT_REPORT`, the optional `junit.xml` path inside it. For example:
+
+```sh
+proc-compose run --background --json -- sh -c 'pytest --junitxml "$PROC_COMPOSE_JUNIT_REPORT"'
+proc-compose jobs wait JOB_ID --json --timeout 30s
+proc-compose jobs show JOB_ID --json
+```
+
+The verification result/receipt exposes `artifacts.directory`, `files` (relative
+names and byte sizes), and `junit` (report path, status, testcase counts, up to
+five failure examples). `jobs show` includes this in its retained `result`.
+Raw files are preserved unchanged, including malformed and oversized reports.
+Background evidence survives runtime cleanup; foreground artifact directories
+have runtime-directory durability and are pruned with old verified receipts.
+Unverified cleanup retains the files without scanning them.
+
+JUnit counts come from `testcase` elements under `testsuite`/`testsuites`, avoiding
+double-counting aggregate suite attributes. UTF-8 reports are limited to 1 MiB
+and 64 XML nesting levels. Invalid/oversized reports, XML directives and positive
+summary-only reports fail with `test_report_invalid`. A report with testcase
+failures or errors fails with `test_report_failed` even if the check exits 0.
+Missing reports are optional; zero cases are labeled `empty`. Report text is
+untrusted application output; counts are the test tool's claims.
+
+The file index contains at most 64 entries, scans at most 256 entries and 16
+directory levels, and skips symlinks, special files and names over 512 bytes.
+Failure names/classes are bounded to 256 bytes, messages to 512 bytes, and the
+combined metadata to 8 KiB. `truncated` and `skipped` expose omitted evidence.
+These limits do not impose a disk quota on the check's artifact writes.
 
 ### Start all processes
 

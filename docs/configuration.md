@@ -28,6 +28,43 @@ processes:
       - db
 ```
 
+## Named Development Tasks
+
+Top-level `tasks` declares development commands for discovery and execution.
+Point entries at existing package scripts or Make targets. A config containing
+only `tasks` is valid; no service is needed for standalone checks.
+
+```yaml
+tasks:
+  lint:
+    description: Lint the web application
+    argv: [npm, run, lint]
+    dir: web
+    timeout: 120
+    resources: ['build:${config.dir}/web']
+  integration:
+    argv: [make, integration]
+    services: [api]
+```
+
+| Field | Contract |
+|---|---|
+| `description` | Optional discovery text. |
+| `argv` | Required non-empty command array, executed directly; use an explicit shell for shell syntax. |
+| `dir` | Optional working directory relative to the config; `--dir` overrides it. |
+| `services` | Optional configured process names and their dependency closure, including at least one service. Omit for standalone execution. |
+| `timeout` | Check budget in seconds, 1..3600; 0 or absent uses 10 minutes. `--check-timeout` overrides it. |
+| `resources` | Optional exclusive resource labels, using the same validation, expansion and leasing as global `resources`. Both sets are held during execution. |
+
+Names use the process-name rules. `tasks list --json` discovers the catalog;
+`tasks run NAME [--background] --json` executes it through the existing
+verification/job lifecycle. It inherits the check environment and generated
+endpoint variables. Service-backed tasks wait for readiness and clean up the
+owned stack. Standalone tasks start no services or teardown processes. Catalog
+tasks run only on request; `processes.*.mode: task` remains stack setup work.
+Background workers resolve definitions at execution time; results retain the
+task name, actual argv, and hash of the exact config bytes loaded.
+
 ## Process Fields
 
 | Field | Required | Default | Description |

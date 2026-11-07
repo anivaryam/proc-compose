@@ -28,9 +28,9 @@ uses it. The `references/` files hold the details.
 
 ## Ground rules
 
-- Pass the same `-f /abs/path/proc-compose.yml --session NAME` to every command
-  of one task. A session's identity is the absolute config path plus the
-  optional session name.
+- Pass the same `-f /abs/path/proc-compose.yml --session NAME` to session-scoped
+  commands for one task. A session's identity is the absolute config path plus
+  the optional name. Retrieve background work with `jobs` by its immutable ID.
 - Never stop, restart, or reload a session you did not start. Look first with
   `proc-compose sessions --json` or `proc-compose status --json`. When `verify`
   reports `session_occupied`, choose another `--session`.
@@ -60,6 +60,11 @@ uses it. The `references/` files hold the details.
 | Watch and control it | `monitor`, `status`, `restart`, `reload`, `stop`, `list` | [commands](references/commands.md#run-and-control) |
 | Run tests while developing | test watcher process, or tests against a running stack | [testing](references/testing.md#local-development-loop) |
 | One owned check with a receipt | `verify`, `attempts`, `why --attempt` | [testing](references/testing.md#verify) |
+| Standalone unit tests, lint, builds, code generation | `run`, `attempts`, `why --attempt` | [testing](references/testing.md#standalone-checks) |
+| Background tests and later result retrieval | `--background`, `jobs list/show/logs/wait/cancel` | [testing](references/testing.md#background-jobs) |
+| Discover and run project checks by name | `tasks list`, `tasks run` | [testing](references/testing.md#named-project-tasks) |
+| Retrieve test reports, traces and failure summaries | `PROC_COMPOSE_ARTIFACT_DIR`, `PROC_COMPOSE_JUNIT_REPORT`, `jobs show` | [testing](references/testing.md#artifacts-and-junit) |
+| Manage retained job evidence | `jobs prune --dry-run` | [testing](references/testing.md#job-retention) |
 | Same check on two worktrees | `compare` | [testing](references/testing.md#compare) |
 | Logs and failure evidence | `logs`, `why` | [sessions and logs](references/sessions-and-logs.md#logs) |
 | Parallel copies per branch or worktree | `--session`, `ports`, `${urls...}`, `resources`, `sessions` | [sessions and logs](references/sessions-and-logs.md#sessions) |
@@ -135,10 +140,13 @@ proc-compose stop                         # stop everything and verify it ended
   readiness, runs the command, stops everything, and writes a receipt. Exit
   0 passed, 1 failed, 2 nothing started, 130 interrupted.
 
-`verify` currently requires at least one service. For a standalone unit test,
-lint, or build, use the project's existing command and the agent harness's
-managed background execution when needed. Check the installed CLI's help
-before assuming it supports detached verification or standalone jobs.
+`verify` requires at least one service. For a standalone unit test, lint, or
+build, use `proc-compose run --json -- PROGRAM [ARG...]` with the project's
+existing command. It requires no config and starts no services. Both commands
+accept `--background`: save the returned job ID, continue other work, then use
+`jobs wait` to retrieve the terminal verdict and `jobs logs` for evidence.
+Launch exit 0 is acceptance, not a pass. Check the installed CLI's help before
+using these features with older versions.
 
 See [testing](references/testing.md) for all three, `compare`, environment
 reports, and CI recipes.

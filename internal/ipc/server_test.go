@@ -159,26 +159,48 @@ func TestClient_RecvTimeoutSilentServer(t *testing.T) {
 	}
 }
 
+// readStartedConn lets a fixture close the peer only after RecvTimeout has
+// installed its deadline and started reading. Closing before that point tests
+// SetReadDeadline's closed-pipe error, not the clean EOF classification.
+type readStartedConn struct {
+	net.Conn
+	reading chan struct{}
+	once    sync.Once
+}
+
+func (c *readStartedConn) Read(p []byte) (int, error) {
+	c.once.Do(func() { close(c.reading) })
+	return c.Conn.Read(p)
+}
+
 func TestClient_RecvDisconnectDistinguishesMalformedEvents(t *testing.T) {
 	for _, frame := range []string{"", "not json\n"} {
 		t.Run(fmt.Sprintf("frame=%q", frame), func(t *testing.T) {
 			clientConn, serverConn := net.Pipe()
+			conn := &readStartedConn{Conn: clientConn, reading: make(chan struct{})}
 			done := make(chan struct{})
+			stop := make(chan struct{})
 			t.Cleanup(func() {
+				close(stop)
 				clientConn.Close()
 				serverConn.Close()
 				<-done
 			})
 			go func() {
 				defer close(done)
+				select {
+				case <-conn.reading:
+				case <-stop:
+					return
+				}
 				if frame != "" {
 					_, _ = io.WriteString(serverConn, frame)
 				}
 				serverConn.Close()
 			}()
-			sc := bufio.NewScanner(clientConn)
+			sc := bufio.NewScanner(conn)
 			sc.Buffer(make([]byte, 64<<10), MaxEventBytes)
-			client := &Client{conn: clientConn, scanner: sc}
+			client := &Client{conn: conn, scanner: sc}
 			_, err := client.RecvTimeout(time.Second)
 			if err == nil || errors.Is(err, ErrDisconnected) != (frame == "") {
 				t.Fatalf("Recv = %v; only clean EOF should be ErrDisconnected", err)
@@ -188,6 +210,15 @@ func TestClient_RecvDisconnectDistinguishesMalformedEvents(t *testing.T) {
 			}
 		})
 	}
+	t.Run("closed before deadline is not clean EOF", func(t *testing.T) {
+		clientConn, serverConn := net.Pipe()
+		defer clientConn.Close()
+		serverConn.Close()
+		client := &Client{conn: clientConn, scanner: bufio.NewScanner(clientConn)}
+		if _, err := client.RecvTimeout(time.Second); !errors.Is(err, io.ErrClosedPipe) || errors.Is(err, ErrDisconnected) {
+			t.Fatalf("closed deadline = %v, want closed-pipe error, not clean EOF", err)
+		}
+	})
 }
 
 func TestServer_AckSignalsBusyWhenChannelFull(t *testing.T) {

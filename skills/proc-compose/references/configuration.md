@@ -48,7 +48,38 @@ processes:
     foreign_listener: allow      # allow (default) | reject another process's answer to an http/tcp probe
 ```
 
+## Named task catalog
+
+Declare on-demand development commands under top-level `tasks`. A config may
+contain only this catalog. Each name uses the process-name rules.
+
+```yaml
+tasks:
+  lint:
+    description: Lint the web app
+    argv: [npm, run, lint]        # required direct argv; reference an existing script
+    dir: web                     # optional, relative to config directory
+    timeout: 120                 # check seconds, 1..3600; 0 or omitted uses 10m
+    resources: ['build:${config.dir}/web']  # optional, plus global resources
+  integration:
+    argv: [make, integration]
+    services: [api]              # optional, configured processes + dependencies
+```
+
+`proc-compose tasks list --json` lists entries; `proc-compose tasks run lint`
+executes one. Add `--background --json` to get a durable job ID. `--dir` and
+`--check-timeout` override entry defaults. Task argv runs directly: use an
+explicit shell executable when shell syntax is needed. Check environment and
+generated endpoint variables are the same as `verify`.
+
+Without `services`, no service or teardown process starts. With `services`,
+the selection must include a service, and normal readiness and stack cleanup
+apply. Global and task resource labels are held in both modes. A catalog task
+runs only on request; `processes.*.mode: task` runs during stack startup.
+
 ## Modes
+
+See also [named task catalog](#named-task-catalog) for checks run on demand.
 
 | | `service` (default) | `task` | `teardown` |
 |---|---|---|---|

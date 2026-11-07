@@ -147,6 +147,44 @@ func TestVerifyCLI_ExitCodesAndJSONContract(t *testing.T) {
 	}
 }
 
+func TestRunCLI_StandaloneReceiptAndFailure(t *testing.T) {
+	bin := buildTestBinary(t)
+	dir, runtimeDir := t.TempDir(), t.TempDir()
+	// A malformed project config must not prevent a standalone command or be
+	// interpreted as a request to start any project processes.
+	writeCLIFile(t, filepath.Join(dir, "proc-compose.yml"), "invalid: [")
+	stdout, stderr, code := runVerifyCLIIn(t, bin, dir, runtimeDir, "--session", "unit", "run", "--json", "--", bin, "--version")
+	result := decodeOne(t, stdout)
+	if code != 0 || result["standalone"] != true || result["status"] != "passed" || result["config_sha256"] != nil {
+		t.Fatalf("run: code %d result %v stderr %s", code, result, stderr)
+	}
+	startup := result["startup"].(map[string]any)
+	if startup["status"] != "not_needed" || startup["validation"] != "not_needed" {
+		t.Fatalf("run claimed to validate/start a stack: %v", startup)
+	}
+	stdout, stderr, code = runVerifyCLIIn(t, bin, dir, runtimeDir, "--session", "unit", "attempts", "latest", "--json")
+	if code != 0 || !strings.Contains(stdout, `"standalone":true`) || !strings.Contains(stdout, `"status":"passed"`) {
+		t.Fatalf("run receipt: code %d stdout %s stderr %s", code, stdout, stderr)
+	}
+	if err := os.Remove(filepath.Join(dir, "proc-compose.yml")); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code = runVerifyCLIIn(t, bin, dir, runtimeDir, "run", "--json", "--", bin, "unknown-command")
+	if result := decodeOne(t, stdout); code != 1 || result["status"] != "failed" || result["check"].(map[string]any)["exit_code"] != float64(1) {
+		t.Fatalf("failed run without config: code %d result %v stderr %s", code, result, stderr)
+	}
+	for _, args := range [][]string{
+		{"run", "--json"},
+		{"run", "--json", "api", "--", bin, "--version"},
+		{"--session", "invalid/session", "run", "--json", "--", bin, "--version"},
+	} {
+		stdout, stderr, code = runVerifyCLI(t, bin, dir, args...)
+		if result := decodeOne(t, stdout); code != 2 || result["run_id"] != nil || result["standalone"] != true {
+			t.Fatalf("run refusal: args %v code %d result %v stderr %s", args, code, result, stderr)
+		}
+	}
+}
+
 // TestVerifyCLI_RefusesCrossSessionAnswersByDefault drives the real verify
 // command: by default, a readiness probe answered on a port another live
 // session leases fails startup and names that session; --allow-cross-session
@@ -238,7 +276,7 @@ func TestVerifyCLI_InvalidConfigJSON(t *testing.T) {
 // point over every command that accepts --json. The root pre-run hook refuses
 // an invalid --session before the command does anything, and every command
 // reports it the same way: exit status 2 and, with --json, exactly one JSON
-// object on stdout. verify and compare render their own result kinds; every
+// object on stdout. verify, run and compare render their own result kinds; every
 // other command renders {operation, status: "error", message}. Without
 // --json the exit status is the same and the error is on stderr.
 func TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere(t *testing.T) {
@@ -254,7 +292,7 @@ func TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere(t *testing.T) {
 	commands := []struct {
 		operation string   // the command path below the root
 		args      []string // the command's own arguments
-		check     []string // the check after --, for verify and compare
+		check     []string // the check after --, for verify, run and compare
 	}{
 		{operation: "status"},
 		{operation: "logs", args: []string{"api"}},
@@ -269,6 +307,15 @@ func TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere(t *testing.T) {
 		{operation: "restart", args: []string{"api"}},
 		{operation: "reload"},
 		{operation: "verify", check: []string{"true"}},
+		{operation: "run", check: []string{"true"}},
+		{operation: "tasks list"},
+		{operation: "tasks run", args: []string{"lint"}},
+		{operation: "jobs list"},
+		{operation: "jobs prune"},
+		{operation: "jobs show", args: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}},
+		{operation: "jobs logs", args: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}},
+		{operation: "jobs wait", args: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}},
+		{operation: "jobs cancel", args: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}},
 		{operation: "compare", args: []string{"--baseline", dir, "--candidate", dir}, check: []string{"true"}},
 	}
 
@@ -321,7 +368,7 @@ func TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere(t *testing.T) {
 			}
 			result := decodeOne(t, stdout)
 			switch tc.operation {
-			case "verify":
+			case "verify", "run", "tasks run":
 				if result["kind"] != "verify.response" || result["exit_code"] != float64(2) || result["attempt_id"] != nil || result["config_path"] != config {
 					t.Fatalf("verify --json result %v", result)
 				}
@@ -350,9 +397,13 @@ func TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere(t *testing.T) {
 				t.Fatalf("human: exit %d, want 2; stdout %q stderr %q", code, stdout, stderr)
 			}
 			switch tc.operation {
-			case "verify":
+			case "verify", "run":
+				if !strings.Contains(stdout, tc.operation+" FAILED (exit 2)") {
+					t.Fatalf("%s human stdout = %q", tc.operation, stdout)
+				}
+			case "tasks run":
 				if !strings.Contains(stdout, "verify FAILED (exit 2)") {
-					t.Fatalf("verify human stdout = %q", stdout)
+					t.Fatalf("tasks run human stdout = %q", stdout)
 				}
 			case "compare":
 				if !strings.Contains(stdout, "compare NOT_COMPARABLE (exit 2)") {
