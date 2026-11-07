@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-11-07
+
 ### Added
 
+- Release assets now include the shared Claude Code/OpenCode skill as tar.gz
+  and ZIP archives, with license/version metadata and SHA-256 checksums alongside
+  the platform binaries.
 - `jobs prune` provides explicit age/count-based retention with dry-run preview
   and bounded batches. It preserves active/unverified evidence, holds worker
   leases during deletion, and keeps immutable identity tombstones and lock files
@@ -944,7 +949,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policies, readiness probes, dependencies, background daemon, monitor TUI,
   and merge-port integration.
 
-[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.12.1...HEAD
+[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.13.0...HEAD
+[1.13.0]: https://github.com/anivaryam/proc-compose/compare/v1.12.1...v1.13.0
 [1.12.1]: https://github.com/anivaryam/proc-compose/compare/v1.12.0...v1.12.1
 [1.12.0]: https://github.com/anivaryam/proc-compose/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/anivaryam/proc-compose/compare/v1.10.0...v1.11.0
