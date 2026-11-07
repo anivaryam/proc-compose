@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Agent skill `skills/proc-compose` for Claude Code and OpenCode, covering
+  every command and config field: setup, running, testing (`verify`,
+  `compare`, local test loops), logs, sessions, and deployment. Tests fail
+  when a command or config field is missing from the skill, when it shows a
+  command that does not exist, when a link breaks, or when its frontmatter
+  breaks the shared portability contract. See
+  [Installation](docs/installation.md#agent-skill-for-claude-code-and-opencode).
+
 ## [1.12.1] - 2026-11-07
 
 ### Fixed
