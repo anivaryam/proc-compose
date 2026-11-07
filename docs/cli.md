@@ -480,6 +480,13 @@ in container entrypoints and CI fixtures that need a hard guarantee before
 running the next step. A task-only stack cannot daemonize because no service
 remains to manage.
 
+Startup log bursts can disconnect an IPC subscriber without stopping the daemon.
+The readiness waiter reconnects and reads a fresh snapshot from the same daemon
+run, within the original timeout. It does not restart the stack or trust readiness
+cached before the disconnect. A missing or different daemon and failed processes
+still fail the wait; `restart --wait-ready` also keeps its replacement-generation
+requirement across reconnects.
+
 ### Log rotation
 
 When running with `--log-file`, use `--max-log-size` to automatically rotate logs when the file exceeds a given size. Up to 3 rotated files are kept.

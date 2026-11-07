@@ -890,7 +890,7 @@ func TestWaitForProcessesReady_CompletedTaskAccepted(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- waitForProcessesReady(socketPath, want, timeout)
+		errCh <- waitForProcessesReady(socketPath, want, timeout, "")
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -921,7 +921,7 @@ func TestWaitForProcessesReady_FailedProcessRejected(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- waitForProcessesReady(socketPath, want, timeout)
+		errCh <- waitForProcessesReady(socketPath, want, timeout, "")
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -962,7 +962,7 @@ func TestWaitForProcessesReady_LaterStateInvalidatesReady(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- waitForProcessesReady(peer.socketPath, want, timeout)
+		errCh <- waitForProcessesReady(peer.socketPath, want, timeout, "")
 	}()
 
 	// The waiter is attached and its snapshot delivered, so the events below
@@ -1005,7 +1005,7 @@ func TestWaitForProcessesReady_FailureAfterReadyRejected(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- waitForProcessesReady(peer.socketPath, want, timeout)
+		errCh <- waitForProcessesReady(peer.socketPath, want, timeout, "")
 	}()
 
 	peer.waitConnected(t)
@@ -1045,7 +1045,7 @@ func TestWaitForProcessesReady_RestartingNotReady(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- waitForProcessesReady(peer.socketPath, want, timeout)
+		errCh <- waitForProcessesReady(peer.socketPath, want, timeout, "")
 	}()
 
 	peer.waitConnected(t)
@@ -1077,7 +1077,7 @@ func TestWaitForProcessesReady_RequiresReplacementGeneration(t *testing.T) {
 			peer := newScriptedPeer(t, []ipc.ProcState{{Name: "svc", State: oldState, Ready: true, Generation: 1}})
 			done := make(chan error, 1)
 			go func() {
-				done <- waitForProcessesReady(peer.socketPath, map[string]struct{}{"svc": {}}, 3*time.Second, map[string]uint64{"svc": 2})
+				done <- waitForProcessesReady(peer.socketPath, map[string]struct{}{"svc": {}}, 3*time.Second, "", map[string]uint64{"svc": 2})
 			}()
 			peer.waitConnected(t)
 			peer.push(ipc.ProcState{Name: "svc", State: "running", Generation: 2, Ready: false})
@@ -1091,6 +1091,146 @@ func TestWaitForProcessesReady_RequiresReplacementGeneration(t *testing.T) {
 				t.Fatal("replacement waiter did not finish")
 			}
 		})
+	}
+}
+
+// A full daemon-side log queue closes the subscriber, not the daemon. Script
+// that EOF explicitly so the regression does not depend on scheduler speed.
+func TestWaitForProcessesReady_ReconnectsAfterLogStreamDisconnect(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket scripted peer")
+	}
+	for _, tc := range []struct {
+		name, state, runID, wantError string
+		generation                    uint64
+		ready, missing, unidentified  bool
+	}{
+		{name: "ready", state: "running", ready: true, generation: 2, runID: "run"},
+		{name: "no_longer_ready", state: "running", generation: 2, runID: "run", wantError: "timed out"},
+		{name: "missing_process", missing: true, runID: "run", wantError: "timed out"},
+		{name: "failed", state: "failed", ready: true, generation: 2, runID: "run", wantError: "process(es) failed: api"},
+		{name: "old_generation_ready", state: "running", ready: true, generation: 1, runID: "run", wantError: "timed out"},
+		{name: "old_generation_failed", state: "failed", ready: true, generation: 1, runID: "run", wantError: "timed out"},
+		{name: "different_daemon", state: "running", ready: true, generation: 2, runID: "replacement", wantError: "daemon identity changed"},
+		{name: "missing_identity", state: "running", ready: true, generation: 2, wantError: "daemon identity changed"},
+		{name: "unidentified_original", unidentified: true, state: "running", ready: true, generation: 2, runID: "run", wantError: "lost daemon connection"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			project := &ipc.Project{RunID: "run"}
+			if tc.unidentified {
+				project = nil
+			}
+			peer := newScriptedPeer(t, []ipc.ProcState{
+				{Name: "api", State: "running", Ready: true, Generation: 2},
+				{Name: "other", State: "starting"},
+			}, project)
+			done := make(chan error, 1)
+			go func() {
+				done <- waitForProcessesReady(peer.socketPath, map[string]struct{}{"api": {}, "other": {}}, 600*time.Millisecond, "", map[string]uint64{"api": 2})
+			}()
+			peer.waitConnected(t)
+			for i := 0; i < 128; i++ {
+				peer.send <- ipc.Event{Type: ipc.TypeLog, Log: &ipc.LogEntry{Process: "api", Line: "startup output"}}
+			}
+			fresh := []ipc.ProcState{{Name: "other", State: "running", Ready: true}}
+			if !tc.missing {
+				fresh = append(fresh, ipc.ProcState{Name: "api", State: tc.state, Ready: tc.ready, Generation: tc.generation})
+			}
+			var nextProject *ipc.Project
+			if tc.runID != "" {
+				nextProject = &ipc.Project{RunID: tc.runID}
+			}
+			peer.reconnect(fresh, nextProject)
+			select {
+			case err := <-done:
+				if tc.wantError == "" {
+					if err != nil {
+						t.Fatalf("healthy daemon lost its readiness waiter: %v", err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("wait error = %v, want %q", err, tc.wantError)
+				} else if tc.wantError == "timed out" && (!strings.Contains(err.Error(), "api") || strings.Contains(err.Error(), "other")) {
+					t.Fatalf("timeout did not use the fresh snapshot: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("readiness waiter did not finish")
+			}
+		})
+	}
+}
+
+func TestWaitForProcessesReady_ReconnectKeepsOriginalDeadline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket scripted peer")
+	}
+	initial := []ipc.ProcState{{Name: "api", State: "starting"}}
+	project := &ipc.Project{RunID: "run"}
+	peer := newScriptedPeer(t, initial, project)
+	const timeout = 400 * time.Millisecond
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- waitForProcessesReady(peer.socketPath, map[string]struct{}{"api": {}}, timeout, "")
+	}()
+	connections := 0
+	guard := time.NewTimer(2 * time.Second)
+	defer guard.Stop()
+	for {
+		select {
+		case <-peer.connected:
+			connections++
+			peer.reconnect(initial, project)
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "timed out") {
+				t.Fatalf("wait error = %v, want the original timeout", err)
+			}
+			if connections < 2 {
+				t.Fatalf("waiter never reconnected: %d connections", connections)
+			}
+			if elapsed := time.Since(started); elapsed > 3*timeout {
+				t.Fatalf("reconnections extended the %s timeout to %s", timeout, elapsed)
+			}
+			return
+		case <-guard.C:
+			t.Fatal("reconnections reset or lost the original timeout")
+		}
+	}
+}
+
+func TestWaitForProcessesReady_RequiresOriginalRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket scripted peer")
+	}
+	for _, observed := range []string{"replacement", ""} {
+		t.Run("observed="+observed, func(t *testing.T) {
+			peer := newScriptedPeer(t, []ipc.ProcState{{Name: "api", State: "running", Ready: true, Generation: 2}}, &ipc.Project{RunID: observed})
+			err := waitForProcessesReady(peer.socketPath, map[string]struct{}{"api": {}}, time.Second, "original", map[string]uint64{"api": 2})
+			if err == nil || !strings.Contains(err.Error(), "daemon identity changed") {
+				t.Fatalf("another daemon satisfied the original operation: %v", err)
+			}
+		})
+	}
+}
+
+func TestWaitForProcessesReady_DaemonGoneAfterDisconnect(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket scripted peer")
+	}
+	peer := newScriptedPeer(t, []ipc.ProcState{{Name: "api", State: "starting"}}, &ipc.Project{RunID: "run"})
+	done := make(chan error, 1)
+	go func() {
+		done <- waitForProcessesReady(peer.socketPath, map[string]struct{}{"api": {}}, 5*time.Second, "")
+	}()
+	peer.waitConnected(t)
+	peer.listener.Close()
+	peer.reconnect(nil, nil)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "lost daemon connection") {
+			t.Fatalf("dead daemon was not reported: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not report the dead daemon promptly")
 	}
 }
 
@@ -1126,7 +1266,7 @@ func TestWaitForProcessesReady_SilentPeerHitsTimeout(t *testing.T) {
 	}()
 
 	start := time.Now()
-	err = waitForProcessesReady(socketPath, map[string]struct{}{"svc": {}}, timeout)
+	err = waitForProcessesReady(socketPath, map[string]struct{}{"svc": {}}, timeout, "")
 	elapsed := time.Since(start)
 
 	select {
@@ -1177,48 +1317,66 @@ func socketDirForTest(t *testing.T) string {
 // transition being tested.
 type scriptedPeer struct {
 	socketPath string
+	listener   net.Listener
 	connected  chan struct{}
-	send       chan ipc.ProcState
+	send       chan ipc.Event
 }
 
-// newScriptedPeer starts a peer that accepts one client, sends it an initial
-// snapshot, then relays ProcStates from send in order. It stops with the test.
-func newScriptedPeer(t *testing.T, initial []ipc.ProcState) *scriptedPeer {
+// newScriptedPeer sends a snapshot followed by ordered events. A snapshot on
+// send closes the connection and becomes the next connection's first event.
+func newScriptedPeer(t *testing.T, initial []ipc.ProcState, project ...*ipc.Project) *scriptedPeer {
 	t.Helper()
 	dir := socketDirForTest(t)
 	p := &scriptedPeer{
 		socketPath: filepath.Join(dir, "pc.sock"),
-		connected:  make(chan struct{}),
-		send:       make(chan ipc.ProcState, 16),
+		connected:  make(chan struct{}, 1),
+		send:       make(chan ipc.Event, 16),
 	}
 	ln, err := net.Listen("unix", p.socketPath)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	p.listener = ln
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(p.send)
+		ln.Close()
+		<-done
+	})
 
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
+		defer close(done)
+		snapshot := ipc.Event{Type: ipc.TypeSnapshot, Processes: initial}
+		if len(project) > 0 {
+			snapshot.Project = project[0]
 		}
-		defer conn.Close()
-		write := func(ev ipc.Event) {
-			data, err := json.Marshal(ev)
+		for {
+			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			conn.Write(append(data, '\n'))
-		}
-		write(ipc.Event{Type: ipc.TypeSnapshot, Processes: initial})
-		// Only signal once the snapshot is on the wire, so a waitConnected
-		// caller knows the client is attached and its first read can proceed.
-		close(p.connected)
-		for st := range p.send {
-			write(ipc.Event{Type: ipc.TypeState, Proc: &st})
+			write := func(ev ipc.Event) {
+				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				_ = json.NewEncoder(conn).Encode(ev)
+			}
+			write(snapshot)
+			// Signal only after the initial snapshot is on the wire.
+			p.connected <- struct{}{}
+			for {
+				ev, ok := <-p.send
+				if !ok {
+					conn.Close()
+					return
+				}
+				if ev.Type == ipc.TypeSnapshot {
+					snapshot = ev
+					break
+				}
+				write(ev)
+			}
+			conn.Close()
 		}
 	}()
-	t.Cleanup(func() { close(p.send) })
 	return p
 }
 
@@ -1235,7 +1393,11 @@ func (p *scriptedPeer) waitConnected(t *testing.T) {
 
 // push queues one state event for delivery.
 func (p *scriptedPeer) push(st ipc.ProcState) {
-	p.send <- st
+	p.send <- ipc.Event{Type: ipc.TypeState, Proc: &st}
+}
+
+func (p *scriptedPeer) reconnect(states []ipc.ProcState, project *ipc.Project) {
+	p.send <- ipc.Event{Type: ipc.TypeSnapshot, Processes: states, Project: project}
 }
 
 func TestCheckOptionalBinaries_MergeWithoutMergePort_ReturnsError(t *testing.T) {
@@ -3680,6 +3842,7 @@ func TestMutationCLI_RestartReadiness(t *testing.T) {
 				configPath := filepath.Join(dir, "not-created.yml")
 				peer := startFakeDaemon(t, nil, configPath)
 				server := ipc.NewServer(peer.socketPath)
+				server.SetProject(&ipc.Project{RunID: "restart-run"})
 				server.SetState(ipc.ProcState{Name: "api", Mode: "service", State: tc.state, Ready: tc.ready, Generation: tc.generation})
 				if err := server.Listen(); err != nil {
 					t.Fatal(err)

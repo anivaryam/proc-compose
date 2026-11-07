@@ -16,6 +16,11 @@ import (
 // the requested duration.
 var ErrRecvTimeout = errors.New("ipc: timed out waiting for event")
 
+// ErrDisconnected means the peer closed the event stream without a read or
+// framing error. It does not by itself mean the daemon exited: a full outbound
+// queue also disconnects an individual subscriber.
+var ErrDisconnected = errors.New("daemon disconnected")
+
 // Client connects to a running daemon's socket/pipe and streams events.
 type Client struct {
 	conn    net.Conn
@@ -92,13 +97,13 @@ func DialTimeout(socketPath string, d time.Duration) (*Client, error) {
 }
 
 // Recv reads the next event from the daemon. Blocks until an event arrives
-// or the connection is closed (returns io.EOF-wrapped error).
+// or the connection is closed (returns ErrDisconnected on clean EOF).
 func (c *Client) Recv() (Event, error) {
 	if !c.scanner.Scan() {
 		if err := c.scanner.Err(); err != nil {
 			return Event{}, err
 		}
-		return Event{}, fmt.Errorf("daemon disconnected")
+		return Event{}, ErrDisconnected
 	}
 	var ev Event
 	if err := json.Unmarshal(c.scanner.Bytes(), &ev); err != nil {

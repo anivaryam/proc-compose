@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -155,6 +156,37 @@ func TestClient_RecvTimeoutSilentServer(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("RecvTimeout took %s, expected it to give up near 200ms", elapsed)
+	}
+}
+
+func TestClient_RecvDisconnectDistinguishesMalformedEvents(t *testing.T) {
+	for _, frame := range []string{"", "not json\n"} {
+		t.Run(fmt.Sprintf("frame=%q", frame), func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			done := make(chan struct{})
+			t.Cleanup(func() {
+				clientConn.Close()
+				serverConn.Close()
+				<-done
+			})
+			go func() {
+				defer close(done)
+				if frame != "" {
+					_, _ = io.WriteString(serverConn, frame)
+				}
+				serverConn.Close()
+			}()
+			sc := bufio.NewScanner(clientConn)
+			sc.Buffer(make([]byte, 64<<10), MaxEventBytes)
+			client := &Client{conn: clientConn, scanner: sc}
+			_, err := client.RecvTimeout(time.Second)
+			if err == nil || errors.Is(err, ErrDisconnected) != (frame == "") {
+				t.Fatalf("Recv = %v; only clean EOF should be ErrDisconnected", err)
+			}
+			if frame == "" && err.Error() != "daemon disconnected" {
+				t.Fatalf("disconnect message changed: %v", err)
+			}
+		})
 	}
 }
 
