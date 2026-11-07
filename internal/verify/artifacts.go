@@ -237,8 +237,10 @@ func parseJUnit(data []byte) (JUnitSummary, error) {
 					}
 				}
 			case "testcase":
-				if caseDepth != 0 || parent != "testsuite" {
-					return s, errors.New("testcase is outside a testsuite")
+				// Node's built-in JUnit reporter emits top-level tests directly
+				// under testsuites; describe() groups still use testsuite.
+				if caseDepth != 0 || (parent != "testsuite" && parent != "testsuites") {
+					return s, errors.New("testcase is outside a testsuite/testsuites container")
 				}
 				caseDepth = len(stack)
 				current = TestFailure{Name: truncateUTF8(attrs["name"], 256), Class: truncateUTF8(attrs["classname"], 256)}

@@ -374,8 +374,10 @@ func TestRun_StandaloneWithoutConfig(t *testing.T) {
 func TestRun_ArtifactsAndJUnitVerdicts(t *testing.T) {
 	for _, tc := range []struct{ name, report, status, code string }{
 		{"pass", `<testsuite><testcase name="unit"/></testsuite>`, "parsed", ""},
+		{"node-pass", `<testsuites><testcase name="unit"/></testsuites>`, "parsed", ""},
 		{"missing", "missing", "missing", ""},
 		{"failure", `<testsuite><testcase name="unit"><failure message="bad result"/></testcase></testsuite>`, "parsed", CodeTestReportFailed},
+		{"node-failure", `<testsuites><testcase name="unit"><failure message="bad result"/></testcase></testsuites>`, "parsed", CodeTestReportFailed},
 		{"invalid", `<testsuite><testcase/>`, "invalid", CodeTestReportInvalid},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

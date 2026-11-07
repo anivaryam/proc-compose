@@ -108,7 +108,8 @@ Background artifacts survive runtime cleanup; foreground artifacts share the
 receipt's runtime-directory lifetime and are pruned with old verified receipts.
 Artifacts with unverified cleanup are retained without scanning.
 
-JUnit supports UTF-8 `testsuite`/`testsuites` trees and counts `testcase` outcomes,
+JUnit supports UTF-8 `testsuite`/`testsuites` trees, including Node's direct
+`testsuites` child testcases, and counts `testcase` outcomes,
 not duplicated aggregate suite totals. Reports over 1 MiB, invalid XML, unsupported
 directives, or summary-only positive counters are `test_report_invalid`; supplied
 case failures/errors cause `test_report_failed` even when the check exits 0.
