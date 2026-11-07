@@ -143,6 +143,7 @@ that `up --survive --install` created. Linux only.
 | `proc-compose jobs logs JOB_ID --json` | Bounded retained logs; `--after`, `-n`, `--max-bytes` | [testing](testing.md#background-jobs) |
 | `proc-compose jobs wait JOB_ID --timeout 30s --json` | Terminal verdict exit code; exit 3 means still incomplete | [testing](testing.md#background-jobs) |
 | `proc-compose jobs cancel JOB_ID --timeout 1m --json` | Cancel only this job and wait for cleanup evidence | [testing](testing.md#background-jobs) |
+| `proc-compose jobs prune --dry-run --json` | Preview age/count retention; omit `--dry-run` to remove eligible evidence | [testing](testing.md#job-retention) |
 | `proc-compose attempts [id\|latest] [--json]` | Verification receipts for this session, newest first | [testing](testing.md#receipts-and-attempt-evidence) |
 | `proc-compose compare --baseline DIR --candidate DIR -- PROGRAM` | Same check against two worktrees | [testing](testing.md#compare) |
 | `proc-compose logs [processes...]` | Bounded, structured event queries; `--follow` streams | [sessions and logs](sessions-and-logs.md#logs) |

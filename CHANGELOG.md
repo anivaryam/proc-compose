@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `jobs prune` provides explicit age/count-based retention with dry-run preview
+  and bounded batches. It preserves active/unverified evidence, holds worker
+  leases during deletion, and keeps immutable identity tombstones and lock files
+  while removing results, logs and artifacts. Interrupted pruning is resumable.
 - Per-attempt artifact directories and optional JUnit XML reporting through
   `PROC_COMPOSE_ARTIFACT_DIR` and `PROC_COMPOSE_JUNIT_REPORT`. Results retain
   bounded file indexes, testcase counts and failure examples while preserving

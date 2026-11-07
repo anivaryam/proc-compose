@@ -311,6 +311,7 @@ func TestCLI_InvalidSessionIsRefusedTheSameWayEverywhere(t *testing.T) {
 		{operation: "tasks list"},
 		{operation: "tasks run", args: []string{"lint"}},
 		{operation: "jobs list"},
+		{operation: "jobs prune"},
 		{operation: "jobs show", args: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}},
 		{operation: "jobs logs", args: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}},
 		{operation: "jobs wait", args: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}},

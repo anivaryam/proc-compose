@@ -61,6 +61,34 @@ proc-compose jobs cancel JOB_ID --timeout 1m --json
   commands do not survive reboot. Journals retain 10 MiB plus three rotations.
   Background receipts use `jobs`, not the session's runtime-only `attempts`.
 
+## Retention of durable jobs
+
+Job evidence persists until explicit pruning. Preview and apply a policy:
+
+```sh
+proc-compose jobs prune --older-than 168h --keep 20 --limit 20 --dry-run --json
+proc-compose jobs prune --older-than 168h --keep 20 --limit 20 --json
+```
+
+The defaults remove evidence completed over seven days ago while keeping the
+newest 20 verified completions across the configured job root. Both age and
+count conditions must be met. Age uses the recorded finish time; `--keep 0`
+disables count protection and `--older-than 0s` disables age protection.
+`--limit` is 1..100 jobs (default 20), `--keep` is 0..10000. Check `has_more`
+for further batches and each entry's status; `protected` can mean a worker still
+holds its lease. Policies are explicit tool invocations, not a background timer.
+
+Queued/running/lost-owner/indeterminate jobs, corrupt records and unverified
+cleanup evidence stay retained. Pre-acquisition refusals with no owned processes
+can be pruned. Failure to retain a full result is not cleanup proof.
+Pruning holds the worker lease, drops command argv/results/logs/artifacts, and
+keeps a small identity tombstone plus the permanent lock file. `jobs show ID`
+then reports `pruned` with no result; `jobs wait` exits 1 and `jobs logs` refuses.
+Pruned IDs never replay and disappear from `jobs list`. A crash during deletion
+leaves `pruning`; later pruning resumes that already-committed deletion even if
+the new age/count policy is stricter. Dry-run only previews it. Partial removal
+errors return exit 1 with entry details; inspect them before retrying.
+
 ## Artifacts and test reports
 
 Checks receive `PROC_COMPOSE_ARTIFACT_DIR` (an existing per-attempt directory)

@@ -47,6 +47,7 @@ type Record struct {
 	ID        string         `json:"job_id"`
 	State     string         `json:"state"`
 	CreatedAt time.Time      `json:"created_at"`
+	PrunedAt  *time.Time     `json:"pruned_at,omitempty"`
 	OwnerPID  int            `json:"owner_pid,omitempty"` // informational; never signalling authority
 	Request   Request        `json:"request"`
 	Result    *verify.Result `json:"result,omitempty"`
@@ -61,6 +62,7 @@ type View struct {
 	State           string         `json:"state"`
 	Terminal        bool           `json:"terminal"`
 	CreatedAt       time.Time      `json:"created_at"`
+	PrunedAt        *time.Time     `json:"pruned_at,omitempty"`
 	OwnerPID        int            `json:"owner_pid,omitempty"`
 	ConfigPath      string         `json:"config_path"`
 	Session         string         `json:"session"`
@@ -128,12 +130,15 @@ func (s *Store) read(id string) (*Record, string, error) {
 		return nil, dir, errors.New("invalid job record identity or version")
 	}
 	switch rec.State {
-	case "queued", "running", "completed", "failed":
+	case "queued", "running", "completed", "failed", "pruning", "pruned":
 	default:
 		return nil, dir, errors.New("invalid job state")
 	}
 	if rec.State == "completed" && !verify.ValidTerminalResult(rec.Result) {
 		return nil, dir, errors.New("job has no terminal result")
+	}
+	if (rec.State == "pruning" || rec.State == "pruned") && (rec.PrunedAt == nil || rec.PrunedAt.IsZero() || rec.Result != nil || rec.OwnerPID != 0) {
+		return nil, dir, errors.New("invalid pruning tombstone")
 	}
 	if rec.State == "completed" {
 		var present struct {
@@ -191,6 +196,7 @@ func (s *Store) Get(id string) (*View, error) {
 		return nil, err
 	}
 	v := &View{Version: 1, Kind: "job.response", ID: id, State: rec.State, CreatedAt: rec.CreatedAt,
+		PrunedAt: rec.PrunedAt,
 		TaskName: rec.Request.TaskName,
 		OwnerPID: rec.OwnerPID, ConfigPath: rec.Request.ConfigPath, Session: rec.Request.Session,
 		Directory: dir, Result: rec.Result, Message: rec.Error}
@@ -200,7 +206,7 @@ func (s *Store) Get(id string) (*View, error) {
 	switch rec.State {
 	case "completed":
 		v.State, v.Terminal = rec.Result.Status, true
-	case "failed":
+	case "failed", "pruning", "pruned":
 		v.Terminal = true
 	case "running":
 		held, err := session.FileLeaseHeld(filepath.Join(dir, "worker.lock"))
@@ -245,6 +251,9 @@ func (s *Store) List(limit int, before string) (*Page, error) {
 		if err != nil {
 			continue // malformed files never become a successful job
 		}
+		if v.State == "pruned" {
+			continue // show by ID still returns the immutable tombstone
+		}
 		if len(page.Jobs) == limit {
 			page.HasMore = true
 			break
@@ -257,9 +266,12 @@ func (s *Store) List(limit int, before string) (*Page, error) {
 }
 
 func (s *Store) Logs(id string, opts logs.Options) (logs.Page, error) {
-	_, dir, err := s.read(id)
+	rec, dir, err := s.read(id)
 	if err != nil {
 		return logs.Page{}, err
+	}
+	if rec.State == "pruning" || rec.State == "pruned" {
+		return logs.Page{}, errors.New("job evidence has been pruned")
 	}
 	page, err := logs.Query(filepath.Join(dir, "events.jsonl"), opts)
 	if errors.Is(err, os.ErrNotExist) {

@@ -64,6 +64,7 @@ uses it. The `references/` files hold the details.
 | Background tests and later result retrieval | `--background`, `jobs list/show/logs/wait/cancel` | [testing](references/testing.md#background-jobs) |
 | Discover and run project checks by name | `tasks list`, `tasks run` | [testing](references/testing.md#named-project-tasks) |
 | Retrieve test reports, traces and failure summaries | `PROC_COMPOSE_ARTIFACT_DIR`, `PROC_COMPOSE_JUNIT_REPORT`, `jobs show` | [testing](references/testing.md#artifacts-and-junit) |
+| Manage retained job evidence | `jobs prune --dry-run` | [testing](references/testing.md#job-retention) |
 | Same check on two worktrees | `compare` | [testing](references/testing.md#compare) |
 | Logs and failure evidence | `logs`, `why` | [sessions and logs](references/sessions-and-logs.md#logs) |
 | Parallel copies per branch or worktree | `--session`, `ports`, `${urls...}`, `resources`, `sessions` | [sessions and logs](references/sessions-and-logs.md#sessions) |

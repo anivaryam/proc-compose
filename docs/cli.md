@@ -20,7 +20,7 @@ proc-compose stop [--timeout N] [--force]               Stop daemon and verify i
 proc-compose list                                       List config processes
 proc-compose verify [processes...] -- PROGRAM [ARG...]  Owned stack + check + verified cleanup + receipt
 proc-compose run -- PROGRAM [ARG...]                    Standalone command + verified cleanup + receipt
-proc-compose jobs list|show|logs|wait|cancel              Retained background jobs by immutable ID
+proc-compose jobs list|show|logs|wait|cancel|prune        Retained background jobs by immutable ID
 proc-compose tasks list|run                             Discover and execute named project tasks
 proc-compose attempts [id|latest] [--json]              List or show verification receipts
 proc-compose agent-guide                                Print the offline operating guide for coding agents
@@ -210,6 +210,7 @@ the same override when reconnecting. Background receipts are retrieved through
 | `jobs logs ID [--after CURSOR] [-n 50] [--max-bytes 65536]` | Usual bounded event pages; use `next_cursor` to resume, `start` for oldest retained events. |
 | `jobs wait ID [--timeout 1m]` | Finite wait (1ms..10m); terminal result exit 0/1/2/130, or exit 3 and `wait_timed_out: true`. Timing out leaves the job running. |
 | `jobs cancel ID [--timeout 1m]` | Request cancellation of only this job, then wait for its result; interrupted jobs return 130. Inspect `result.cleanup` to prove termination. |
+| `jobs prune [--older-than 168h] [--keep 20] [--limit 20] [--dry-run]` | Explicit bounded evidence retention; preview or remove old verified completions while preserving newest results. |
 
 All accept `--json`. `terminal: true`, `state: passed`, and the passing `result`
 mean a completed check with verified cleanup. `queued` and `running` are not
@@ -219,6 +220,40 @@ Neither proves cleanup. `owner_pid` is descriptive, never signalling authority.
 Cancellation uses the job's own mailbox; it never kills a stored PID or stops
 an unrelated session. An early worker failure can have `state: failed` and a
 `message` without a verification result. Flag parsing errors may be plain text.
+
+### Job retention
+
+```sh
+proc-compose jobs prune --older-than 168h --keep 20 --limit 20 --dry-run --json
+proc-compose jobs prune --older-than 168h --keep 20 --limit 20 --json
+```
+
+Pruning is explicit and spans the configured job root, across projects. Defaults
+keep the newest 20 verified completions and remove evidence whose finish time is
+over seven days old; both conditions must hold. `--keep` accepts 0..10000;
+`--older-than` accepts nonnegative durations. Zero disables that protection.
+At most `--limit` jobs (1..100, default 20) are processed per call. The `jobs.prune`
+JSON response includes policy cutoff, eligible/protected counts, `has_more`, and
+per-job statuses (`would_prune`, `pruned`, `protected`, `already_pruned`, `error`).
+Dry-run acquires/relinquishes the same leases but does not change evidence.
+
+Active, queued, abandoned, indeterminate, corrupt and unverified-cleanup jobs
+are preserved. A completed result with proven cleanup or a pre-acquisition
+refusal that owned no processes is eligible. Worker leases are acquired before
+deletion and state is re-read; a busy/unavailable lease protects that job.
+`eligible` describes the policy snapshot, so some entries may still be protected
+by their lease. `has_more` identifies candidates beyond the current batch.
+
+Evidence removal keeps a minimal `job.json` tombstone (identity, project/session,
+task name and creation/pruning timestamps) and the permanent `worker.lock` inode.
+The old argv, result, logs and artifacts are removed. `jobs show ID` still returns
+`state: pruned`, without a verdict; `jobs wait` returns 1 and `jobs logs` errors.
+`jobs list` omits pruned tombstones. IDs cannot be replayed. These small identity
+records persist rather than risking deletion of a lock another process may hold.
+
+Deletion first records `pruning`; interrupted removal resumes on the next prune
+invocation, independently of a stricter new age/count policy. Dry-run previews
+the pending cleanup. Partial errors return exit 1 with per-entry details.
 
 ### Retained artifacts and JUnit
 

@@ -71,6 +71,29 @@ The worker reads the catalog at execution time; `task_name`, `config_sha256`,
 and `check.argv` record the executed definition. Standalone catalog tasks still
 validate their config; raw `run --` does not.
 
+## Job retention
+
+```sh
+proc-compose jobs prune --older-than 168h --keep 20 --limit 20 --dry-run --json
+proc-compose jobs prune --older-than 168h --keep 20 --limit 20 --json
+```
+
+Pruning applies across the configured job root. Defaults protect the newest 20
+verified completions and evidence younger than seven days; both protections
+must permit deletion. `--keep 0` and `--older-than 0s` disable their protections.
+Read the preview before applying a retention policy; application is an explicit
+user/task decision, not a routine step after every check. `has_more` means more
+candidates remain beyond the batch limit (1..100). Inspect entry statuses:
+`protected` may mean the worker still holds its lease.
+
+Queued/running/abandoned/indeterminate jobs, corrupt records and unverified
+cleanup evidence are preserved. Pruning removes results, logs, argv and artifacts
+but retains small identity tombstones and permanent lock files. `jobs show ID`
+reports `pruned`; `jobs wait` exits 1, logs are unavailable, and the ID cannot
+replay. Pruned entries disappear from list. Interrupted deletions show `pruning`
+and resume on the next prune invocation, even under a stricter new policy;
+dry-run only previews. Partial errors exit 1 with entry details.
+
 ## Artifacts and JUnit
 
 Direct existing test reporters to `PROC_COMPOSE_JUNIT_REPORT`, and other outputs
