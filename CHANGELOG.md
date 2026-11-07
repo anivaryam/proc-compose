@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-11-08
+
+### Fixed
+
+- Accept Node.js's built-in JUnit reporter output, which places top-level
+  `testcase` elements directly under `testsuites`. Passing Node reports no longer
+  fail as invalid; failure/error cases still fail the operation, and nested or
+  misplaced testcase elements remain rejected.
+
 ## [1.13.0] - 2026-11-07
 
 ### Added
@@ -949,7 +958,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policies, readiness probes, dependencies, background daemon, monitor TUI,
   and merge-port integration.
 
-[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.13.0...HEAD
+[Unreleased]: https://github.com/anivaryam/proc-compose/compare/v1.13.1...HEAD
+[1.13.1]: https://github.com/anivaryam/proc-compose/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/anivaryam/proc-compose/compare/v1.12.1...v1.13.0
 [1.12.1]: https://github.com/anivaryam/proc-compose/compare/v1.12.0...v1.12.1
 [1.12.0]: https://github.com/anivaryam/proc-compose/compare/v1.11.0...v1.12.0

@@ -76,7 +76,7 @@ the complete `proc-compose/` skill directory, its references, license and releas
 binary and skill archives are listed in the release's `SHA256SUMS` asset.
 
 ```sh
-VERSION=v1.13.0
+VERSION=v1.13.1
 BASE="https://github.com/anivaryam/proc-compose/releases/download/$VERSION"
 curl -fLO "$BASE/proc-compose_skill.tar.gz"
 curl -fLO "$BASE/SHA256SUMS"

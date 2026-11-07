@@ -17,6 +17,23 @@ func TestJUnit_CountsCasesNotNestedSuiteTotals(t *testing.T) {
 	}
 }
 
+func TestJUnit_NodeReporterRootCases(t *testing.T) {
+	// Node 22's built-in JUnit reporter places top-level tests directly in
+	// testsuites, alongside testsuite elements for describe() groups.
+	data := `<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testcase name="top-level pass" time="0.001133" classname="test"/>
+  <testcase name="top-level failure" time="0.001985" classname="test"><failure type="testCodeFailure" message="expected equality">assertion details</failure></testcase>
+  <testcase name="top-level skip" classname="test"><skipped/></testcase>
+  <testsuite name="group" tests="1" errors="1"><testcase name="group error"><error>stack trace</error></testcase></testsuite>
+  <!-- tests 4 -->
+</testsuites>`
+	s, err := parseJUnit([]byte(data))
+	if err != nil || s.Status != "parsed" || s.Tests != 4 || s.Failures != 1 || s.Errors != 1 || s.Skipped != 1 || len(s.Examples) != 2 || s.Examples[0].Name != "top-level failure" || s.Examples[0].Message != "expected equality" {
+		t.Fatalf("Node JUnit summary: %+v %v", s, err)
+	}
+}
+
 func TestJUnit_RejectsMalformedOrUnsupportedReports(t *testing.T) {
 	for _, data := range []string{
 		``, `<unrelated/>`, `<testsuite>`, `<testsuite/><testsuite/>`,
@@ -25,6 +42,8 @@ func TestJUnit_RejectsMalformedOrUnsupportedReports(t *testing.T) {
 		`<testsuite tests="-1"/>`, `<testsuite><failure/></testsuite>`,
 		`<testsuite><testcase name="a" name="b"/></testsuite>`,
 		`<testsuite><testcase><testcase/></testcase></testsuite>`,
+		`<testsuites><testcase><testcase/></testcase></testsuites>`,
+		`<testsuites><properties><testcase/></properties></testsuites>`,
 		strings.Repeat(`<testsuite>`, 65) + strings.Repeat(`</testsuite>`, 65),
 	} {
 		t.Run(fmt.Sprintf("case-%d", len(data)), func(t *testing.T) {
